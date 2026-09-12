@@ -11,7 +11,7 @@ test('formats SRT timestamps', () => {
   assert.equal(formatSrtTime(3661.999), '01:01:01,999');
 });
 
-test('writes clip-relative captions clipped to the candidate range', async () => {
+test('writes clip-relative captions for segments overlapping the candidate range', async () => {
   const root = await mkdtemp(join(tmpdir(), 'studio-captions-')); const path = join(root, 'clip.srt');
   try {
     const count = await writeSrtCaptions(path, [
@@ -20,9 +20,9 @@ test('writes clip-relative captions clipped to the candidate range', async () =>
       { startSeconds: 15, endSeconds: 22, text: 'Second caption' },
     ], 10, 20);
     const srt = await readFile(path, 'utf8');
-    assert.equal(count, 2);
+    assert.equal(count, 3);
+    assert.match(srt, /00:00:00,000 --> 00:00:02,000\nBefore the clip/);
     assert.match(srt, /00:00:00,000 --> 00:00:05,000\nFirst caption/);
     assert.match(srt, /00:00:05,000 --> 00:00:10,000\nSecond caption/);
-    assert.doesNotMatch(srt, /Before the clip/);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
