@@ -38,6 +38,9 @@ export function createApp(config: AppConfig) {
   app.use(cors({ origin: config.CORS_ORIGIN }));
   app.use(pinoHttp({ logger }));
   app.use(express.json({ limit: '32kb' }));
+  app.get('/test-upload', (_req, res) => {
+    res.type('html').send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Video Processing Test</title></head><body><h1>Video Processing Test</h1><p>Temporary mobile test page.</p><form id="form"><input id="video" name="video" type="file" accept="video/*" required><button type="submit">Upload video</button></form><pre id="out"></pre><script>const form=document.getElementById('form'),video=document.getElementById('video'),out=document.getElementById('out');form.addEventListener('submit',async e=>{e.preventDefault();const file=video.files[0];if(!file)return;out.textContent='Uploading...';const data=new FormData();data.append('video',file);try{const r=await fetch('/api/jobs',{method:'POST',body:data});const j=await r.json();if(!r.ok){out.textContent=JSON.stringify(j,null,2);return}const id=j.job.id;out.textContent=JSON.stringify(j,null,2);const poll=async()=>{const sr=await fetch('/api/jobs/'+id);const sj=await sr.json();out.textContent=JSON.stringify(sj,null,2);if(sj.job.status==='completed'||sj.job.status==='failed')return;setTimeout(poll,3000)};setTimeout(poll,1000)}catch(err){out.textContent=String(err)}});</script></body></html>`);
+  });
   app.get('/api/health', (_req, res) => res.json({ status: 'ok', service: 'short-form-video-studio' }));
   app.post('/api/jobs', upload.single('video'), (req, res, next) => {
     try {
