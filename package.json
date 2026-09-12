@@ -1,0 +1,13 @@
+{
+  "name": "short-form-video-studio",
+  "version": "0.1.0",
+  "private": true,
+  "engines": { "node": ">=22.5.0" },
+  "workspaces": ["apps/*"],
+  "scripts": {
+    "dev": "npm run dev --workspace=@studio/api & npm run dev --workspace=@studio/web",
+    "build": "npm run build --workspaces",
+    "check": "npm run check --workspaces",
+    "test": "npm run test --workspace=@studio/api"
+  }
+}
