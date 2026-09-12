@@ -4,7 +4,7 @@ import { extname } from 'node:path';
 import cors from 'cors';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import multer from 'multer';
-import pinoHttp from 'pino-http';
+import { pinoHttp } from 'pino-http';
 import pino from 'pino';
 import type { AppConfig } from './config.js';
 import { StudioDatabase } from './database.js';
