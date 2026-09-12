@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { readFile } from 'node:fs/promises';
+import { access, readFile } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 import { promisify } from 'node:util';
 import type { TranscriptSegment } from './domain.js';
@@ -32,20 +32,43 @@ function parseTimestamp(value: unknown): number | undefined {
   return Number(match[1]) * 3600 + Number(match[2]) * 60 + Number(match[3]) + Number(match[4]) / 1000;
 }
 
+function trimDiagnostic(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) return '(no output)';
+  return trimmed.length > 4000 ? `${trimmed.slice(-4000)}\n...[truncated]` : trimmed;
+}
+
 export class WhisperCppTranscriber implements TranscriptionEngine {
   constructor(private readonly executablePath: string, private readonly modelPath: string, private readonly language: string, private readonly timeoutMs: number) {}
   async transcribe(audioPath: string, workDir: string): Promise<TranscriptInput> {
     const outputBase = join(workDir, basename(audioPath, '.wav'));
+    let stdout = '';
+    let stderr = '';
     try {
       // Render's free service is CPU-only. Force whisper.cpp to stay on CPU instead of
       // attempting GPU initialization, which makes the process fail before transcription.
-      await execFileAsync(this.executablePath, ['-m', this.modelPath, '-f', audioPath, '-l', this.language, '-ngl', '0', '-oj', '-of', outputBase], { timeout: this.timeoutMs, maxBuffer: 1024 * 1024, cwd: dirname(audioPath) });
+      const result = await execFileAsync(this.executablePath, ['-m', this.modelPath, '-f', audioPath, '-l', this.language, '-ngl', '0', '-oj', '-of', outputBase], { timeout: this.timeoutMs, maxBuffer: 2 * 1024 * 1024, cwd: dirname(audioPath) });
+      stdout = result.stdout;
+      stderr = result.stderr;
     } catch (error) {
-      const detail = error instanceof Error ? error.message : 'Unknown whisper.cpp execution failure';
-      throw new Error(`Local whisper.cpp transcription failed: ${detail}`);
+      const execError = error as { message?: string; stdout?: string; stderr?: string };
+      stdout = typeof execError.stdout === 'string' ? execError.stdout : '';
+      stderr = typeof execError.stderr === 'string' ? execError.stderr : '';
+      const detail = execError.message ?? 'Unknown whisper.cpp execution failure';
+      throw new Error(`Local whisper.cpp transcription failed: ${detail}\nwhisper stdout:\n${trimDiagnostic(stdout)}\nwhisper stderr:\n${trimDiagnostic(stderr)}`);
     }
+
+    try {
+      await access(`${outputBase}.json`);
+    } catch {
+      throw new Error(`whisper.cpp exited without creating JSON output.\naudio: ${audioPath}\noutput: ${outputBase}.json\nwhisper stdout:\n${trimDiagnostic(stdout)}\nwhisper stderr:\n${trimDiagnostic(stderr)}`);
+    }
+
     try { return parseWhisperCppJson(await readFile(`${outputBase}.json`, 'utf8')); }
-    catch (error) { const detail = error instanceof Error ? error.message : 'Unknown output parsing failure'; throw new Error(`Could not read whisper.cpp JSON output: ${detail}`); }
+    catch (error) {
+      const detail = error instanceof Error ? error.message : 'Unknown output parsing failure';
+      throw new Error(`Could not read whisper.cpp JSON output: ${detail}\nwhisper stdout:\n${trimDiagnostic(stdout)}\nwhisper stderr:\n${trimDiagnostic(stderr)}`);
+    }
   }
 }
 
