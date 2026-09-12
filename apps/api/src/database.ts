@@ -37,7 +37,7 @@ export class StudioDatabase {
   }
   private migrateGeneratedClips() {
     const existing = new Set(this.db.prepare('PRAGMA table_info(generated_clips)').all().map((column: any) => column.name));
-    const additions: Array<[string, string]> = [['candidate_id', "TEXT NOT NULL DEFAULT ''"], ['duration_seconds', 'REAL NOT NULL DEFAULT 0'], ['output_filename', "TEXT NOT NULL DEFAULT ''"], ['status', "TEXT NOT NULL DEFAULT 'queued'"], ['error_message', 'TEXT'], ['updated_at', "TEXT NOT NULL DEFAULT ''"]];
+    const additions: Array<[string, string]> = [['candidate_id', "TEXT NOT NULL DEFAULT ''"], ['duration_seconds', 'REAL NOT NULL DEFAULT 0'], ['output_filename', "TEXT NOT NULL DEFAULT ''"], ['status', "TEXT NOT NULL DEFAULT 'queued'"], ['error_message', 'TEXT'], ['caption_path', 'TEXT'], ['updated_at', "TEXT NOT NULL DEFAULT ''"]];
     for (const [name, definition] of additions) if (!existing.has(name)) this.db.exec(`ALTER TABLE generated_clips ADD COLUMN ${name} ${definition}`);
   }
   createJob(job: VideoJob) {
@@ -57,9 +57,9 @@ export class StudioDatabase {
     this.db.prepare('INSERT INTO generated_clips (id, job_id, candidate_id, start_seconds, end_seconds, duration_seconds, output_path, output_filename, status, error_message, caption_path, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
       .run(clip.id, clip.jobId, clip.candidateId, clip.startSeconds, clip.endSeconds, clip.durationSeconds, clip.outputPath, clip.outputFilename, clip.status, clip.errorMessage, clip.captionPath, clip.createdAt, clip.updatedAt);
   }
-  updateClip(id: string, fields: Partial<Pick<GeneratedClip, 'status' | 'errorMessage' | 'durationSeconds'>>) {
+  updateClip(id: string, fields: Partial<Pick<GeneratedClip, 'status' | 'errorMessage' | 'durationSeconds' | 'captionPath'>>) {
     const entries = Object.entries(fields).filter(([, value]) => value !== undefined); if (!entries.length) return;
-    const columns: Record<string, string> = { errorMessage: 'error_message', durationSeconds: 'duration_seconds' };
+    const columns: Record<string, string> = { errorMessage: 'error_message', durationSeconds: 'duration_seconds', captionPath: 'caption_path' };
     this.db.prepare(`UPDATE generated_clips SET ${entries.map(([key]) => `${columns[key] ?? key} = ?`).join(', ')}, updated_at = ? WHERE id = ?`).run(...entries.map(([, value]) => value ?? null), new Date().toISOString(), id);
   }
   getClip(jobId: string, clipId: string): GeneratedClip | undefined { return this.mapClip(this.db.prepare('SELECT * FROM generated_clips WHERE job_id = ? AND id = ?').get(jobId, clipId)); }
