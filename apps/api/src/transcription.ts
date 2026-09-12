@@ -37,7 +37,9 @@ export class WhisperCppTranscriber implements TranscriptionEngine {
   async transcribe(audioPath: string, workDir: string): Promise<TranscriptInput> {
     const outputBase = join(workDir, basename(audioPath, '.wav'));
     try {
-      await execFileAsync(this.executablePath, ['-m', this.modelPath, '-f', audioPath, '-l', this.language, '-oj', '-of', outputBase], { timeout: this.timeoutMs, maxBuffer: 1024 * 1024, cwd: dirname(audioPath) });
+      // Render's free service is CPU-only. Force whisper.cpp to stay on CPU instead of
+      // attempting GPU initialization, which makes the process fail before transcription.
+      await execFileAsync(this.executablePath, ['-m', this.modelPath, '-f', audioPath, '-l', this.language, '-ngl', '0', '-oj', '-of', outputBase], { timeout: this.timeoutMs, maxBuffer: 1024 * 1024, cwd: dirname(audioPath) });
     } catch (error) {
       const detail = error instanceof Error ? error.message : 'Unknown whisper.cpp execution failure';
       throw new Error(`Local whisper.cpp transcription failed: ${detail}`);
