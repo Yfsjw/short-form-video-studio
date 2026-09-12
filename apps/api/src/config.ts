@@ -19,8 +19,9 @@ const schema = z.object({
   CLIP_VERTICAL_WIDTH: z.coerce.number().int().positive().default(1080),
   CLIP_VERTICAL_HEIGHT: z.coerce.number().int().positive().default(1920),
   TRANSCRIPTION_ENGINE: z.enum(['whisper_cpp']).default('whisper_cpp'),
-  WHISPER_CPP_PATH: z.string().default('./.render/whisper-cli'),
-  WHISPER_MODEL_PATH: z.string().default('./.render/ggml-base.en.bin'),
+  // Render builds .render at the repository root, while the API starts from apps/api.
+  WHISPER_CPP_PATH: z.string().default('../../.render/whisper-cli'),
+  WHISPER_MODEL_PATH: z.string().default('../../.render/ggml-base.en.bin'),
   TRANSCRIPTION_LANGUAGE: z.string().min(2).max(12).default('en'),
   TRANSCRIPTION_TIMEOUT_MS: z.coerce.number().int().positive().default(3_600_000),
   HIGHLIGHT_MIN_DURATION_SECONDS: z.coerce.number().positive().default(20),
