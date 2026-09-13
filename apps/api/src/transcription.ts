@@ -47,7 +47,7 @@ export class WhisperCppTranscriber implements TranscriptionEngine {
     try {
       // Render's free service is CPU-only. Force whisper.cpp to stay on CPU instead of
       // attempting GPU initialization, which makes the process fail before transcription.
-      const result = await execFileAsync(this.executablePath, ['-m', this.modelPath, '-f', audioPath, '-l', this.language, '-ngl', '0', '-oj', '-of', outputBase], { timeout: this.timeoutMs, maxBuffer: 2 * 1024 * 1024, cwd: dirname(audioPath) });
+      const result = await execFileAsync(this.executablePath, ['-m', this.modelPath, '-f', audioPath, '-l', this.language, '-ng', '-oj', '-of', outputBase], { timeout: this.timeoutMs, maxBuffer: 2 * 1024 * 1024, cwd: dirname(audioPath) });
       stdout = result.stdout;
       stderr = result.stderr;
     } catch (error) {
