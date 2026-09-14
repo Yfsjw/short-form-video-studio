@@ -38,9 +38,24 @@ export function createApp(config: AppConfig) {
   app.use(cors({ origin: config.CORS_ORIGIN }));
   app.use(pinoHttp({ logger }));
   app.use(express.json({ limit: '32kb' }));
+
   app.get('/test-upload', (_req, res) => {
-    res.type('html').send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Video Processing Test</title><style>body{font-family:system-ui,sans-serif;max-width:720px;margin:32px auto;padding:0 16px}button{padding:10px 16px;margin-top:12px}pre{white-space:pre-wrap;word-break:break-word;background:#f5f5f5;padding:12px;border-radius:8px}</style></head><body><h1>Video Processing Test</h1><p>Temporary mobile test page.</p><input id="video" type="file" accept="video/*"><br><button id="upload" type="button">Upload video</button><pre id="out">Choose a video, then tap Upload video.</pre><script>const video=document.getElementById('video');const out=document.getElementById('out');const button=document.getElementById('upload');let busy=false;async function readResponse(r){const text=await r.text();if(!text)return {error:{code:'EMPTY_RESPONSE',message:'The server closed the upload request without returning a response.'}};try{return JSON.parse(text)}catch{return {error:{code:'NON_JSON_RESPONSE',message:'The server returned an unexpected response.',raw:text.slice(0,500)}}}}async function uploadVideo(){if(busy)return;const file=video.files&&video.files[0];if(!file){out.textContent='Please choose a video first.';return}busy=true;button.disabled=true;out.textContent='Uploading '+(file.size/1024/1024).toFixed(1)+' MB...';const data=new FormData();data.append('video',file);try{const r=await fetch('/api/jobs',{method:'POST',body:data});const j=await readResponse(r);if(!r.ok||j.error){out.textContent=JSON.stringify(j,null,2);return}const id=j.job.id;out.textContent='Upload complete. Job: '+id+'\n\nProcessing...';async function poll(){try{const sr=await fetch('/api/jobs/'+id);const sj=await readResponse(sr);out.textContent=JSON.stringify(sj,null,2);if(sj.job&&sj.job.status!=='completed'&&sj.job.status!=='failed'){setTimeout(poll,3000)}}catch(err){out.textContent='Polling failed: '+String(err)}}setTimeout(poll,1000)}catch(err){out.textContent='Upload failed: '+String(err)}finally{busy=false;button.disabled=false}}button.addEventListener('click',uploadVideo);</script></body></html>`);
+    res.type('html').send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Video Processing Test</title><style>body{font-family:system-ui,sans-serif;max-width:720px;margin:32px auto;padding:0 16px}button{padding:10px 16px;margin-top:12px}pre{white-space:pre-wrap;word-break:break-word;background:#f5f5f5;padding:12px;border-radius:8px}</style></head><body><h1>Video Processing Test</h1><p>Temporary mobile upload test. This version does not require JavaScript.</p><form action="/test-upload" method="post" enctype="multipart/form-data"><input name="video" type="file" accept="video/*" required><br><button type="submit">Upload video</button></form><pre>Choose a video, then tap Upload video.</pre></body></html>`);
   });
+
+  app.post('/test-upload', upload.single('video'), (req, res, next) => {
+    try {
+      if (!req.file) return res.status(400).type('html').send('<h1>Upload failed</h1><p>No video file was received.</p><p><a href="/test-upload">Try again</a></p>');
+      const now = new Date().toISOString();
+      const job: VideoJob = { id: randomUUID(), originalFilename: req.file.originalname, storedFilename: req.file.filename, mimeType: req.file.mimetype, sizeBytes: req.file.size, status: 'queued', stage: 'queued', errorMessage: null, durationSeconds: null, width: null, height: null, createdAt: now, updatedAt: now };
+      db.createJob(job);
+      pipeline.enqueue(job.id);
+      res.type('html').send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Upload received</title><style>body{font-family:system-ui,sans-serif;max-width:720px;margin:32px auto;padding:0 16px}pre{white-space:pre-wrap;word-break:break-word;background:#f5f5f5;padding:12px;border-radius:8px}</style></head><body><h1>Upload received</h1><p>Your video reached the backend successfully.</p><pre>Job ID: ${job.id}\nFile: ${req.file.originalname}\nSize: ${(req.file.size / 1024 / 1024).toFixed(1)} MB\nStatus: queued</pre><p>Open <a href="/api/jobs/${job.id}">the job status</a> to monitor processing.</p><p><a href="/test-upload">Upload another video</a></p></body></html>`);
+    } catch (error) {
+      next(error);
+    }
+  });
+
   app.get('/api/health', (_req, res) => res.json({ status: 'ok', service: 'short-form-video-studio' }));
   app.post('/api/jobs', upload.single('video'), (req, res, next) => {
     try {
