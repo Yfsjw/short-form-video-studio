@@ -34,26 +34,40 @@ export function createApp(config: AppConfig) {
     if (!acceptedExtensions.has(ext) || (file.mimetype && !acceptedMimeTypes.has(file.mimetype))) return cb(new Error('Only MP4, MOV, MKV, WebM, AVI, and M4V video files are accepted.'));
     cb(null, true);
   }});
+  const testUpload = multer({ storage, limits: { fileSize: 20 * 1024 * 1024, files: 1 }, fileFilter: (_req, file, cb) => {
+    const ext = extname(file.originalname).toLowerCase();
+    if (!acceptedExtensions.has(ext) || (file.mimetype && !acceptedMimeTypes.has(file.mimetype))) return cb(new Error('Only MP4, MOV, MKV, WebM, AVI, and M4V video files are accepted.'));
+    cb(null, true);
+  }});
   const app = express();
   app.use(cors({ origin: config.CORS_ORIGIN }));
   app.use(pinoHttp({ logger }));
   app.use(express.json({ limit: '32kb' }));
 
   app.get('/test-upload', (_req, res) => {
-    res.type('html').send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Video Processing Test</title><style>body{font-family:system-ui,sans-serif;max-width:720px;margin:32px auto;padding:0 16px}button{padding:10px 16px;margin-top:12px}pre{white-space:pre-wrap;word-break:break-word;background:#f5f5f5;padding:12px;border-radius:8px}</style></head><body><h1>Video Processing Test</h1><p>Temporary mobile upload test. This version does not require JavaScript.</p><form action="/test-upload" method="post" enctype="multipart/form-data"><input name="video" type="file" accept="video/*" required><br><button type="submit">Upload video</button></form><pre>Choose a video, then tap Upload video.</pre></body></html>`);
+    res.type('html').send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Video Upload Diagnostic</title><style>body{font-family:system-ui,sans-serif;max-width:720px;margin:32px auto;padding:0 16px}button{padding:10px 16px;margin-top:12px}pre{white-space:pre-wrap;word-break:break-word;background:#f5f5f5;padding:12px;border-radius:8px}.note{font-weight:600}</style></head><body><h1>Video Upload Diagnostic</h1><p class="note">For this test, choose a video smaller than 20 MB.</p><p>We are testing only: phone → Render → backend. The normal API upload limit is unchanged.</p><form action="/test-upload" method="post" enctype="multipart/form-data"><input name="video" type="file" accept="video/*" required><br><button type="submit">Upload video</button></form><pre>Use a short video, ideally 5–20 MB. Do not use the previous ~95 MB file for this test.</pre></body></html>`);
   });
 
-  app.post('/test-upload', upload.single('video'), (req, res, next) => {
-    try {
-      if (!req.file) return res.status(400).type('html').send('<h1>Upload failed</h1><p>No video file was received.</p><p><a href="/test-upload">Try again</a></p>');
-      const now = new Date().toISOString();
-      const job: VideoJob = { id: randomUUID(), originalFilename: req.file.originalname, storedFilename: req.file.filename, mimeType: req.file.mimetype, sizeBytes: req.file.size, status: 'queued', stage: 'queued', errorMessage: null, durationSeconds: null, width: null, height: null, createdAt: now, updatedAt: now };
-      db.createJob(job);
-      pipeline.enqueue(job.id);
-      res.type('html').send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Upload received</title><style>body{font-family:system-ui,sans-serif;max-width:720px;margin:32px auto;padding:0 16px}pre{white-space:pre-wrap;word-break:break-word;background:#f5f5f5;padding:12px;border-radius:8px}</style></head><body><h1>Upload received</h1><p>Your video reached the backend successfully.</p><pre>Job ID: ${job.id}\nFile: ${req.file.originalname}\nSize: ${(req.file.size / 1024 / 1024).toFixed(1)} MB\nStatus: queued</pre><p>Open <a href="/api/jobs/${job.id}">the job status</a> to monitor processing.</p><p><a href="/test-upload">Upload another video</a></p></body></html>`);
-    } catch (error) {
-      next(error);
-    }
+  app.post('/test-upload', (req, res, next) => {
+    testUpload.single('video')(req, res, (error?: unknown) => {
+      if (error) {
+        const message = error instanceof multer.MulterError && error.code === 'LIMIT_FILE_SIZE'
+          ? 'Diagnostic limit exceeded: choose a video smaller than 20 MB.'
+          : error instanceof Error ? error.message : 'Upload failed unexpectedly.';
+        req.log.error({ err: error }, 'Diagnostic upload failed');
+        return res.status(400).type('html').send(`<!doctype html><html><body><h1>Upload failed</h1><p>${message}</p><p><a href="/test-upload">Try again</a></p></body></html>`);
+      }
+      try {
+        if (!req.file) return res.status(400).type('html').send('<h1>Upload failed</h1><p>No video file was received.</p><p><a href="/test-upload">Try again</a></p>');
+        const now = new Date().toISOString();
+        const job: VideoJob = { id: randomUUID(), originalFilename: req.file.originalname, storedFilename: req.file.filename, mimeType: req.file.mimetype, sizeBytes: req.file.size, status: 'queued', stage: 'queued', errorMessage: null, durationSeconds: null, width: null, height: null, createdAt: now, updatedAt: now };
+        db.createJob(job);
+        pipeline.enqueue(job.id);
+        res.type('html').send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Upload received</title></head><body><h1>Upload received</h1><p>Your video reached the backend successfully.</p><pre>Job ID: ${job.id}\nFile: ${req.file.originalname}\nSize: ${(req.file.size / 1024 / 1024).toFixed(1)} MB\nStatus: queued</pre><p>Open <a href="/api/jobs/${job.id}">the job status</a> to monitor processing.</p><p><a href="/test-upload">Upload another video</a></p></body></html>`);
+      } catch (error) {
+        next(error);
+      }
+    });
   });
 
   app.get('/api/health', (_req, res) => res.json({ status: 'ok', service: 'short-form-video-studio' }));
