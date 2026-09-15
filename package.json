@@ -7,7 +7,7 @@
   "scripts": {
     "dev": "npm run dev --workspace=@studio/api & npm run dev --workspace=@studio/web",
     "build": "npm run setup:whisper && npm run build --workspaces",
-    "setup:whisper": "rm -rf .render && git clone --depth 1 https://github.com/ggml-org/whisper.cpp.git .render/whisper.cpp && cmake -S .render/whisper.cpp -B .render/whisper.cpp/build -DCMAKE_BUILD_TYPE=Release && cmake --build .render/whisper.cpp/build -j2 --config Release && cp .render/whisper.cpp/build/bin/whisper-cli .render/whisper-cli && curl -L --fail --retry 3 https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en-q5_1.bin -o .render/ggml-base.en.bin",
+    "setup:whisper": "rm -rf .render && git clone --depth 1 https://github.com/ggml-org/whisper.cpp.git .render/whisper.cpp && cmake -S .render/whisper.cpp -B .render/whisper.cpp/build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF && cmake --build .render/whisper.cpp/build -j2 --config Release && cp .render/whisper.cpp/build/bin/whisper-cli .render/whisper-cli && curl -L --fail --retry 3 https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en-q5_1.bin -o .render/ggml-base.en.bin",
     "check": "npm run check --workspaces",
     "test": "npm run test --workspace=@studio/api"
   }
