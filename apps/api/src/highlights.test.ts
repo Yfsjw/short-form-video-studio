@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { mkdtemp, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { StudioDatabase } from './database.js';
 import type { TranscriptSegment, VideoJob } from './domain.js';
 import { DeterministicHighlightDetector, type HighlightOptions } from './highlights.js';
+
+const TEST_DATABASE_URL = process.env.DATABASE_URL ?? 'postgresql://postgres:localtest@localhost:5432/studio_local_test';
 
 // Deterministic fixture data representing timestamped local-transcription output; not AI output.
 const segments = (items: Array<[number, number, string]>): TranscriptSegment[] => items.map(([startSeconds, endSeconds, text], segmentIndex) => ({ id: `s-${segmentIndex}`, jobId: 'job', segmentIndex, startSeconds, endSeconds, text, createdAt: '2026-01-01T00:00:00.000Z' }));
@@ -31,10 +31,10 @@ test('suppresses heavily overlapping windows while retaining ranked candidates',
 });
 
 test('persists highlight candidates in ranking order', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'studio-highlights-db-')); const db = new StudioDatabase(join(root, 'studio.db'));
+  const db = await StudioDatabase.connect(TEST_DATABASE_URL, `test_highlights_${randomUUID().replaceAll('-', '_')}`);
   try {
-    const now = new Date().toISOString(); const job: VideoJob = { id: 'job', originalFilename: 'video.mp4', storedFilename: 'video.mp4', mimeType: 'video/mp4', sizeBytes: 1, status: 'processing', stage: 'detecting_highlights', errorMessage: null, durationSeconds: 30, width: null, height: null, createdAt: now, updatedAt: now }; db.createJob(job);
-    db.replaceHighlights(job.id, [{ startSeconds: 10, endSeconds: 20, score: 90, quality: 'high', reasons: ['numeric detail'], signals: {}, sourceSegmentIndexes: [1] }, { startSeconds: 0, endSeconds: 10, score: 50, quality: 'medium', reasons: [], signals: {}, sourceSegmentIndexes: [0] }]);
-    assert.deepEqual(db.listHighlights(job.id).map((candidate) => candidate.score), [90, 50]);
-  } finally { db.close(); await rm(root, { recursive: true, force: true }); }
+    const now = new Date().toISOString(); const job: VideoJob = { id: 'job', originalFilename: 'video.mp4', storedFilename: 'video.mp4', mimeType: 'video/mp4', sizeBytes: 1, status: 'processing', stage: 'detecting_highlights', errorMessage: null, durationSeconds: 30, width: null, height: null, createdAt: now, updatedAt: now }; await db.createJob(job);
+    await db.replaceHighlights(job.id, [{ startSeconds: 10, endSeconds: 20, score: 90, quality: 'high', reasons: ['numeric detail'], signals: {}, sourceSegmentIndexes: [1] }, { startSeconds: 0, endSeconds: 10, score: 50, quality: 'medium', reasons: [], signals: {}, sourceSegmentIndexes: [0] }]);
+    assert.deepEqual((await db.listHighlights(job.id)).map((candidate) => candidate.score), [90, 50]);
+  } finally { await db.close({ dropSchema: true }); }
 });

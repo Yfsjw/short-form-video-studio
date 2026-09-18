@@ -18,12 +18,12 @@ import { FfmpegClipRenderer, isSafeClipIdentifier, resolveClipOutputPath } from 
 const acceptedExtensions = new Set(['.mp4', '.mov', '.mkv', '.webm', '.avi', '.m4v']);
 const acceptedMimeTypes = new Set(['video/mp4', 'video/quicktime', 'video/x-matroska', 'video/webm', 'video/x-msvideo', 'video/x-m4v']);
 
-export function createApp(config: AppConfig) {
+export async function createApp(config: AppConfig) {
   mkdirSync(config.UPLOAD_DIR, { recursive: true });
   mkdirSync(config.TEMP_DIR, { recursive: true });
   mkdirSync(config.OUTPUT_DIR, { recursive: true });
   const logger = pino({ level: process.env.LOG_LEVEL ?? 'info' });
-  const db = new StudioDatabase(config.DATABASE_PATH);
+  const db = await StudioDatabase.connect(config.DATABASE_URL);
   const transcriber = createTranscriptionEngine(config);
   const highlightOptions: HighlightOptions = { minDurationSeconds: config.HIGHLIGHT_MIN_DURATION_SECONDS, maxDurationSeconds: config.HIGHLIGHT_MAX_DURATION_SECONDS, maxCandidates: config.HIGHLIGHT_MAX_CANDIDATES, overlapThreshold: config.HIGHLIGHT_OVERLAP_THRESHOLD, weights: { density: config.HIGHLIGHT_WEIGHT_DENSITY, emphasis: config.HIGHLIGHT_WEIGHT_EMPHASIS, question: config.HIGHLIGHT_WEIGHT_QUESTION, number: config.HIGHLIGHT_WEIGHT_NUMBER, contrast: config.HIGHLIGHT_WEIGHT_CONTRAST, hook: config.HIGHLIGHT_WEIGHT_HOOK, completeness: config.HIGHLIGHT_WEIGHT_COMPLETENESS } };
   const renderer = new FfmpegClipRenderer(config.FFMPEG_PATH, config.CLIP_VIDEO_CODEC, config.CLIP_AUDIO_CODEC, config.CLIP_CRF, config.CLIP_PRESET, config.CLIP_VERTICAL_WIDTH, config.CLIP_VERTICAL_HEIGHT);
@@ -49,7 +49,7 @@ export function createApp(config: AppConfig) {
   });
 
   app.post('/test-upload', (req, res, next) => {
-    testUpload.single('video')(req, res, (error?: unknown) => {
+    testUpload.single('video')(req, res, async (error?: unknown) => {
       if (error) {
         const message = error instanceof multer.MulterError && error.code === 'LIMIT_FILE_SIZE'
           ? 'Diagnostic limit exceeded: choose a video smaller than 20 MB.'
@@ -61,7 +61,7 @@ export function createApp(config: AppConfig) {
         if (!req.file) return res.status(400).type('html').send('<h1>Upload failed</h1><p>No video file was received.</p><p><a href="/test-upload">Try again</a></p>');
         const now = new Date().toISOString();
         const job: VideoJob = { id: randomUUID(), originalFilename: req.file.originalname, storedFilename: req.file.filename, mimeType: req.file.mimetype, sizeBytes: req.file.size, status: 'queued', stage: 'queued', errorMessage: null, durationSeconds: null, width: null, height: null, createdAt: now, updatedAt: now };
-        db.createJob(job);
+        await db.createJob(job);
         pipeline.enqueue(job.id);
         res.type('html').send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Upload received</title></head><body><h1>Upload received</h1><p>Your video reached the backend successfully.</p><pre>Job ID: ${job.id}\nFile: ${req.file.originalname}\nSize: ${(req.file.size / 1024 / 1024).toFixed(1)} MB\nStatus: queued</pre><p>Open <a href="/api/jobs/${job.id}">the job status</a> to monitor processing.</p><p><a href="/test-upload">Upload another video</a></p></body></html>`);
       } catch (error) {
@@ -71,33 +71,33 @@ export function createApp(config: AppConfig) {
   });
 
   app.get('/api/health', (_req, res) => res.json({ status: 'ok', service: 'short-form-video-studio' }));
-  app.post('/api/jobs', upload.single('video'), (req, res, next) => {
+  app.post('/api/jobs', upload.single('video'), async (req, res, next) => {
     try {
       if (!req.file) return res.status(400).json({ error: { code: 'VIDEO_REQUIRED', message: 'Attach one video file using the “video” field.' } });
       const now = new Date().toISOString();
       const job: VideoJob = { id: randomUUID(), originalFilename: req.file.originalname, storedFilename: req.file.filename, mimeType: req.file.mimetype, sizeBytes: req.file.size, status: 'queued', stage: 'queued', errorMessage: null, durationSeconds: null, width: null, height: null, createdAt: now, updatedAt: now };
-      db.createJob(job); pipeline.enqueue(job.id);
+      await db.createJob(job); pipeline.enqueue(job.id);
       res.status(202).json({ job });
     } catch (error) { next(error); }
   });
-  app.get('/api/jobs/:id', (req, res) => {
-    const job = db.getJob(req.params.id);
+  app.get('/api/jobs/:id', async (req, res) => {
+    const job = await db.getJob(req.params.id);
     if (!job) return res.status(404).json({ error: { code: 'JOB_NOT_FOUND', message: 'No processing job exists for this id.' } });
-    res.json({ job, clips: db.listClips(job.id) });
+    res.json({ job, clips: await db.listClips(job.id) });
   });
-  app.get('/api/jobs/:id/transcript', (req, res) => {
-    const job = db.getJob(req.params.id);
+  app.get('/api/jobs/:id/transcript', async (req, res) => {
+    const job = await db.getJob(req.params.id);
     if (!job) return res.status(404).json({ error: { code: 'JOB_NOT_FOUND', message: 'No processing job exists for this id.' } });
-    res.json({ jobId: job.id, status: job.status, stage: job.stage, segments: db.listTranscript(job.id) });
+    res.json({ jobId: job.id, status: job.status, stage: job.stage, segments: await db.listTranscript(job.id) });
   });
-  app.get('/api/jobs/:id/highlights', (req, res) => {
-    const job = db.getJob(req.params.id);
+  app.get('/api/jobs/:id/highlights', async (req, res) => {
+    const job = await db.getJob(req.params.id);
     if (!job) return res.status(404).json({ error: { code: 'JOB_NOT_FOUND', message: 'No processing job exists for this id.' } });
-    res.json({ jobId: job.id, status: job.status, stage: job.stage, candidates: db.listHighlights(job.id) });
+    res.json({ jobId: job.id, status: job.status, stage: job.stage, candidates: await db.listHighlights(job.id) });
   });
-  app.get('/api/jobs/:jobId/clips/:clipId', (req, res) => {
+  app.get('/api/jobs/:jobId/clips/:clipId', async (req, res) => {
     if (!isSafeClipIdentifier(req.params.jobId) || !isSafeClipIdentifier(req.params.clipId)) return res.status(404).json({ error: { code: 'CLIP_NOT_FOUND', message: 'Generated clip not found.' } });
-    const job = db.getJob(req.params.jobId); const clip = job && db.getClip(job.id, req.params.clipId);
+    const job = await db.getJob(req.params.jobId); const clip = job && await db.getClip(job.id, req.params.clipId);
     if (!job || !clip || clip.status !== 'completed' || clip.outputFilename !== `${clip.id}.mp4`) return res.status(404).json({ error: { code: 'CLIP_NOT_FOUND', message: 'Generated clip not found.' } });
     const outputPath = resolveClipOutputPath(config.OUTPUT_DIR, job.id, clip.id, clip.outputFilename);
     if (!outputPath) return res.status(404).json({ error: { code: 'CLIP_NOT_FOUND', message: 'Generated clip not found.' } });

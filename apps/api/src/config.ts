@@ -4,7 +4,9 @@ import { z } from 'zod';
 const schema = z.object({
   PORT: z.coerce.number().int().positive().default(3001),
   HOST: z.string().default('0.0.0.0'),
-  DATABASE_PATH: z.string().default('./data/studio.db'),
+  // Local default matches the throwaway Postgres instance used for local dev/tests.
+  // Render sets the real Neon connection string via this same env var.
+  DATABASE_URL: z.string().default('postgresql://postgres:localtest@localhost:5432/studio_local_test'),
   UPLOAD_DIR: z.string().default('./uploads'),
   MAX_UPLOAD_BYTES: z.coerce.number().int().positive().default(2_147_483_648),
   FFMPEG_PATH: z.string().default('ffmpeg'),
@@ -43,5 +45,5 @@ export function loadConfig(env = process.env) {
   const value = schema.parse(env);
   if (value.HIGHLIGHT_MIN_DURATION_SECONDS > value.HIGHLIGHT_MAX_DURATION_SECONDS) throw new Error('HIGHLIGHT_MIN_DURATION_SECONDS must not exceed HIGHLIGHT_MAX_DURATION_SECONDS.');
   if (value.CLIP_VERTICAL_WIDTH / value.CLIP_VERTICAL_HEIGHT !== 9 / 16) throw new Error('CLIP_VERTICAL_WIDTH and CLIP_VERTICAL_HEIGHT must preserve a 9:16 aspect ratio.');
-  return { ...value, DATABASE_PATH: resolve(value.DATABASE_PATH), UPLOAD_DIR: resolve(value.UPLOAD_DIR), TEMP_DIR: resolve(value.TEMP_DIR), OUTPUT_DIR: resolve(value.OUTPUT_DIR), WHISPER_MODEL_PATH: resolve(value.WHISPER_MODEL_PATH), WHISPER_CPP_PATH: resolve(value.WHISPER_CPP_PATH) };
+  return { ...value, UPLOAD_DIR: resolve(value.UPLOAD_DIR), TEMP_DIR: resolve(value.TEMP_DIR), OUTPUT_DIR: resolve(value.OUTPUT_DIR), WHISPER_MODEL_PATH: resolve(value.WHISPER_MODEL_PATH), WHISPER_CPP_PATH: resolve(value.WHISPER_CPP_PATH) };
 }
