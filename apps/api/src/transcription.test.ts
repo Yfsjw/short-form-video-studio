@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { StudioDatabase } from './database.js';
 import type { VideoJob } from './domain.js';
 import { VideoPipeline } from './pipeline.js';
+import { NullStorage } from './storage.js';
 import { parseWhisperCppJson, type TranscriptionEngine } from './transcription.js';
 import { DeterministicHighlightDetector } from './highlights.js';
 import type { ClipRenderer } from './clips.js';
@@ -37,7 +38,7 @@ test('pipeline integration persists mock-engine segments and cleans temporary au
     const mockTranscriber: TranscriptionEngine = { transcribe: async () => [{ segmentIndex: 0, startSeconds: 0, endSeconds: 2, text: 'Adapter-provided transcript.' }] };
     const mockRenderer: ClipRenderer = { render: async () => ({ durationSeconds: 2, sizeBytes: 1 }) };
     const logger = { info: () => undefined, error: () => undefined };
-    await new VideoPipeline(db, fakeMedia, mockTranscriber, new DeterministicHighlightDetector(), { minDurationSeconds: 1, maxDurationSeconds: 10, maxCandidates: 3, overlapThreshold: 0.65, weights: { density: 1 } }, mockRenderer, 1, root, root, root, logger).run(job.id);
+    await new VideoPipeline(db, fakeMedia, mockTranscriber, new DeterministicHighlightDetector(), { minDurationSeconds: 1, maxDurationSeconds: 10, maxCandidates: 3, overlapThreshold: 0.65, weights: { density: 1 } }, mockRenderer, 1, root, root, root, logger, new NullStorage()).run(job.id);
     assert.equal((await db.getJob(job.id))?.status, 'completed'); assert.equal((await db.listTranscript(job.id))[0]?.text, 'Adapter-provided transcript.');
     assert.equal((await db.listClips(job.id))[0]?.candidateId.length, 36);
     assert.ok(!(await readdir(root)).some((entry) => entry.startsWith('job-2-')));

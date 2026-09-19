@@ -9,13 +9,14 @@ import type { HighlightDetector, HighlightOptions } from './highlights.js';
 import type { ClipRenderer } from './clips.js';
 import type { GeneratedClip } from './domain.js';
 import { writeSrtCaptions } from './captions.js';
+import type { DurableStorage } from './storage.js';
 
 type PipelineStore = Pick<StudioDatabase, 'getJob' | 'updateJob' | 'replaceTranscript' | 'listTranscript' | 'replaceHighlights' | 'listHighlights' | 'createClip' | 'updateClip'>;
 type MediaProcessor = Pick<FfmpegAdapter, 'probe' | 'extractAudio'>;
 
 /** Orchestrates real processing stages, including 9:16 rendering and transcript-synced captions. */
 export class VideoPipeline {
-  constructor(private readonly db: PipelineStore, private readonly ffmpeg: MediaProcessor, private readonly transcriber: TranscriptionEngine, private readonly highlightDetector: HighlightDetector, private readonly highlightOptions: HighlightOptions, private readonly clipRenderer: ClipRenderer, private readonly maxClipCandidates: number, private readonly uploadDir: string, private readonly tempDir: string, private readonly outputDir: string, private readonly logger: Pick<Logger, 'info' | 'error'>) {}
+  constructor(private readonly db: PipelineStore, private readonly ffmpeg: MediaProcessor, private readonly transcriber: TranscriptionEngine, private readonly highlightDetector: HighlightDetector, private readonly highlightOptions: HighlightOptions, private readonly clipRenderer: ClipRenderer, private readonly maxClipCandidates: number, private readonly uploadDir: string, private readonly tempDir: string, private readonly outputDir: string, private readonly logger: Pick<Logger, 'info' | 'error'>, private readonly storage: DurableStorage) {}
   enqueue(jobId: string) { void this.run(jobId); }
   async run(jobId: string) {
     const job = await this.db.getJob(jobId); if (!job) return;
@@ -50,6 +51,8 @@ export class VideoPipeline {
             const transcriptSegments = await this.db.listTranscript(jobId);
             const captionCount = await writeSrtCaptions(captionPath, transcriptSegments, candidate.startSeconds, candidate.endSeconds);
             const rendered = await this.clipRenderer.render({ sourcePath: join(this.uploadDir, job.storedFilename), startSeconds: candidate.startSeconds, endSeconds: candidate.endSeconds, outputPath, captionPath: captionCount ? captionPath : null });
+            await this.storage.upload(outputPath, clip.outputPath, 'video/mp4');
+            if (captionCount) await this.storage.upload(captionPath, `${jobId}/${clipId}.srt`, 'application/x-subrip');
             await this.db.updateClip(clipId, { status: 'completed', durationSeconds: rendered.durationSeconds, errorMessage: null, captionPath }); completedCount += 1;
           } catch (error) {
             await rm(captionPath, { force: true });

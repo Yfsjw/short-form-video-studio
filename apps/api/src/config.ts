@@ -13,6 +13,12 @@ const schema = z.object({
   FFPROBE_PATH: z.string().default('ffprobe'),
   TEMP_DIR: z.string().default('./tmp'),
   OUTPUT_DIR: z.string().default('./outputs'),
+  // All four optional: when unset, generated clips stay local-disk-only (fine for local
+  // dev/tests). Render always sets these so real uploads/clips survive restarts.
+  R2_ACCOUNT_ID: z.string().optional(),
+  R2_BUCKET_NAME: z.string().optional(),
+  R2_ACCESS_KEY_ID: z.string().optional(),
+  R2_SECRET_ACCESS_KEY: z.string().optional(),
   CLIP_MAX_CANDIDATES: z.coerce.number().int().positive().default(3),
   CLIP_VIDEO_CODEC: z.string().default('libx264'),
   CLIP_AUDIO_CODEC: z.string().default('aac'),
