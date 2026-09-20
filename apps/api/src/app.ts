@@ -140,7 +140,7 @@ ${clips.filter((clip) => clip.status === 'completed').map((clip) => `<a class="d
     const job = await db.getJob(req.params.jobId); const clip = job && await db.getClip(job.id, req.params.clipId);
     if (!job || !clip || clip.status !== 'completed' || clip.outputFilename !== `${clip.id}.mp4`) return res.status(404).json({ error: { code: 'CLIP_NOT_FOUND', message: 'Generated clip not found.' } });
     if (durableStorage.isDurable) {
-      const url = await durableStorage.getDownloadUrl(clip.outputPath);
+      const url = await durableStorage.getDownloadUrl(clip.outputPath, req.query.download === '1' ? clip.outputFilename : undefined);
       if (url) return res.redirect(url);
     }
     const outputPath = resolveClipOutputPath(config.OUTPUT_DIR, job.id, clip.id, clip.outputFilename);

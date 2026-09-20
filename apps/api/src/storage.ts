@@ -8,8 +8,8 @@ export interface DurableStorage {
   upload(localPath: string, key: string, contentType: string): Promise<void>;
   /** True when this storage actually persists uploads (vs. the local-disk-only fallback). */
   readonly isDurable: boolean;
-  /** A URL the browser can download `key` from directly, or null when nothing was ever uploaded under it (fallback mode). */
-  getDownloadUrl(key: string): Promise<string | null>;
+  /** A URL the browser can fetch `key` from directly, or null when nothing was ever uploaded under it (fallback mode). Pass forceDownloadFilename to make the browser save the file instead of playing/rendering it inline. */
+  getDownloadUrl(key: string, forceDownloadFilename?: string): Promise<string | null>;
 }
 
 /** Real persistence: Cloudflare R2 via its S3-compatible API. */
@@ -31,10 +31,16 @@ export class R2Storage implements DurableStorage {
     }));
   }
 
-  async getDownloadUrl(key: string): Promise<string> {
+  async getDownloadUrl(key: string, forceDownloadFilename?: string): Promise<string> {
     // Presigned GET so the browser downloads directly from R2 -- Node never has to
-    // buffer or proxy the (potentially large) video file through itself.
-    return getSignedUrl(this.client, new GetObjectCommand({ Bucket: this.bucket, Key: key }), { expiresIn: 3600 });
+    // buffer or proxy the (potentially large) video file through itself. Without
+    // ResponseContentDisposition, R2 serves the object with its plain video/mp4
+    // content-type and browsers (mobile Chrome especially) just play it inline
+    // instead of saving it -- so this is set only when an actual download was asked for.
+    return getSignedUrl(this.client, new GetObjectCommand({
+      Bucket: this.bucket, Key: key,
+      ResponseContentDisposition: forceDownloadFilename ? `attachment; filename="${forceDownloadFilename}"` : undefined,
+    }), { expiresIn: 3600 });
   }
 }
 
@@ -42,7 +48,7 @@ export class R2Storage implements DurableStorage {
 export class NullStorage implements DurableStorage {
   readonly isDurable = false;
   async upload() { /* intentionally a no-op */ }
-  async getDownloadUrl() { return null; }
+  async getDownloadUrl(_key: string, _forceDownloadFilename?: string) { return null; }
 }
 
 export function createStorage(config: { R2_ACCOUNT_ID?: string; R2_BUCKET_NAME?: string; R2_ACCESS_KEY_ID?: string; R2_SECRET_ACCESS_KEY?: string }): DurableStorage {
