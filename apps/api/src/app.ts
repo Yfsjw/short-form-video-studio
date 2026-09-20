@@ -7,6 +7,10 @@ import multer from 'multer';
 import { pinoHttp } from 'pino-http';
 import pino from 'pino';
 import type { AppConfig } from './config.js';
+
+function escapeHtml(text: string): string {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
 import { StudioDatabase } from './database.js';
 import { createStorage } from './storage.js';
 import type { VideoJob } from './domain.js';
@@ -65,7 +69,7 @@ export async function createApp(config: AppConfig) {
         const job: VideoJob = { id: randomUUID(), originalFilename: req.file.originalname, storedFilename: req.file.filename, mimeType: req.file.mimetype, sizeBytes: req.file.size, status: 'queued', stage: 'queued', errorMessage: null, durationSeconds: null, width: null, height: null, createdAt: now, updatedAt: now };
         await db.createJob(job);
         pipeline.enqueue(job.id);
-        res.type('html').send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Upload received</title></head><body><h1>Upload received</h1><p>Your video reached the backend successfully.</p><pre>Job ID: ${job.id}\nFile: ${req.file.originalname}\nSize: ${(req.file.size / 1024 / 1024).toFixed(1)} MB\nStatus: queued</pre><p>Open <a href="/api/jobs/${job.id}">the job status</a> to monitor processing.</p><p><a href="/test-upload">Upload another video</a></p></body></html>`);
+        res.type('html').send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Upload received</title></head><body><h1>Upload received</h1><p>Your video reached the backend successfully.</p><pre>Job ID: ${job.id}\nFile: ${req.file.originalname}\nSize: ${(req.file.size / 1024 / 1024).toFixed(1)} MB\nStatus: queued</pre><p>Open <a href="/jobs/${job.id}">the job status</a> to monitor processing.</p><p><a href="/test-upload">Upload another video</a></p></body></html>`);
       } catch (error) {
         next(error);
       }
@@ -86,6 +90,40 @@ export async function createApp(config: AppConfig) {
     const job = await db.getJob(req.params.id);
     if (!job) return res.status(404).json({ error: { code: 'JOB_NOT_FOUND', message: 'No processing job exists for this id.' } });
     res.json({ job, clips: await db.listClips(job.id) });
+  });
+  // Human-friendly counterpart to the JSON route above: a big clickable download
+  // link instead of asking the person to read raw JSON and copy a clip id by hand
+  // on a phone screen. No JavaScript at all -- auto-refresh is a plain <meta> tag,
+  // so there's no inline <script> here to ever break again the way /test-upload did.
+  app.get('/jobs/:id', async (req, res) => {
+    const job = await db.getJob(req.params.id);
+    if (!job) return res.status(404).type('html').send('<!doctype html><html><body><h1>Not found</h1><p>No job exists for this id.</p></body></html>');
+    const clips = await db.listClips(job.id);
+    const stillWorking = job.status !== 'completed' && job.status !== 'failed';
+    res.type('html').send(String.raw`<!doctype html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+${stillWorking ? '<meta http-equiv="refresh" content="5">' : ''}
+<title>Job status</title>
+<style>
+  body{font-family:system-ui,sans-serif;max-width:480px;margin:32px auto;padding:0 16px}
+  .status{padding:12px;border-radius:8px;background:#f5f5f5;margin:12px 0}
+  .download{display:block;text-align:center;padding:16px;margin:12px 0;background:#1a73e8;color:#fff;text-decoration:none;border-radius:8px;font-weight:bold}
+  .error{background:#fdecea;color:#a33}
+</style>
+</head>
+<body>
+<h1>Video status</h1>
+<div class="status ${job.status === 'failed' ? 'error' : ''}">
+  <div>Status: <strong>${job.status}</strong> (${job.stage})</div>
+  ${job.status === 'failed' && job.errorMessage ? `<div style="margin-top:8px">${escapeHtml(job.errorMessage)}</div>` : ''}
+  ${stillWorking ? '<div style="margin-top:8px">Still working -- this page refreshes itself every 5 seconds.</div>' : ''}
+</div>
+${clips.filter((clip) => clip.status === 'completed').map((clip) => `<a class="download" href="/api/jobs/${job.id}/clips/${clip.id}?download=1">Download clip (${clip.durationSeconds ? Math.round(clip.durationSeconds) + 's' : ''})</a>`).join('')}
+<p><a href="/test-upload">Upload another video</a></p>
+</body>
+</html>`);
   });
   app.get('/api/jobs/:id/transcript', async (req, res) => {
     const job = await db.getJob(req.params.id);
