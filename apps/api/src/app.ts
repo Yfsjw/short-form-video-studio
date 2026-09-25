@@ -19,6 +19,7 @@ import { VideoPipeline } from './pipeline.js';
 import { createTranscriptionEngine } from './transcription.js';
 import { DeterministicHighlightDetector, type HighlightOptions } from './highlights.js';
 import { FfmpegClipRenderer, isSafeClipIdentifier, resolveClipOutputPath } from './clips.js';
+import { downloadYouTubeVideo } from './youtube.js';
 
 const acceptedExtensions = new Set(['.mp4', '.mov', '.mkv', '.webm', '.avi', '.m4v']);
 const acceptedMimeTypes = new Set(['video/mp4', 'video/quicktime', 'video/x-matroska', 'video/webm', 'video/x-msvideo', 'video/x-m4v']);
@@ -79,6 +80,22 @@ export async function createApp(config: AppConfig) {
   });
 
   app.get('/api/health', (_req, res) => res.json({ status: 'ok', service: 'short-form-video-studio' }));
+  app.post('/api/youtube', async (req, res, next) => {
+    try {
+      if (!config.COBALT_API_URL) return res.status(503).json({ error: { code: 'YOUTUBE_INGESTION_NOT_CONFIGURED', message: 'YouTube ingestion is not configured on this deployment.' } });
+      const youtubeUrl = typeof req.body?.url === 'string' ? req.body.url.trim() : '';
+      if (!youtubeUrl) return res.status(400).json({ error: { code: 'YOUTUBE_URL_REQUIRED', message: 'Provide a YouTube URL in the “url” field.' } });
+
+      const id = randomUUID();
+      const now = new Date().toISOString();
+      const downloaded = await downloadYouTubeVideo({ youtubeUrl, cobaltUrl: config.COBALT_API_URL, cobaltApiKey: config.COBALT_API_KEY, outputDir: config.UPLOAD_DIR, jobId: id, timeoutMs: config.YOUTUBE_DOWNLOAD_TIMEOUT_MS });
+      const job: VideoJob = { id, originalFilename: downloaded.originalFilename, storedFilename: downloaded.storedFilename, mimeType: downloaded.mimeType, sizeBytes: downloaded.sizeBytes, status: 'queued', stage: 'queued', errorMessage: null, durationSeconds: null, width: null, height: null, createdAt: now, updatedAt: now };
+      await db.createJob(job);
+      pipeline.enqueue(job.id);
+      res.status(202).json({ job, source: 'youtube' });
+    } catch (error) { next(error); }
+  });
+
   app.post('/api/jobs', upload.single('video'), async (req, res, next) => {
     try {
       if (!req.file) return res.status(400).json({ error: { code: 'VIDEO_REQUIRED', message: 'Attach one video file using the “video” field.' } });
