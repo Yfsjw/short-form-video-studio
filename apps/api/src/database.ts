@@ -155,6 +155,22 @@ export class StudioDatabase {
   }
 
   /** Pass { dropSchema: true } in tests to clean up the isolated schema created by connect(). Never drops anything without both a schema and this explicit flag, so production callers can't accidentally wipe data. */
+  /**
+   * Call once at startup. A job left in 'queued' or 'processing' can only mean the
+   * previous process died mid-run (enqueue() is fire-and-forget in-process, so there's
+   * no queue to resume from -- see VideoPipeline.enqueue). Confirmed live: without this,
+   * such jobs stay stuck exactly as they were forever, with no way for a caller to tell
+   * "still working" from "abandoned." Marks them failed with a distinct, honest reason
+   * instead of resuming (which the current architecture cannot actually do).
+   */
+  async reapStuckJobs(): Promise<number> {
+    const result = await this.pool.query(
+      `UPDATE video_jobs SET status = 'failed', stage = 'failed', error_message = 'Processing was interrupted by a server restart and cannot be resumed automatically.', updated_at = $1 WHERE status IN ('queued', 'processing')`,
+      [new Date().toISOString()]
+    );
+    return result.rowCount ?? 0;
+  }
+
   async close(options?: { dropSchema?: boolean }) {
     if (options?.dropSchema && this.schema) {
       await this.pool.query(`DROP SCHEMA IF EXISTS "${this.schema}" CASCADE`);
