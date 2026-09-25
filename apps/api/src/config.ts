@@ -43,7 +43,10 @@ const schema = z.object({
   HIGHLIGHT_WEIGHT_CONTRAST: z.coerce.number().min(0).default(0.15),
   HIGHLIGHT_WEIGHT_HOOK: z.coerce.number().min(0).default(0.1),
   HIGHLIGHT_WEIGHT_COMPLETENESS: z.coerce.number().min(0).default(0.1),
-  CORS_ORIGIN: z.string().url().default('http://localhost:5173')
+  CORS_ORIGIN: z.string().url().default('http://localhost:5173'),
+  COBALT_API_URL: z.string().url().optional(),
+  COBALT_API_KEY: z.string().optional(),
+  YOUTUBE_DOWNLOAD_TIMEOUT_MS: z.coerce.number().int().positive().default(1_200_000)
 });
 
 export type AppConfig = ReturnType<typeof loadConfig>;
