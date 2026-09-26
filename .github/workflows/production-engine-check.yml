@@ -1,6 +1,7 @@
 name: Production Engine Check
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - production-engine-foundation
