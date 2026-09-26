@@ -7,7 +7,7 @@ on:
   pull_request:
 
 jobs:
-  typecheck:
+  typecheck-and-media-qc:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -17,3 +17,25 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run check
+      - name: Verify media toolchain
+        run: |
+          ffmpeg -version
+          ffprobe -version
+      - name: Render a real vertical MP4
+        run: |
+          mkdir -p artifacts
+          ffmpeg -nostdin -y             -f lavfi -i "color=c=0x101216:s=1080x1920:r=30:d=12"             -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=12"             -vf "drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:text='PRODUCTION ENGINE':fontcolor=white:fontsize=86:x=(w-text_w)/2:y=760,drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf:text='real MP4 render + audio':fontcolor=0xD1D5DB:fontsize=48:x=(w-text_w)/2:y=900"             -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p             -c:a aac -b:a 128k -shortest -movflags +faststart artifacts/production-engine-smoke.mp4
+          ffprobe -v error -show_entries stream=index,codec_type,codec_name,width,height -show_entries format=duration,format_name -of json artifacts/production-engine-smoke.mp4 > artifacts/qc.json
+          cat artifacts/qc.json
+          test -s artifacts/production-engine-smoke.mp4
+          grep -q '"width": 1080' artifacts/qc.json
+          grep -q '"height": 1920' artifacts/qc.json
+          grep -q '"codec_type": "video"' artifacts/qc.json
+          grep -q '"codec_type": "audio"' artifacts/qc.json
+      - name: Upload real MP4 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-engine-smoke
+          path: |
+            artifacts/production-engine-smoke.mp4
+            artifacts/qc.json
