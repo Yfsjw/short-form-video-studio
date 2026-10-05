@@ -3,6 +3,7 @@ import { mkdir, rename, rm } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import { Readable } from 'node:stream';
 import { pipeline as streamPipeline } from 'node:stream/promises';
+import type { ReadableStream as NodeWebReadableStream } from 'node:stream/web';
 
 type CobaltResponse =
   | { status: 'tunnel' | 'redirect'; url: string; filename?: string }
@@ -88,7 +89,7 @@ export async function downloadYouTubeVideo(options: {
       const target = join(options.outputDir, storedFilename);
       const partial = `${target}.part`;
       await rm(partial, { force: true });
-      await streamPipeline(Readable.fromWeb(mediaRes.body as globalThis.ReadableStream), createWriteStream(partial));
+      await streamPipeline(Readable.fromWeb(mediaRes.body as unknown as NodeWebReadableStream<Uint8Array>), createWriteStream(partial));
       await rename(partial, target);
       const stat = await import('node:fs/promises').then((fs) => fs.stat(target));
       if (!stat.size) throw new Error('Downloaded YouTube video is empty.');
