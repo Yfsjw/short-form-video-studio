@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { Pool, type PoolClient } from 'pg';
-import type { GeneratedClip, HighlightCandidate, JobStatus, TranscriptSegment, VideoJob } from './domain.js';
+import type { GeneratedClip, HighlightCandidate, JobStatus, NewVideoJob, TranscriptSegment, VideoJob } from './domain.js';
 
 const SCHEMA_SQL = `
   CREATE TABLE IF NOT EXISTS video_jobs (
@@ -26,6 +26,9 @@ const SCHEMA_SQL = `
     reasons_json TEXT NOT NULL, signals_json TEXT NOT NULL, source_segment_indexes_json TEXT NOT NULL, created_at TEXT NOT NULL,
     UNIQUE(job_id, candidate_index)
   );
+  -- Added after the first production release; IF NOT EXISTS makes them safe on every boot, on old and new databases alike.
+  ALTER TABLE video_jobs ADD COLUMN IF NOT EXISTS source_storage_key TEXT;
+  ALTER TABLE video_jobs ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0;
 `;
 
 /**
@@ -63,17 +66,17 @@ export class StudioDatabase {
     return new StudioDatabase(pool, schema);
   }
 
-  async createJob(job: VideoJob) {
+  async createJob(job: NewVideoJob) {
     await this.pool.query(
       'INSERT INTO video_jobs (id, original_filename, stored_filename, mime_type, size_bytes, status, stage, error_message, duration_seconds, width, height, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)',
       [job.id, job.originalFilename, job.storedFilename, job.mimeType, job.sizeBytes, job.status, job.stage, job.errorMessage, job.durationSeconds, job.width, job.height, job.createdAt, job.updatedAt]
     );
   }
 
-  async updateJob(id: string, fields: Partial<Pick<VideoJob, 'status' | 'stage' | 'errorMessage' | 'durationSeconds' | 'width' | 'height'>>) {
+  async updateJob(id: string, fields: Partial<Pick<VideoJob, 'status' | 'stage' | 'errorMessage' | 'durationSeconds' | 'width' | 'height' | 'sourceStorageKey'>>) {
     const entries = Object.entries(fields).filter(([, value]) => value !== undefined);
     if (!entries.length) return;
-    const column: Record<string, string> = { errorMessage: 'error_message', durationSeconds: 'duration_seconds' };
+    const column: Record<string, string> = { errorMessage: 'error_message', durationSeconds: 'duration_seconds', sourceStorageKey: 'source_storage_key' };
     const setClauses = entries.map(([key], i) => `${column[key] ?? key} = $${i + 1}`);
     const values = entries.map(([, value]) => value ?? null);
     await this.pool.query(
@@ -154,23 +157,58 @@ export class StudioDatabase {
     return result.rows.map((row) => this.mapHighlight(row));
   }
 
-  /** Pass { dropSchema: true } in tests to clean up the isolated schema created by connect(). Never drops anything without both a schema and this explicit flag, so production callers can't accidentally wipe data. */
-  /**
-   * Call once at startup. A job left in 'queued' or 'processing' can only mean the
-   * previous process died mid-run (enqueue() is fire-and-forget in-process, so there's
-   * no queue to resume from -- see VideoPipeline.enqueue). Confirmed live: without this,
-   * such jobs stay stuck exactly as they were forever, with no way for a caller to tell
-   * "still working" from "abandoned." Marks them failed with a distinct, honest reason
-   * instead of resuming (which the current architecture cannot actually do).
-   */
-  async reapStuckJobs(): Promise<number> {
-    const result = await this.pool.query(
-      `UPDATE video_jobs SET status = 'failed', stage = 'failed', error_message = 'Processing was interrupted by a server restart and cannot be resumed automatically.', updated_at = $1 WHERE status IN ('queued', 'processing')`,
-      [new Date().toISOString()]
-    );
-    return result.rowCount ?? 0;
+  /** Counts one more processing attempt for the job and returns the new total (1 on the first run). */
+  async beginAttempt(id: string): Promise<number> {
+    const result = await this.pool.query('UPDATE video_jobs SET attempts = attempts + 1, updated_at = $1 WHERE id = $2 RETURNING attempts', [new Date().toISOString(), id]);
+    return Number(result.rows[0]?.attempts ?? 0);
   }
 
+  /** Heartbeat: a live process refreshes its job's row so nobody mistakes the job for an abandoned one. */
+  async touchJob(id: string) {
+    await this.pool.query(`UPDATE video_jobs SET updated_at = $1 WHERE id = $2 AND status IN ('queued', 'processing')`, [new Date().toISOString(), id]);
+  }
+
+  /** Every job that has not reached a final state yet, oldest first. */
+  async listUnfinishedJobs(): Promise<VideoJob[]> {
+    const result = await this.pool.query(`SELECT * FROM video_jobs WHERE status IN ('queued', 'processing') ORDER BY created_at`);
+    return result.rows.map((row) => this.mapJob(row)).filter((job): job is VideoJob => Boolean(job));
+  }
+
+  /**
+   * Atomically takes over a job whose process died (nothing touched its row since `staleBefore`).
+   * Returns false when the job is no longer stale or another process claimed it first, so two
+   * servers sweeping at the same moment can never both resume the same job. `updated_at` holds
+   * ISO-8601 UTC text, so comparing it as text is the same as comparing the instants.
+   */
+  /** Jobs that are over but whose stored copy of the uploaded video was never deleted (the process died, or storage failed, right when the job ended). */
+  async listFinishedJobsHoldingSource(limit = 50): Promise<VideoJob[]> {
+    const result = await this.pool.query(`SELECT * FROM video_jobs WHERE status IN ('completed', 'failed') AND source_storage_key IS NOT NULL ORDER BY updated_at LIMIT $1`, [limit]);
+    return result.rows.map((row) => this.mapJob(row)).filter((job): job is VideoJob => Boolean(job));
+  }
+  async claimJobForRecovery(id: string, staleBefore: string): Promise<boolean> {
+    const result = await this.pool.query(
+      `UPDATE video_jobs SET status = 'queued', stage = 'queued', error_message = NULL, updated_at = $1 WHERE id = $2 AND status IN ('queued', 'processing') AND updated_at < $3`,
+      [new Date().toISOString(), id, staleBefore]
+    );
+    return result.rowCount === 1;
+  }
+
+  /** Gives up on an abandoned job with an honest reason (same staleness guard as claimJobForRecovery). */
+  async failStaleJob(id: string, staleBefore: string, message: string): Promise<boolean> {
+    const result = await this.pool.query(
+      `UPDATE video_jobs SET status = 'failed', stage = 'failed', error_message = $1, updated_at = $2 WHERE id = $3 AND status IN ('queued', 'processing') AND updated_at < $4`,
+      [message, new Date().toISOString(), id, staleBefore]
+    );
+    return result.rowCount === 1;
+  }
+
+  /** Deletes every clip row of a job before it is re-run, and returns them so their stored files can be removed too. */
+  async deleteClipsForJob(jobId: string): Promise<GeneratedClip[]> {
+    const result = await this.pool.query('DELETE FROM generated_clips WHERE job_id = $1 RETURNING *', [jobId]);
+    return result.rows.map((row) => this.mapClip(row)).filter((clip): clip is GeneratedClip => Boolean(clip));
+  }
+
+  /** Pass { dropSchema: true } in tests to clean up the isolated schema created by connect(). Never drops anything without both a schema and this explicit flag, so production callers can't accidentally wipe data. */
   async close(options?: { dropSchema?: boolean }) {
     if (options?.dropSchema && this.schema) {
       await this.pool.query(`DROP SCHEMA IF EXISTS "${this.schema}" CASCADE`);
@@ -192,7 +230,7 @@ export class StudioDatabase {
     }
   }
 
-  private mapJob(row: any): VideoJob | undefined { if (!row) return undefined; return { id: row.id, originalFilename: row.original_filename, storedFilename: row.stored_filename, mimeType: row.mime_type, sizeBytes: Number(row.size_bytes), status: row.status as JobStatus, stage: row.stage, errorMessage: row.error_message, durationSeconds: row.duration_seconds, width: row.width, height: row.height, createdAt: row.created_at, updatedAt: row.updated_at }; }
+  private mapJob(row: any): VideoJob | undefined { if (!row) return undefined; return { id: row.id, originalFilename: row.original_filename, storedFilename: row.stored_filename, mimeType: row.mime_type, sizeBytes: Number(row.size_bytes), status: row.status as JobStatus, stage: row.stage, errorMessage: row.error_message, durationSeconds: row.duration_seconds, width: row.width, height: row.height, createdAt: row.created_at, updatedAt: row.updated_at, sourceStorageKey: row.source_storage_key ?? null, attempts: Number(row.attempts ?? 0) }; }
   private mapClip(row: any): GeneratedClip | undefined { if (!row) return undefined; return { id: row.id, jobId: row.job_id, candidateId: row.candidate_id, startSeconds: row.start_seconds, endSeconds: row.end_seconds, durationSeconds: row.duration_seconds, outputPath: row.output_path, outputFilename: row.output_filename, status: row.status, errorMessage: row.error_message, captionPath: row.caption_path, createdAt: row.created_at, updatedAt: row.updated_at }; }
   private mapTranscript(row: any): TranscriptSegment { return { id: row.id, jobId: row.job_id, segmentIndex: row.segment_index, startSeconds: row.start_seconds, endSeconds: row.end_seconds, text: row.text, createdAt: row.created_at }; }
   private mapHighlight(row: any): HighlightCandidate { return { id: row.id, jobId: row.job_id, candidateIndex: row.candidate_index, startSeconds: row.start_seconds, endSeconds: row.end_seconds, score: row.score, quality: row.quality, reasons: JSON.parse(row.reasons_json), signals: JSON.parse(row.signals_json), sourceSegmentIndexes: JSON.parse(row.source_segment_indexes_json), createdAt: row.created_at }; }

@@ -1,10 +1,15 @@
 name: CI
 
+# Runs on every push to any branch (so a change is proven before it can reach main, which Render deploys
+# automatically) and on pull requests into main.
 on:
   push:
-    branches: [main]
   pull_request:
     branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   api:
@@ -25,9 +30,6 @@ jobs:
           --health-retries 5
     env:
       DATABASE_URL: postgresql://postgres:localtest@localhost:5432/studio_local_test
-    defaults:
-      run:
-        working-directory: apps/api
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -35,6 +37,12 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: package.json
+      # The end-to-end tests render real video with FFmpeg. They fail loudly in CI (instead of being skipped) when it is missing.
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - run: npm install
+      # Type-checks both apps.
       - run: npm run check
+      # API tests: real PostgreSQL, real FFmpeg, real HTTP uploads. Cloudflare R2 and speech recognition are replaced by test doubles.
       - run: npm test
+      # The compile step Render runs after building whisper.cpp; catches anything that only breaks in a production build.
+      - run: npm run build --workspaces

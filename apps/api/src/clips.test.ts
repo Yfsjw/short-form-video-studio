@@ -6,14 +6,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { FfmpegClipRenderer, isSafeClipIdentifier, resolveClipOutputPath } from './clips.js';
 import { StudioDatabase } from './database.js';
-import type { GeneratedClip, VideoJob } from './domain.js';
+import type { GeneratedClip, NewVideoJob } from './domain.js';
 
 const TEST_DATABASE_URL = process.env.DATABASE_URL ?? 'postgresql://postgres:localtest@localhost:5432/studio_local_test';
 
 test('persists candidate-to-clip mapping and lifecycle fields', async () => {
   const db = await StudioDatabase.connect(TEST_DATABASE_URL, `test_clips_${randomUUID().replaceAll('-', '_')}`);
   try {
-    const now = new Date().toISOString(); const job: VideoJob = { id: 'job', originalFilename: 'source.mp4', storedFilename: 'source.mp4', mimeType: 'video/mp4', sizeBytes: 1, status: 'processing', stage: 'extracting_clips', errorMessage: null, durationSeconds: 20, width: 1, height: 1, createdAt: now, updatedAt: now }; await db.createJob(job);
+    const now = new Date().toISOString(); const job: NewVideoJob = { id: 'job', originalFilename: 'source.mp4', storedFilename: 'source.mp4', mimeType: 'video/mp4', sizeBytes: 1, status: 'processing', stage: 'extracting_clips', errorMessage: null, durationSeconds: 20, width: 1, height: 1, createdAt: now, updatedAt: now }; await db.createJob(job);
     const clip: GeneratedClip = { id: 'clip', jobId: job.id, candidateId: 'candidate', startSeconds: 2, endSeconds: 8, durationSeconds: 6, outputPath: 'job/clip.mp4', outputFilename: 'clip.mp4', status: 'queued', errorMessage: null, captionPath: null, createdAt: now, updatedAt: now }; await db.createClip(clip); await db.updateClip(clip.id, { status: 'processing' }); await db.updateClip(clip.id, { status: 'completed', captionPath: 'job/clip.srt' });
     const stored = await db.getClip(job.id, clip.id); assert.equal(stored?.candidateId, 'candidate'); assert.equal(stored?.status, 'completed'); assert.equal(stored?.durationSeconds, 6); assert.equal(stored?.captionPath, 'job/clip.srt');
   } finally { await db.close({ dropSchema: true }); }

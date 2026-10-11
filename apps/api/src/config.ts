@@ -1,6 +1,9 @@
 import { resolve } from 'node:path';
 import { z } from 'zod';
 
+/** A true/false switch read from the environment. Anything that is not a clear yes or no is rejected so a typo in a safety flag fails loudly at startup instead of silently turning the protection off. */
+const envFlag = z.string().default('false').transform((value) => value.trim().toLowerCase() || 'false').pipe(z.enum(['true', 'false', '1', '0', 'yes', 'no', 'on', 'off'])).transform((value) => ['true', '1', 'yes', 'on'].includes(value));
+
 const schema = z.object({
   PORT: z.coerce.number().int().positive().default(3001),
   HOST: z.string().default('0.0.0.0'),
@@ -19,6 +22,19 @@ const schema = z.object({
   R2_BUCKET_NAME: z.string().optional(),
   R2_ACCESS_KEY_ID: z.string().optional(),
   R2_SECRET_ACCESS_KEY: z.string().optional(),
+  // When on, the server refuses to start unless all four R2 settings are present, instead of
+  // quietly falling back to the local disk (which Render wipes on every restart).
+  REQUIRE_DURABLE_STORAGE: envFlag,
+  // How many jobs may be in their CPU/memory-heavy stages (transcription, rendering) at once.
+  // The 512 MB free instance can only afford one.
+  JOB_CONCURRENCY: z.coerce.number().int().min(1).max(8).default(1),
+  // A job is started at most this many times in total (the first run included); after that it is
+  // failed for good, so a video that crashes the server cannot cause an endless crash loop.
+  JOB_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(10).default(3),
+  // A running job refreshes its database row every JOB_HEARTBEAT_SECONDS; a queued/processing job
+  // untouched for JOB_STALE_AFTER_SECONDS belongs to a process that died and is resumed or failed.
+  JOB_STALE_AFTER_SECONDS: z.coerce.number().int().min(2).default(60),
+  JOB_HEARTBEAT_SECONDS: z.coerce.number().int().min(1).default(15),
   CLIP_MAX_CANDIDATES: z.coerce.number().int().positive().default(3),
   CLIP_VIDEO_CODEC: z.string().default('libx264'),
   CLIP_AUDIO_CODEC: z.string().default('aac'),
@@ -54,5 +70,6 @@ export function loadConfig(env = process.env) {
   const value = schema.parse(env);
   if (value.HIGHLIGHT_MIN_DURATION_SECONDS > value.HIGHLIGHT_MAX_DURATION_SECONDS) throw new Error('HIGHLIGHT_MIN_DURATION_SECONDS must not exceed HIGHLIGHT_MAX_DURATION_SECONDS.');
   if (value.CLIP_VERTICAL_WIDTH / value.CLIP_VERTICAL_HEIGHT !== 9 / 16) throw new Error('CLIP_VERTICAL_WIDTH and CLIP_VERTICAL_HEIGHT must preserve a 9:16 aspect ratio.');
+  if (value.JOB_HEARTBEAT_SECONDS * 2 > value.JOB_STALE_AFTER_SECONDS) throw new Error('JOB_HEARTBEAT_SECONDS must be at most half of JOB_STALE_AFTER_SECONDS, otherwise a healthy job could be mistaken for an abandoned one.');
   return { ...value, UPLOAD_DIR: resolve(value.UPLOAD_DIR), TEMP_DIR: resolve(value.TEMP_DIR), OUTPUT_DIR: resolve(value.OUTPUT_DIR), WHISPER_MODEL_PATH: resolve(value.WHISPER_MODEL_PATH), WHISPER_CPP_PATH: resolve(value.WHISPER_CPP_PATH) };
 }

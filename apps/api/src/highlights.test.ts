@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { randomUUID } from 'node:crypto';
 import { StudioDatabase } from './database.js';
-import type { TranscriptSegment, VideoJob } from './domain.js';
+import type { TranscriptSegment, NewVideoJob } from './domain.js';
 import { DeterministicHighlightDetector, type HighlightOptions } from './highlights.js';
 
 const TEST_DATABASE_URL = process.env.DATABASE_URL ?? 'postgresql://postgres:localtest@localhost:5432/studio_local_test';
@@ -33,7 +33,7 @@ test('suppresses heavily overlapping windows while retaining ranked candidates',
 test('persists highlight candidates in ranking order', async () => {
   const db = await StudioDatabase.connect(TEST_DATABASE_URL, `test_highlights_${randomUUID().replaceAll('-', '_')}`);
   try {
-    const now = new Date().toISOString(); const job: VideoJob = { id: 'job', originalFilename: 'video.mp4', storedFilename: 'video.mp4', mimeType: 'video/mp4', sizeBytes: 1, status: 'processing', stage: 'detecting_highlights', errorMessage: null, durationSeconds: 30, width: null, height: null, createdAt: now, updatedAt: now }; await db.createJob(job);
+    const now = new Date().toISOString(); const job: NewVideoJob = { id: 'job', originalFilename: 'video.mp4', storedFilename: 'video.mp4', mimeType: 'video/mp4', sizeBytes: 1, status: 'processing', stage: 'detecting_highlights', errorMessage: null, durationSeconds: 30, width: null, height: null, createdAt: now, updatedAt: now }; await db.createJob(job);
     await db.replaceHighlights(job.id, [{ startSeconds: 10, endSeconds: 20, score: 90, quality: 'high', reasons: ['numeric detail'], signals: {}, sourceSegmentIndexes: [1] }, { startSeconds: 0, endSeconds: 10, score: 50, quality: 'medium', reasons: [], signals: {}, sourceSegmentIndexes: [0] }]);
     assert.deepEqual((await db.listHighlights(job.id)).map((candidate) => candidate.score), [90, 50]);
   } finally { await db.close({ dropSchema: true }); }

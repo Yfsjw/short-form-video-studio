@@ -5,7 +5,7 @@ import { mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { StudioDatabase } from './database.js';
-import type { VideoJob } from './domain.js';
+import type { NewVideoJob } from './domain.js';
 import { VideoPipeline } from './pipeline.js';
 import { NullStorage } from './storage.js';
 import { parseWhisperCppJson, type TranscriptionEngine } from './transcription.js';
@@ -22,7 +22,7 @@ test('parses timestamped whisper.cpp JSON output', () => {
 test('stores and returns transcript segments in segment order', async () => {
   const db = await StudioDatabase.connect(TEST_DATABASE_URL, `test_transcript_${randomUUID().replaceAll('-', '_')}`);
   try {
-    const now = new Date().toISOString(); const job: VideoJob = { id: 'job-1', originalFilename: 'source.mp4', storedFilename: 'source.mp4', mimeType: 'video/mp4', sizeBytes: 1, status: 'processing', stage: 'transcribing', errorMessage: null, durationSeconds: null, width: null, height: null, createdAt: now, updatedAt: now };
+    const now = new Date().toISOString(); const job: NewVideoJob = { id: 'job-1', originalFilename: 'source.mp4', storedFilename: 'source.mp4', mimeType: 'video/mp4', sizeBytes: 1, status: 'processing', stage: 'transcribing', errorMessage: null, durationSeconds: null, width: null, height: null, createdAt: now, updatedAt: now };
     await db.createJob(job); await db.replaceTranscript(job.id, [{ segmentIndex: 1, startSeconds: 2, endSeconds: 3, text: 'second' }, { segmentIndex: 0, startSeconds: 0, endSeconds: 1, text: 'first' }]);
     assert.deepEqual((await db.listTranscript(job.id)).map(({ segmentIndex, startSeconds, endSeconds, text }) => ({ segmentIndex, startSeconds, endSeconds, text })), [{ segmentIndex: 0, startSeconds: 0, endSeconds: 1, text: 'first' }, { segmentIndex: 1, startSeconds: 2, endSeconds: 3, text: 'second' }]);
   } finally { await db.close({ dropSchema: true }); }
@@ -33,7 +33,8 @@ test('pipeline integration persists mock-engine segments and cleans temporary au
   const root = await mkdtemp(join(tmpdir(), 'studio-pipeline-'));
   const db = await StudioDatabase.connect(TEST_DATABASE_URL, `test_pipeline_${randomUUID().replaceAll('-', '_')}`);
   try {
-    const now = new Date().toISOString(); const job: VideoJob = { id: 'job-2', originalFilename: 'source.mp4', storedFilename: 'source.mp4', mimeType: 'video/mp4', sizeBytes: 1, status: 'queued', stage: 'queued', errorMessage: null, durationSeconds: null, width: null, height: null, createdAt: now, updatedAt: now }; await db.createJob(job);
+    const now = new Date().toISOString(); const job: NewVideoJob = { id: 'job-2', originalFilename: 'source.mp4', storedFilename: 'source.mp4', mimeType: 'video/mp4', sizeBytes: 1, status: 'queued', stage: 'queued', errorMessage: null, durationSeconds: null, width: null, height: null, createdAt: now, updatedAt: now }; await db.createJob(job);
+    await writeFile(join(root, job.storedFilename), 'x'); // the pipeline now checks that the uploaded file really is on disk
     const fakeMedia = { probe: async () => ({ durationSeconds: 6, width: 1920, height: 1080 }), extractAudio: async (_input: string, output: string) => { await writeFile(output, 'mock wav'); } };
     const mockTranscriber: TranscriptionEngine = { transcribe: async () => [{ segmentIndex: 0, startSeconds: 0, endSeconds: 2, text: 'Adapter-provided transcript.' }] };
     const mockRenderer: ClipRenderer = { render: async () => ({ durationSeconds: 2, sizeBytes: 1 }) };
