@@ -17,6 +17,7 @@ import { createTranscriptionEngine, type TranscriptionEngine } from './transcrip
 import { DeterministicHighlightDetector, type HighlightOptions } from './highlights.js';
 import { FfmpegClipRenderer, isSafeClipIdentifier, resolveClipOutputPath } from './clips.js';
 import { downloadYouTubeVideo } from './youtube.js';
+import { KeepAwake } from './keepawake.js';
 
 const acceptedExtensions = new Set(['.mp4', '.mov', '.mkv', '.webm', '.avi', '.m4v']);
 const acceptedMimeTypes = new Set(['video/mp4', 'video/quicktime', 'video/x-matroska', 'video/webm', 'video/x-msvideo', 'video/x-m4v']);
@@ -44,6 +45,8 @@ export interface AppOverrides {
   transcriber?: TranscriptionEngine;
   /** Isolates the database tables in their own Postgres schema (used by tests). */
   databaseSchema?: string;
+  /** How often the keep-awake check runs (default 4 minutes; tests make it fast). */
+  keepAwakeIntervalMs?: number;
 }
 
 export async function createApp(config: AppConfig, overrides: AppOverrides = {}) {
@@ -96,9 +99,19 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
   }});
   /** An upload that never became a job (the database was unreachable, say) must not sit on the disk for nothing. */
   const discardUpload = (storedFilename: string | undefined) => (storedFilename ? rm(join(config.UPLOAD_DIR, storedFilename), { force: true }).catch(() => undefined) : Promise.resolve());
+  // Requests that are being handled right now (a big upload from a phone can take many minutes). Health checks are left
+  // out, so neither Render's own nor the keep-awake request below can make the server look busy all by itself.
+  let requestsInFlight = 0;
   const app = express();
   app.use(cors({ origin: config.CORS_ORIGIN }));
   app.use(pinoHttp({ logger }));
+  app.use((req, res, next) => {
+    if (req.path === '/api/health') return next();
+    requestsInFlight += 1;
+    // 'close' fires when the response is complete and also when the client goes away halfway.
+    res.once('close', () => { requestsInFlight -= 1; });
+    next();
+  });
   app.use(express.json({ limit: '32kb' }));
 
   app.get('/test-upload', (_req, res) => {
@@ -226,6 +239,15 @@ ${clips.filter((clip) => clip.status === 'completed').map((clip) => `<a class="d
     const uploadCode = error instanceof multer.MulterError ? error.code : undefined;
     res.status(uploadCode || error.message.startsWith('Only ') ? 400 : 500).json({ error: { code: uploadCode ? 'INVALID_UPLOAD' : 'INTERNAL_ERROR', message: uploadCode === 'LIMIT_FILE_SIZE' ? `Video exceeds the ${maxUploadMb} MB upload limit.` : error.message || 'Unexpected server error.' } });
   });
-  const close = async (options?: { dropSchema?: boolean }) => { pipeline.close(); await db.close(options); };
+
+  // A free Render instance is spun down after 15 minutes without visitors, and a job running for longer than that
+  // while nobody watches the page (a locked phone stops the refresh) would be killed. Only on Render (which provides the
+  // public address), only while there is work.
+  const keepAwake = config.KEEP_AWAKE_WHILE_PROCESSING && config.RENDER_EXTERNAL_URL
+    ? new KeepAwake({ publicUrl: config.RENDER_EXTERNAL_URL, intervalMs: overrides.keepAwakeIntervalMs ?? 4 * 60_000, isBusy: () => pipeline.activeJobCount > 0 || requestsInFlight > 0, logger })
+    : undefined;
+  if (keepAwake) { keepAwake.start(); logger.info({ publicUrl: config.RENDER_EXTERNAL_URL }, 'While a job is processing or an upload is arriving, the instance keeps itself awake'); }
+
+  const close = async (options?: { dropSchema?: boolean }) => { keepAwake?.stop(); pipeline.close(); await db.close(options); };
   return { app, db, pipeline, storageStatus, close };
 }

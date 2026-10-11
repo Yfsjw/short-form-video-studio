@@ -42,6 +42,20 @@ test('the heartbeat must be fast enough that a healthy job is never mistaken for
   assert.throws(() => loadConfig({ JOB_STALE_AFTER_SECONDS: '10' }), /at most half/); // the default 15 s heartbeat no longer fits
 });
 
+test('the keep-awake switch is on by default, can be switched off, and rejects typos like the other safety flags', () => {
+  assert.equal(loadConfig({}).KEEP_AWAKE_WHILE_PROCESSING, true);
+  assert.equal(loadConfig({ KEEP_AWAKE_WHILE_PROCESSING: '' }).KEEP_AWAKE_WHILE_PROCESSING, true);
+  for (const off of ['false', 'FALSE', '0', 'no', 'off']) assert.equal(loadConfig({ KEEP_AWAKE_WHILE_PROCESSING: off }).KEEP_AWAKE_WHILE_PROCESSING, false, `"${off}" should switch it off`);
+  for (const on of ['true', '1', 'yes', 'on']) assert.equal(loadConfig({ KEEP_AWAKE_WHILE_PROCESSING: on }).KEEP_AWAKE_WHILE_PROCESSING, true);
+  assert.throws(() => loadConfig({ KEEP_AWAKE_WHILE_PROCESSING: 'flase' }));
+});
+
+test('the public address Render provides is used when valid, and a bad one never stops the server from starting', () => {
+  assert.equal(loadConfig({}).RENDER_EXTERNAL_URL, undefined);
+  assert.equal(loadConfig({ RENDER_EXTERNAL_URL: 'https://studio.onrender.com' }).RENDER_EXTERNAL_URL, 'https://studio.onrender.com');
+  for (const unusable of ['', ' ', 'not a url', 'studio.onrender.com']) assert.equal(loadConfig({ RENDER_EXTERNAL_URL: unusable }).RENDER_EXTERNAL_URL, undefined, `"${unusable}" must be ignored, not crash the boot`);
+});
+
 test('the upload limit can be raised or lowered from the environment', () => {
   assert.equal(loadConfig({ MAX_UPLOAD_BYTES: '104857600' }).MAX_UPLOAD_BYTES, 104_857_600);
   assert.equal(loadConfig({}).MAX_UPLOAD_BYTES, 2_147_483_648);

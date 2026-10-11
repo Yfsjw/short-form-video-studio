@@ -36,10 +36,12 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: package.json
+          cache-dependency-path: package-lock.json
       # The end-to-end tests render real video with FFmpeg. They fail loudly in CI (instead of being skipped) when it is missing.
       - run: sudo apt-get update && sudo apt-get install -y ffmpeg
-      - run: npm install
+      # Installs exactly the versions in package-lock.json (and fails if package.json and the lockfile disagree), so what
+      # is tested here is what Render builds. Update the lockfile on purpose, never by accident.
+      - run: npm ci
       # Type-checks both apps.
       - run: npm run check
       # API tests: real PostgreSQL, real FFmpeg, real HTTP uploads. Cloudflare R2 and speech recognition are replaced by test doubles.

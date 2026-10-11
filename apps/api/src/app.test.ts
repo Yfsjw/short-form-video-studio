@@ -55,7 +55,7 @@ type Studio = Awaited<ReturnType<typeof createApp>>;
 interface RunningServer { base: string; root: string; dirs: { UPLOAD_DIR: string; TEMP_DIR: string; OUTPUT_DIR: string }; studio: Studio; storage: DurableStorage; stop: () => Promise<void> }
 
 /** Boots the real app on a free port, with its own empty upload/temp/output folders (like a freshly started container). */
-async function start(options: { schema: string; storage?: DurableStorage; transcriber?: TranscriptionEngine; env?: Record<string, string> }): Promise<RunningServer> {
+async function start(options: { schema: string; storage?: DurableStorage; transcriber?: TranscriptionEngine; env?: Record<string, string>; keepAwakeIntervalMs?: number }): Promise<RunningServer> {
   const root = await mkdtemp(join(workspace, 'server-'));
   const dirs = { UPLOAD_DIR: join(root, 'uploads'), TEMP_DIR: join(root, 'tmp'), OUTPUT_DIR: join(root, 'outputs') };
   const config = loadConfig({
@@ -66,7 +66,7 @@ async function start(options: { schema: string; storage?: DurableStorage; transc
     ...options.env,
   });
   const storage = options.storage ?? new MemoryStorage();
-  const studio = await createApp(config, { storage, transcriber: options.transcriber ?? talk, databaseSchema: options.schema });
+  const studio = await createApp(config, { storage, transcriber: options.transcriber ?? talk, databaseSchema: options.schema, keepAwakeIntervalMs: options.keepAwakeIntervalMs });
   const server = createServer(studio.app).listen(0, '127.0.0.1');
   await new Promise<void>((resolve) => server.once('listening', resolve));
   let stopped = false;
@@ -313,4 +313,76 @@ test('the job page tells the truth about a resumed job and about a failed one, w
     assert.ok(!failedPage.includes('<b>boom</b>'));
     assert.doesNotMatch(failedPage, /http-equiv="refresh"/);
   } finally { await server.stop(); await dropSchema(schema); }
+});
+
+/** Stands in for Render's public front door: records every request that arrives at the service's "public address". */
+async function frontDoor() {
+  const knocks: Array<{ url: string; agent: string | undefined }> = [];
+  const door = createServer((req, res) => { knocks.push({ url: req.url ?? '', agent: req.headers['user-agent'] }); res.setHeader('content-type', 'application/json'); res.end('{"status":"ok"}'); });
+  door.listen(0, '127.0.0.1');
+  await new Promise<void>((resolve) => door.once('listening', resolve));
+  return { url: `http://127.0.0.1:${(door.address() as AddressInfo).port}`, knocks, close: () => new Promise<void>((resolve) => { door.closeAllConnections(); door.close(() => resolve()); }) };
+}
+
+/** Starts an upload of a 50 MB video, sends 1 MB of it and then waits, like a phone on a slow connection. */
+async function startSlowUpload(server: RunningServer, route = '/api/jobs') {
+  const boundary = `----slow${randomUUID()}`;
+  const socket = net.connect(Number(new URL(server.base).port), '127.0.0.1');
+  socket.on('error', () => undefined);
+  await new Promise<void>((resolve) => socket.once('connect', () => resolve()));
+  socket.write(`POST ${route} HTTP/1.1\r\nHost: test\r\nContent-Type: multipart/form-data; boundary=${boundary}\r\nContent-Length: ${50 * 1024 * 1024}\r\n\r\n--${boundary}\r\nContent-Disposition: form-data; name="video"; filename="big.mp4"\r\nContent-Type: video/mp4\r\n\r\n`);
+  socket.write(Buffer.alloc(1024 * 1024, 7));
+  await eventually('the server to start writing the upload to disk', () => readdir(server.dirs.UPLOAD_DIR), (files) => files.length === 1);
+  return socket;
+}
+
+test('while a job is being processed the instance requests its own public address, and stops as soon as the work is done', needsFfmpeg, async () => {
+  const schema = schemaName('awake'); const door = await frontDoor();
+  let release!: () => void; const gate = new Promise<void>((resolve) => { release = resolve; });
+  const slowTalk: TranscriptionEngine = { transcribe: async (audioPath, workDir) => { await gate; return talk.transcribe(audioPath, workDir); } };
+  const server = await start({ schema, transcriber: slowTalk, env: { RENDER_EXTERNAL_URL: door.url }, keepAwakeIntervalMs: 40 });
+  try {
+    await sleep(200);
+    assert.equal(door.knocks.length, 0, 'an idle server must not knock');
+
+    const { job } = await (await upload(server.base, '/api/jobs', await readFile(sampleVideo))).json() as { job: { id: string } };
+    await eventually('knocks while the job is being processed', () => door.knocks.length, (count) => count >= 3);
+    assert.ok(door.knocks.every((knock) => knock.url === '/api/health'), 'it must only ever request the health endpoint');
+    assert.ok(door.knocks.every((knock) => knock.agent === 'short-form-video-studio-keep-awake'), 'its requests must be recognisable in the logs');
+
+    release();
+    const finished = await waitForJob(server.base, job.id);
+    assert.equal(finished.job.status, 'completed', finished.job.errorMessage ?? '');
+    await untilSettled(server);
+    await sleep(150); // a request that was already on its way may still land
+    const afterWork = door.knocks.length;
+    await sleep(300);
+    assert.equal(door.knocks.length, afterWork, 'it must stop knocking once the work is done');
+  } finally { release(); await server.stop(); await door.close(); await dropSchema(schema); }
+});
+
+test('an upload that is still arriving counts as work, and a client that disappears stops counting', async () => {
+  const schema = schemaName('awake_upload'); const door = await frontDoor();
+  const server = await start({ schema, env: { RENDER_EXTERNAL_URL: door.url }, keepAwakeIntervalMs: 40 });
+  try {
+    const socket = await startSlowUpload(server);
+    await eventually('knocks during the slow upload', () => door.knocks.length, (count) => count >= 2);
+    socket.destroy();
+    await eventually('the half-received file to be removed', () => readdir(server.dirs.UPLOAD_DIR), (files) => files.length === 0);
+    await sleep(150);
+    const afterAbandoned = door.knocks.length;
+    await sleep(300);
+    assert.equal(door.knocks.length, afterAbandoned, 'an abandoned upload must not keep the instance awake');
+  } finally { await server.stop(); await door.close(); await dropSchema(schema); }
+});
+
+test('with KEEP_AWAKE_WHILE_PROCESSING switched off the instance never requests its own address, even while an upload is arriving', async () => {
+  const schema = schemaName('awake_off'); const door = await frontDoor();
+  const server = await start({ schema, env: { RENDER_EXTERNAL_URL: door.url, KEEP_AWAKE_WHILE_PROCESSING: 'false' }, keepAwakeIntervalMs: 40 });
+  try {
+    const socket = await startSlowUpload(server);
+    await sleep(400);
+    socket.destroy();
+    assert.equal(door.knocks.length, 0);
+  } finally { await server.stop(); await door.close(); await dropSchema(schema); }
 });

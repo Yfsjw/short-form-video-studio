@@ -1,8 +1,8 @@
 import { resolve } from 'node:path';
 import { z } from 'zod';
 
-/** A true/false switch read from the environment. Anything that is not a clear yes or no is rejected so a typo in a safety flag fails loudly at startup instead of silently turning the protection off. */
-const envFlag = z.string().default('false').transform((value) => value.trim().toLowerCase() || 'false').pipe(z.enum(['true', 'false', '1', '0', 'yes', 'no', 'on', 'off'])).transform((value) => ['true', '1', 'yes', 'on'].includes(value));
+/** A true/false switch read from the environment. Anything that is not a clear yes or no is rejected so a typo in a safety flag fails loudly at startup instead of silently turning the protection off. Unset or empty means `defaultValue`. */
+const envFlag = (defaultValue: boolean) => z.string().default(String(defaultValue)).transform((value) => value.trim().toLowerCase() || String(defaultValue)).pipe(z.enum(['true', 'false', '1', '0', 'yes', 'no', 'on', 'off'])).transform((value) => ['true', '1', 'yes', 'on'].includes(value));
 
 const schema = z.object({
   PORT: z.coerce.number().int().positive().default(3001),
@@ -24,7 +24,7 @@ const schema = z.object({
   R2_SECRET_ACCESS_KEY: z.string().optional(),
   // When on, the server refuses to start unless all four R2 settings are present, instead of
   // quietly falling back to the local disk (which Render wipes on every restart).
-  REQUIRE_DURABLE_STORAGE: envFlag,
+  REQUIRE_DURABLE_STORAGE: envFlag(false),
   // How many jobs may be in their CPU/memory-heavy stages (transcription, rendering) at once.
   // The 512 MB free instance can only afford one.
   JOB_CONCURRENCY: z.coerce.number().int().min(1).max(8).default(1),
@@ -35,6 +35,12 @@ const schema = z.object({
   // untouched for JOB_STALE_AFTER_SECONDS belongs to a process that died and is resumed or failed.
   JOB_STALE_AFTER_SECONDS: z.coerce.number().int().min(2).default(60),
   JOB_HEARTBEAT_SECONDS: z.coerce.number().int().min(1).default(15),
+  // Render sets this by itself to the service's public address. While a job runs or an upload arrives, the
+  // server requests its own /api/health at that address so a free instance is not spun down (killing the job)
+  // for lack of visitors. Unset everywhere else (local development, tests), which switches this off.
+  // A missing or malformed value is treated as "not set": a nicety like this must never stop the server from starting.
+  RENDER_EXTERNAL_URL: z.string().url().optional().catch(undefined),
+  KEEP_AWAKE_WHILE_PROCESSING: envFlag(true),
   CLIP_MAX_CANDIDATES: z.coerce.number().int().positive().default(3),
   CLIP_VIDEO_CODEC: z.string().default('libx264'),
   CLIP_AUDIO_CODEC: z.string().default('aac'),

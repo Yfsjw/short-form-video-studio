@@ -54,9 +54,13 @@ Job stages you can see on the status page: `preparing_source`, `saving_source`, 
 ### Honest limits of this design
 
 - **A sleeping free instance does not process anything.** Render's free web services spin down after about 15 minutes without
-  inbound traffic and kill whatever is running. The job page refreshes itself every 5 seconds, so a job page that stays open
-  (and is not suspended by the phone's browser) keeps the service awake; otherwise the job is resumed from R2 the next time
-  anything wakes the service. A paid instance (or a periodic request to `/api/health` from outside) removes this limit.
+  inbound traffic and kill whatever is running. Two things try to prevent that while there is work: the job page refreshes
+  itself every 5 seconds (but a locked phone stops it), and the server itself requests its own `/api/health` at its public
+  address (`RENDER_EXTERNAL_URL`, which Render provides) every 4 minutes **only while a job is being processed or an upload is
+  arriving**, and stops when the work is done (`KEEP_AWAKE_WHILE_PROCESSING=false` switches it off). Render does not document
+  whether a request a service makes to itself counts as inbound traffic, so **whether this really prevents the spin-down has to be
+  measured on the live service and has not been**. If it does not work, nothing is lost: the job is resumed from R2 the next time
+  anything wakes the service. A paid instance removes the limit for certain.
 - **The first moments of an upload are not covered.** The copy to R2 starts right after the upload is accepted and takes time
   proportional to the file size. If the server dies in that window the video exists only on the dying disk, so the job is
   failed with a clear "please upload again" message instead of being resumed.
@@ -103,9 +107,10 @@ The suite includes end-to-end tests that boot the real application and talk to i
 real multipart uploads and real FFmpeg/ffprobe; only R2 (kept in memory) and speech recognition (fixed text) are replaced.
 They cover: upload → durable copy → clips → signed download; a server killed in the middle of a job and replaced by a fresh
 one with an empty disk, which finishes the job from R2; uploads abandoned halfway; uploads above the old 20 MB cap;
-refusing to start without R2 when `REQUIRE_DURABLE_STORAGE` is on. CI runs the whole suite on every push and pull request.
+refusing to start without R2 when `REQUIRE_DURABLE_STORAGE` is on; the keep-awake request being made while a job runs or an
+upload arrives and not otherwise. CI runs the whole suite on every push and pull request.
 What the tests do **not** cover: the real R2 service (checked by the startup self-test instead), real whisper.cpp output,
-and large (hundreds of MB) videos on a 512 MB instance.
+large (hundreds of MB) videos on a 512 MB instance, and whether Render really counts the keep-awake request as traffic.
 
 ## Configuration
 
@@ -120,6 +125,8 @@ All configuration comes from environment variables; see [`.env.example`](.env.ex
 | `JOB_CONCURRENCY` | Jobs allowed in the CPU/memory-heavy stages at once (1–8, default 1). |
 | `JOB_MAX_ATTEMPTS` | Times a job may be started in total, the first run included (1–10, default 3). |
 | `JOB_STALE_AFTER_SECONDS`, `JOB_HEARTBEAT_SECONDS` | A job untouched for the first value is considered abandoned (default 60); live jobs refresh every second value (default 15, must be at most half of the first). |
+| `KEEP_AWAKE_WHILE_PROCESSING` | `false` stops the server from requesting its own `/api/health` while work is in progress (default `true`; only active when `RENDER_EXTERNAL_URL` is set). Anything other than a clear yes/no is rejected. |
+| `RENDER_EXTERNAL_URL` | Set by Render itself to the service's public address; not something to configure by hand. A missing or malformed value just disables the keep-awake request. |
 | `UPLOAD_DIR`, `TEMP_DIR`, `OUTPUT_DIR` | Local scratch directories (uploads, per-job audio/whisper output, rendered clips). |
 | `MAX_UPLOAD_BYTES` | Largest accepted upload (default 2 GiB). The upload page states the limit. |
 | `FFMPEG_PATH`, `FFPROBE_PATH` | Binary locations when not on `PATH`. |
@@ -181,7 +188,9 @@ process the videos users upload.
 
 Currently deployed as one free Render web service (512 MB RAM, `npm install && npm run build`, then
 `npm run start --workspace=@studio/api`, health check `/api/health`) with Neon PostgreSQL and a Cloudflare R2 bucket. The build
-compiles whisper.cpp from source, so builds take several minutes and are not cached. Set the four `R2_*` variables,
+compiles whisper.cpp from source, so builds take several minutes and are not cached. `package-lock.json` is committed, so every
+build installs exactly the dependency versions CI tested (the AWS SDK that talks to R2, for one, is released almost daily);
+upgrade on purpose with `npm update`, run the tests, and commit the lockfile. Set the four `R2_*` variables,
 `DATABASE_URL`, and `REQUIRE_DURABLE_STORAGE=true` there. whisper.cpp on a shared CPU takes roughly the duration of the source
 media or longer, so long videos need patience (or a bigger instance). For anything beyond a single small instance use
 authenticated uploads with quotas, a separate worker tier fed by a durable queue, and resource limits.
