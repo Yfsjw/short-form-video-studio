@@ -190,7 +190,11 @@ Currently deployed as one free Render web service (512 MB RAM, `npm install && n
 `npm run start --workspace=@studio/api`, health check `/api/health`) with Neon PostgreSQL and a Cloudflare R2 bucket. The build
 compiles whisper.cpp from source, so builds take several minutes and are not cached. `package-lock.json` is committed, so every
 build installs exactly the dependency versions CI tested (the AWS SDK that talks to R2, for one, is released almost daily);
-upgrade on purpose with `npm update`, run the tests, and commit the lockfile. Set the four `R2_*` variables,
+upgrade on purpose with `npm update`, run the tests, and commit the lockfile. whisper.cpp is pinned the same way: `setup:whisper`
+in the root `package.json` fetches one exact commit (`7e26d3b0…`, the one the service was running when the pin was added) instead
+of whatever is newest, because the upstream project changes daily and a change to its command line or output would only show up
+when a customer's job reaches transcription. To move to a newer whisper.cpp, change that hash, build it, and run a real
+transcription before deploying. Set the four `R2_*` variables,
 `DATABASE_URL`, and `REQUIRE_DURABLE_STORAGE=true` there. whisper.cpp on a shared CPU takes roughly the duration of the source
 media or longer, so long videos need patience (or a bigger instance). For anything beyond a single small instance use
 authenticated uploads with quotas, a separate worker tier fed by a durable queue, and resource limits.
