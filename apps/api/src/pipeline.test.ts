@@ -21,7 +21,7 @@ const fakeMedia = { probe: async () => ({ durationSeconds: 6, width: 1920, heigh
 const speech: TranscriptionEngine = { transcribe: async () => [{ segmentIndex: 0, startSeconds: 0, endSeconds: 2, text: 'Adapter-provided transcript.' }] };
 const writingRenderer: ClipRenderer = { render: async (request) => { await writeFile(request.outputPath, 'rendered clip'); return { durationSeconds: request.endSeconds - request.startSeconds, sizeBytes: 13 }; } };
 const highlightOptions = { minDurationSeconds: 1, maxDurationSeconds: 10, maxCandidates: 3, overlapThreshold: 0.65, weights: { density: 1 } };
-const fastRuntime: PipelineRuntimeOptions = { concurrency: 1, staleAfterMs: 1000, heartbeatMs: 50, recheckMs: 100, maxAttempts: 3 };
+const fastRuntime: PipelineRuntimeOptions = { concurrency: 1, staleAfterMs: 1000, heartbeatMs: 50, recheckMs: 100, watchdogMs: 60_000, maxAttempts: 3 };
 
 type Context = Awaited<ReturnType<typeof setup>>;
 
@@ -217,6 +217,31 @@ test('leaves a job alone while it still seems to be owned by a live process, and
     const job = await waitForStatus(ctx, 'j5', ['completed', 'failed'], 10_000);
     assert.equal(job.status, 'completed', job.errorMessage ?? '');
     assert.equal(job.attempts, 2);
+  } finally { await ctx.cleanup(); }
+});
+
+test('keeps looking even when nothing was waiting, so a job orphaned after the start-up check (the old instance of a redeploy) is still found', async () => {
+  const ctx = await setup({ runtime: { watchdogMs: 100 } });
+  try {
+    assert.deepEqual(await ctx.pipeline.recoverInterruptedJobs(), { resumed: [], failed: [], waiting: 0 }, 'the start-up check finds nothing to do');
+    // Afterwards another process accepts a job and is shut down before it can finish it.
+    await addJob(ctx, 'late', { status: 'processing', local: false, durable: true, attempts: 1 });
+    await ctx.backdate('late', 10);
+    const job = await waitForStatus(ctx, 'late', ['completed', 'failed'], 10_000);
+    assert.equal(job.status, 'completed', job.errorMessage ?? '');
+    assert.equal(job.attempts, 2);
+  } finally { await ctx.cleanup(); }
+});
+
+test('the slow watchdog stops when the pipeline is closed, so nothing keeps polling a database that is shutting down', async () => {
+  const ctx = await setup({ runtime: { watchdogMs: 50 } });
+  try {
+    await ctx.pipeline.recoverInterruptedJobs();
+    ctx.pipeline.close();
+    await addJob(ctx, 'ignored', { status: 'processing', local: false, durable: true, attempts: 1 });
+    await ctx.backdate('ignored', 10);
+    await sleep(400); // several watchdog periods
+    assert.equal((await ctx.db.getJob('ignored'))?.status, 'processing', 'a closed pipeline must not take jobs over');
   } finally { await ctx.cleanup(); }
 });
 

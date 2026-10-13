@@ -32,14 +32,17 @@ job is allowed to depend on the process or its disk surviving:
    bucket and the copy is verified with a `HEAD` request (stored size must equal the sent size; the transfer is retried up to
    three times). Only then is any CPU spent on it. If the copy cannot be made the job fails immediately and says so.
 2. **Running jobs prove they are alive.** Every running job refreshes its database row every `JOB_HEARTBEAT_SECONDS`.
-3. **Interrupted jobs are found and resumed.** When the server starts (and again, about every half of `JOB_STALE_AFTER_SECONDS`,
-   for as long as some unfinished job still looks like it belongs to another live server, for example during a zero-downtime
-   redeploy) it looks for queued/processing jobs that nothing has touched for `JOB_STALE_AFTER_SECONDS`. For each one:
+3. **Interrupted jobs are found and resumed.** When the server starts, and afterwards for as long as the process lives (every
+   half of `JOB_STALE_AFTER_SECONDS` while some unfinished job still looks like it belongs to another live server, for example
+   during a zero-downtime redeploy; otherwise every three times `JOB_STALE_AFTER_SECONDS`, which also catches a job that the old
+   server accepted after the new one had done its start-up check and was then shut down), it looks for queued/processing jobs
+   that nothing has touched for `JOB_STALE_AFTER_SECONDS`. For each one:
    - started `JOB_MAX_ATTEMPTS` times already → failed for good with an honest message (a video that crashes the server must
      not cause an endless crash loop);
    - its video never reached R2 and is not on this disk → failed with an honest message ("please upload again");
    - otherwise it is taken over with a single atomic database update (two servers can never both take it), the video is
-     restored from R2 (size-checked), clips left by the interrupted attempt are discarded, and processing starts again.
+     restored from R2 (size-checked; a transfer that breaks is retried up to three times), clips left by the interrupted
+     attempt are discarded, and processing starts again.
 4. **Nothing is kept longer than needed.** When a job ends, either way, its stored source video is deleted from R2 and the
    local scratch copies are removed. If the process died or R2 failed at exactly that moment, the next recovery pass deletes
    the leftover. The local copy of a video that is *not* yet safe in R2 is never deleted while its job may still be resumed.

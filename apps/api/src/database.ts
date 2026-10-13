@@ -44,7 +44,7 @@ export class StudioDatabase {
    * Connects and ensures the schema exists. Pass `schema` to isolate a run (e.g. one
    * Postgres schema per test file) instead of sharing the default "public" schema.
    */
-  static async connect(connectionString: string, schema?: string): Promise<StudioDatabase> {
+  static async connect(connectionString: string, schema?: string, logger?: { warn: (fields: object, message: string) => void }): Promise<StudioDatabase> {
     const needsSsl = /sslmode=require/.test(connectionString) || /neon\.tech/.test(connectionString);
     const poolConfig: import('pg').PoolConfig = { connectionString, ssl: needsSsl ? { rejectUnauthorized: true } : undefined };
     if (schema) {
@@ -54,6 +54,16 @@ export class StudioDatabase {
       poolConfig.options = `-c search_path="${schema}"`;
     }
     const pool = new Pool(poolConfig);
+    // A connection sitting idle in the pool can be cut by the server (a serverless database restarting or suspending
+    // its compute, a network hiccup). pg reports that as an 'error' event on the pool, and an 'error' event that nobody
+    // listens to crashes the whole process -- reproduced with a Postgres session terminated behind the pool's back. By the
+    // time the event arrives the pool has already thrown the dead connection away and opens a fresh one when it is next
+    // needed, so noting it down is all that is left to do. (A connection that is in use fails its own query instead.)
+    pool.on('error', (error) => {
+      const fields = { err: error };
+      const message = 'A database connection that was idle in the pool was closed by the server; the pool will open a new one when it is needed';
+      if (logger) logger.warn(fields, message); else console.warn(message, error.message);
+    });
     if (schema) {
       const bootstrap = await pool.connect();
       try {
@@ -174,17 +184,18 @@ export class StudioDatabase {
     return result.rows.map((row) => this.mapJob(row)).filter((job): job is VideoJob => Boolean(job));
   }
 
+  /** Jobs that are over but whose stored copy of the uploaded video was never deleted (the process died, or storage failed, right when the job ended). */
+  async listFinishedJobsHoldingSource(limit = 50): Promise<VideoJob[]> {
+    const result = await this.pool.query(`SELECT * FROM video_jobs WHERE status IN ('completed', 'failed') AND source_storage_key IS NOT NULL ORDER BY updated_at LIMIT $1`, [limit]);
+    return result.rows.map((row) => this.mapJob(row)).filter((job): job is VideoJob => Boolean(job));
+  }
+
   /**
    * Atomically takes over a job whose process died (nothing touched its row since `staleBefore`).
    * Returns false when the job is no longer stale or another process claimed it first, so two
    * servers sweeping at the same moment can never both resume the same job. `updated_at` holds
    * ISO-8601 UTC text, so comparing it as text is the same as comparing the instants.
    */
-  /** Jobs that are over but whose stored copy of the uploaded video was never deleted (the process died, or storage failed, right when the job ended). */
-  async listFinishedJobsHoldingSource(limit = 50): Promise<VideoJob[]> {
-    const result = await this.pool.query(`SELECT * FROM video_jobs WHERE status IN ('completed', 'failed') AND source_storage_key IS NOT NULL ORDER BY updated_at LIMIT $1`, [limit]);
-    return result.rows.map((row) => this.mapJob(row)).filter((job): job is VideoJob => Boolean(job));
-  }
   async claimJobForRecovery(id: string, staleBefore: string): Promise<boolean> {
     const result = await this.pool.query(
       `UPDATE video_jobs SET status = 'queued', stage = 'queued', error_message = NULL, updated_at = $1 WHERE id = $2 AND status IN ('queued', 'processing') AND updated_at < $3`,

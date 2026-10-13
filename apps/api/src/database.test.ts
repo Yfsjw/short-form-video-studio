@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { Pool } from 'pg';
 import { StudioDatabase } from './database.js';
 import type { GeneratedClip, NewVideoJob } from './domain.js';
+import { eventually } from './test-support.js';
 
 const TEST_DATABASE_URL = process.env.DATABASE_URL ?? 'postgresql://postgres:localtest@localhost:5432/studio_local_test';
 const schemaName = (label: string) => `test_${label}_${randomUUID().replaceAll('-', '_')}`;
@@ -117,6 +118,26 @@ test('giving up on an abandoned job records the reason, but never touches a live
   assert.equal((await db.getJob('alive'))?.status, 'processing');
   assert.equal((await db.getJob('finished'))?.status, 'completed');
 }));
+
+test('a connection the server cuts while it sits idle in the pool is noted, does not crash the process, and the next query simply works', async () => {
+  // Without a listener for the pool's 'error' event, this very scenario ends the whole Node process (found while reviewing the code).
+  const applicationName = `idle-probe-${randomUUID()}`;
+  const url = `${TEST_DATABASE_URL}${TEST_DATABASE_URL.includes('?') ? '&' : '?'}application_name=${applicationName}`;
+  const noted: string[] = [];
+  const db = await StudioDatabase.connect(url, schemaName('idle_cut'), { warn: (_fields, message) => { noted.push(message); } });
+  const admin = new Pool({ connectionString: TEST_DATABASE_URL, max: 1 });
+  try {
+    await db.createJob(makeJob('j1', 'queued')); // leaves a connection idle in the pool
+    // Only this test's own connections are cut (picked out by their application name), never those of tests running alongside.
+    const cut = await admin.query(`SELECT count(*)::int AS n FROM (SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = $1) AS cut`, [applicationName]);
+    assert.ok(cut.rows[0].n >= 1, 'the probe must have cut at least one idle connection');
+    await eventually('the pool to learn that its idle connection was cut', () => noted.length, (count) => count >= 1);
+    assert.equal((await db.getJob('j1'))?.id, 'j1', 'the next query must work on a fresh connection');
+  } finally {
+    await admin.end();
+    await db.close({ dropSchema: true });
+  }
+});
 
 test('deleting a job\'s clips returns them (so their files can be removed) and spares other jobs', () => withDatabase('delete_clips', async (db) => {
   await db.createJob(makeJob('j1', 'processing'));

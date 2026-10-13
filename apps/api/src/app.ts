@@ -58,7 +58,7 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
   mkdirSync(config.TEMP_DIR, { recursive: true });
   mkdirSync(config.OUTPUT_DIR, { recursive: true });
   const logger = pino({ level: process.env.LOG_LEVEL ?? 'info' });
-  const db = await StudioDatabase.connect(config.DATABASE_URL, overrides.databaseSchema);
+  const db = await StudioDatabase.connect(config.DATABASE_URL, overrides.databaseSchema, logger);
   const transcriber = overrides.transcriber ?? createTranscriptionEngine(config);
   const highlightOptions: HighlightOptions = { minDurationSeconds: config.HIGHLIGHT_MIN_DURATION_SECONDS, maxDurationSeconds: config.HIGHLIGHT_MAX_DURATION_SECONDS, maxCandidates: config.HIGHLIGHT_MAX_CANDIDATES, overlapThreshold: config.HIGHLIGHT_OVERLAP_THRESHOLD, weights: { density: config.HIGHLIGHT_WEIGHT_DENSITY, emphasis: config.HIGHLIGHT_WEIGHT_EMPHASIS, question: config.HIGHLIGHT_WEIGHT_QUESTION, number: config.HIGHLIGHT_WEIGHT_NUMBER, contrast: config.HIGHLIGHT_WEIGHT_CONTRAST, hook: config.HIGHLIGHT_WEIGHT_HOOK, completeness: config.HIGHLIGHT_WEIGHT_COMPLETENESS } };
   const renderer = new FfmpegClipRenderer(config.FFMPEG_PATH, config.CLIP_VIDEO_CODEC, config.CLIP_AUDIO_CODEC, config.CLIP_CRF, config.CLIP_PRESET, config.CLIP_VERTICAL_WIDTH, config.CLIP_VERTICAL_HEIGHT);
@@ -68,6 +68,7 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
     staleAfterMs: config.JOB_STALE_AFTER_SECONDS * 1000,
     heartbeatMs: config.JOB_HEARTBEAT_SECONDS * 1000,
     recheckMs: Math.max(1000, config.JOB_STALE_AFTER_SECONDS * 500),
+    watchdogMs: Math.max(5000, config.JOB_STALE_AFTER_SECONDS * 3000),
   });
 
   // Prove at startup (and leave a clear line in the logs) whether durable storage really works,

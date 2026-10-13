@@ -12,6 +12,8 @@ class FakeS3 {
   readonly objects = new Map<string, Buffer>();
   readonly calls: string[] = [];
   putFailures = 0; // reject this many PUTs before behaving
+  getFailures = 0; // reject this many GETs before behaving
+  brokenGetStreams = 0; // for this many GETs, hand over a body that dies halfway through
   reportedSizeOffset = 0; // make HEAD lie about the stored size
   truncateGetBy = 0; // deliver fewer bytes than ContentLength announces
   garbleGet = false; // deliver different bytes than were stored
@@ -37,8 +39,14 @@ class FakeS3 {
     }
     if (command instanceof GetObjectCommand) {
       this.calls.push('get');
+      if (this.getFailures > 0) { this.getFailures -= 1; throw new Error('simulated network failure'); }
       const object = this.objects.get(command.input.Key!);
       if (!object) throw Object.assign(new Error('The specified key does not exist.'), { name: 'NoSuchKey' });
+      if (this.brokenGetStreams > 0) {
+        this.brokenGetStreams -= 1;
+        const half = object.subarray(0, Math.floor(object.length / 2));
+        return { Body: Readable.from((async function* () { yield half; throw new Error('connection reset halfway through the download'); })()), ContentLength: object.length };
+      }
       const delivered = this.garbleGet ? Buffer.alloc(object.length, 'x') : object.subarray(0, object.length - this.truncateGetBy);
       return { Body: Readable.from([delivered]), ContentLength: object.length };
     }
@@ -109,6 +117,38 @@ test('a download that arrives incomplete is rejected and never appears as the re
 test('downloading something that does not exist fails and leaves nothing behind', () => withStorage(async ({ storage, dir }) => {
   await assert.rejects(storage.download('sources/missing/source.mp4', join(dir, 'source.mp4')), /Could not download sources\/missing\/source.mp4/);
   assert.deepEqual(await readdir(dir), []);
+}));
+
+test('a download that fails for a moment is tried again, so a passing network problem does not cost a customer their job', () => withStorage(async ({ s3, storage, dir }) => {
+  s3.objects.set('sources/j/source.mp4', Buffer.from('the whole video'));
+  s3.getFailures = 2;
+  const target = join(dir, 'source.mp4');
+  await storage.download('sources/j/source.mp4', target);
+  assert.equal(await readFile(target, 'utf8'), 'the whole video');
+  assert.equal(s3.calls.filter((call) => call === 'get').length, 3);
+  assert.deepEqual(await readdir(dir), ['source.mp4']);
+}));
+
+test('a connection that dies halfway through a download is retried from the start, and the half-written file never survives', () => withStorage(async ({ s3, storage, dir }) => {
+  s3.objects.set('sources/j/source.mp4', Buffer.from('0123456789abcdef'));
+  s3.brokenGetStreams = 1;
+  const target = join(dir, 'source.mp4');
+  await storage.download('sources/j/source.mp4', target);
+  assert.equal(await readFile(target, 'utf8'), '0123456789abcdef');
+  assert.deepEqual(await readdir(dir), ['source.mp4'], 'no .part file may be left behind');
+}));
+
+test('a download gives up with a clear error once every attempt has failed', () => withStorage(async ({ s3, storage, dir }) => {
+  s3.objects.set('sources/j/source.mp4', Buffer.from('video'));
+  s3.getFailures = 99;
+  await assert.rejects(storage.download('sources/j/source.mp4', join(dir, 'source.mp4')), /Could not download sources\/j\/source.mp4 from durable storage after 3 attempts: simulated network failure/);
+  assert.equal(s3.calls.filter((call) => call === 'get').length, 3);
+  assert.deepEqual(await readdir(dir), []);
+}));
+
+test('an object that is simply not there is reported at once instead of being asked for again and again', () => withStorage(async ({ s3, storage, dir }) => {
+  await assert.rejects(storage.download('sources/gone/source.mp4', join(dir, 'source.mp4')), /after 1 attempt: The specified key does not exist/);
+  assert.equal(s3.calls.filter((call) => call === 'get').length, 1);
 }));
 
 test('delete removes an object, and deleting one that is already gone is fine', () => withStorage(async ({ s3, storage }) => {

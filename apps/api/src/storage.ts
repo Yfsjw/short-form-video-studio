@@ -37,6 +37,11 @@ export interface S3Sender { send(command: unknown): Promise<any>; }
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 const describeError = (error: unknown) => (error instanceof Error ? error.message : String(error));
+/** The store answered, and said there is nothing under that key (as opposed to a failure that may pass). */
+const isMissingObject = (error: unknown) => {
+  const { name, $metadata } = (error ?? {}) as { name?: string; $metadata?: { httpStatusCode?: number } };
+  return name === 'NoSuchKey' || name === 'NotFound' || $metadata?.httpStatusCode === 404;
+};
 
 async function readAll(body: unknown): Promise<Buffer> {
   const chunks: Buffer[] = [];
@@ -86,18 +91,28 @@ export class R2Storage implements DurableStorage {
 
   async download(key: string, localPath: string) {
     await mkdir(dirname(localPath), { recursive: true });
-    const partial = `${localPath}.part-${randomUUID()}`;
-    try {
-      const response = await this.client.send(new GetObjectCommand({ Bucket: this.bucket, Key: key }));
-      if (!response.Body) throw new Error(`durable storage returned no data for ${key}`);
-      await pipeline(response.Body as Readable, createWriteStream(partial));
-      const written = (await stat(partial)).size;
-      if (typeof response.ContentLength === 'number' && response.ContentLength !== written) throw new Error(`downloaded ${written} bytes of ${key} but the stored object has ${response.ContentLength}`);
-      await rename(partial, localPath);
-    } catch (error) {
-      await rm(partial, { force: true });
-      throw new Error(`Could not download ${key} from durable storage: ${describeError(error)}`);
+    let lastError: unknown;
+    let attempts = 0;
+    // A connection that breaks halfway through a large video is the likeliest thing to go wrong while a job is being resumed,
+    // and giving up on the job for that would throw away work a second try would have saved. Same number of tries as uploads.
+    for (; attempts <= this.retryDelaysMs.length; attempts += 1) {
+      if (attempts > 0) await sleep(this.retryDelaysMs[attempts - 1]);
+      const partial = `${localPath}.part-${randomUUID()}`;
+      try {
+        const response = await this.client.send(new GetObjectCommand({ Bucket: this.bucket, Key: key }));
+        if (!response.Body) throw new Error(`durable storage returned no data for ${key}`);
+        await pipeline(response.Body as Readable, createWriteStream(partial));
+        const written = (await stat(partial)).size;
+        if (typeof response.ContentLength === 'number' && response.ContentLength !== written) throw new Error(`downloaded ${written} bytes of ${key} but the stored object has ${response.ContentLength}`);
+        await rename(partial, localPath);
+        return;
+      } catch (error) {
+        lastError = error;
+        await rm(partial, { force: true });
+        if (isMissingObject(error)) { attempts += 1; break; } // trying again cannot bring back an object that is gone
+      }
     }
+    throw new Error(`Could not download ${key} from durable storage after ${attempts} attempt${attempts === 1 ? '' : 's'}: ${describeError(lastError)}`);
   }
 
   async delete(key: string) {

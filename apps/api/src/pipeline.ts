@@ -23,11 +23,17 @@ export interface PipelineRuntimeOptions {
   heartbeatMs: number;
   /** While a job still looks like another live process owns it, look again this often. */
   recheckMs: number;
+  /**
+   * Even when nothing looks abandoned, look again this often for as long as the process lives. Another process (the old
+   * instance during a zero-downtime redeploy) can accept a job after this one did its start-up check and then be shut down
+   * before finishing it; without this nobody would notice until the next restart.
+   */
+  watchdogMs: number;
   /** How many times a job may be started in total (the first run included) before it is failed for good. */
   maxAttempts: number;
 }
 
-export const defaultRuntimeOptions: PipelineRuntimeOptions = { concurrency: 1, staleAfterMs: 60_000, heartbeatMs: 15_000, recheckMs: 30_000, maxAttempts: 3 };
+export const defaultRuntimeOptions: PipelineRuntimeOptions = { concurrency: 1, staleAfterMs: 60_000, heartbeatMs: 15_000, recheckMs: 30_000, watchdogMs: 180_000, maxAttempts: 3 };
 
 export interface RecoverySummary {
   /** Jobs handed back to the pipeline because their video can still be obtained. */
@@ -87,7 +93,7 @@ export class VideoPipeline {
       // Typically the database was unreachable, so not even the failure could be written down. The job is
       // left in its last saved state with nobody refreshing it; look again shortly, and once it has gone
       // quiet it is resumed (or failed for good if it has already used up its attempts).
-      this.scheduleRecheck(true);
+      this.scheduleRecheck(this.options.recheckMs);
     });
   }
 
@@ -99,8 +105,9 @@ export class VideoPipeline {
   /**
    * Looks for jobs a dead process left unfinished and either resumes them or fails them with an
    * honest reason. Safe to call from several servers at once (the takeover is one atomic update),
-   * and it keeps looking while some unfinished job still seems to be owned by another live process,
-   * so a job orphaned by a redeploy is picked up as soon as its heartbeat goes quiet.
+   * and it keeps looking: soon again while some unfinished job still seems to be owned by another live process (so a job
+   * orphaned by a redeploy is picked up as soon as its heartbeat goes quiet), and at a slow pace otherwise (so a job that
+   * was orphaned after this check ran is found too).
    */
   async recoverInterruptedJobs(): Promise<RecoverySummary> {
     const summary: RecoverySummary = { resumed: [], failed: [], waiting: 0 };
@@ -124,10 +131,10 @@ export class VideoPipeline {
       await this.sweepFinishedSources();
     } catch (error) {
       this.logger.error({ err: error }, 'Looking for interrupted jobs failed; will try again shortly');
-      this.scheduleRecheck(true);
+      this.scheduleRecheck(this.options.recheckMs);
       return summary;
     }
-    this.scheduleRecheck(summary.waiting > 0);
+    this.scheduleRecheck(summary.waiting > 0 ? this.options.recheckMs : this.options.watchdogMs);
     return summary;
   }
 
@@ -151,13 +158,13 @@ export class VideoPipeline {
     return { resume: true };
   }
 
-  private scheduleRecheck(needed: boolean) {
+  private scheduleRecheck(delayMs: number) {
     if (this.recheckTimer) { clearTimeout(this.recheckTimer); this.recheckTimer = undefined; }
-    if (!needed || this.closed) return;
+    if (this.closed) return;
     this.recheckTimer = setTimeout(() => {
       this.recheckTimer = undefined;
       void this.recoverInterruptedJobs();
-    }, this.options.recheckMs);
+    }, delayMs);
     this.recheckTimer.unref();
   }
 

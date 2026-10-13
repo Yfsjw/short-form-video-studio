@@ -21,7 +21,7 @@ export interface KeepAwakeOptions {
  *
  * While there is real work in progress, this requests the service's own public health endpoint every few minutes, so
  * the request travels through Render's front door like a visitor's would. When the work is done it stops, and the
- * instance may sleep as usual. It never touches the database, so it does not keep the database awake either.
+ * instance may sleep as usual. The request itself never touches the database (the health endpoint does not query it).
  *
  * Best effort, and honestly so: Render does not document whether requests a service makes to itself count as traffic.
  * If they do not, nothing is lost beyond the requests; the job is resumed from durable storage after the restart.
