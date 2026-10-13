@@ -56,11 +56,19 @@ export class R2Storage implements DurableStorage {
   private readonly client: S3Sender;
   private readonly retryDelaysMs: number[];
 
-  constructor(accountId: string, private readonly bucket: string, accessKeyId: string, secretAccessKey: string, options: { client?: S3Sender; retryDelaysMs?: number[] } = {}) {
+  constructor(accountId: string, private readonly bucket: string, accessKeyId: string, secretAccessKey: string, options: { client?: S3Sender; retryDelaysMs?: number[]; endpoint?: string; stallTimeoutsMs?: { connect: number; idle: number } } = {}) {
+    // Left to itself the SDK waits for ever on a connection that is accepted but never answered (measured: a request
+    // to such a server was still pending after 8 s, and no timeout is set by default). A job stuck on one such request
+    // keeps refreshing its heartbeat, so nothing would ever call it abandoned, and it would hold the instance awake with it.
+    // These are limits on silence, not on duration: `idle` restarts whenever any byte moves, so a slow but live transfer of a
+    // large video is never cut off.
+    const stall = options.stallTimeoutsMs ?? { connect: 15_000, idle: 60_000 };
     this.signer = new S3Client({
       region: 'auto',
-      endpoint: `https://${accountId}.r2.cloudflarestorage.com`,
+      endpoint: options.endpoint ?? `https://${accountId}.r2.cloudflarestorage.com`,
+      forcePathStyle: options.endpoint ? true : undefined, // only the tests point somewhere else, at an address without bucket sub-domains
       credentials: { accessKeyId, secretAccessKey },
+      requestHandler: { connectionTimeout: stall.connect, socketTimeout: stall.idle },
     });
     this.client = options.client ?? this.signer;
     // Pause before each retry of a failed upload: 3 attempts in total with the defaults.

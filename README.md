@@ -30,7 +30,10 @@ job is allowed to depend on the process or its disk surviving:
 
 1. **The upload is copied to R2 first.** Right after the upload is accepted the video is copied to `sources/<job id>/` in the
    bucket and the copy is verified with a `HEAD` request (stored size must equal the sent size; the transfer is retried up to
-   three times). Only then is any CPU spent on it. If the copy cannot be made the job fails immediately and says so.
+   three times). Only then is any CPU spent on it. If the copy cannot be made the job fails immediately and says so. Every call
+   to R2 is abandoned after 15 seconds without a connection or 60 seconds of complete silence (the limit is on silence, not on
+   duration, so a slow but live transfer of a big video is never cut off); without that, a connection that stalls would leave a
+   job waiting for ever while its heartbeat made it look alive.
 2. **Running jobs prove they are alive.** Every running job refreshes its database row every `JOB_HEARTBEAT_SECONDS`.
 3. **Interrupted jobs are found and resumed.** When the server starts, and afterwards for as long as the process lives (every
    half of `JOB_STALE_AFTER_SECONDS` while some unfinished job still looks like it belongs to another live server, for example

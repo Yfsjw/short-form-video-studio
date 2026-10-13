@@ -245,9 +245,17 @@ export class VideoPipeline {
   /** Catches stored videos that outlived their job: the process died, or storage failed, at the very moment the job ended. */
   private async sweepFinishedSources() {
     if (!this.storage.isDurable) return;
+    let failuresInARow = 0;
     for (const job of await this.db.listFinishedJobsHoldingSource()) {
       if (this.heartbeats.has(job.id)) continue; // its own clean-up is still running
-      if (await this.releaseStoredSource(job.id)) this.logger.info({ jobId: job.id }, 'Deleted a stored video that was left behind by a finished job');
+      if (await this.releaseStoredSource(job.id)) {
+        failuresInARow = 0;
+        this.logger.info({ jobId: job.id }, 'Deleted a stored video that was left behind by a finished job');
+      } else if (++failuresInARow >= 3) {
+        // Storage is evidently in trouble. Every further attempt would take as long to fail as these did, and this runs while
+        // the server is starting up; the next pass tries again, and nothing has been lost (the jobs still point at their videos).
+        break;
+      }
     }
   }
 

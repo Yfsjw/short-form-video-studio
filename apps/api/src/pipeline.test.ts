@@ -448,6 +448,25 @@ test('a storage outage while sweeping neither breaks recovery nor loses track of
   } finally { await ctx.cleanup(); }
 });
 
+test('a storage outage makes the sweep give up after a few failures in a row, instead of start-up waiting for every leftover to fail', async () => {
+  const ctx = await setup();
+  try {
+    const ids = ['a', 'b', 'c', 'd', 'e'];
+    for (const id of ids) await addJob(ctx, id, { status: 'completed', local: false, durable: true });
+    const storage = ctx.storage as MemoryStorage;
+    storage.failDeletes = true;
+    await ctx.pipeline.recoverInterruptedJobs();
+    assert.equal(storage.log.filter((entry) => entry.startsWith('delete:')).length, 3, 'the sweep must stop after three failures in a row');
+
+    storage.failDeletes = false; // storage is back: the next pass finds every leftover, none was forgotten
+    await ctx.pipeline.recoverInterruptedJobs();
+    for (const id of ids) {
+      assert.equal(storage.objects.has(`sources/${id}/source.mp4`), false, `${id}: the leftover must be swept once storage works again`);
+      assert.equal((await ctx.db.getJob(id))?.sourceStorageKey, null);
+    }
+  } finally { await ctx.cleanup(); }
+});
+
 test('a video that was uploaded but never recorded on its job is deleted when that job is given up on', async () => {
   const ctx = await setup();
   try {

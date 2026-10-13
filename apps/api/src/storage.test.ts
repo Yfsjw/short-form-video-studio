@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import http from 'node:http';
+import net, { type AddressInfo } from 'node:net';
 import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -150,6 +152,56 @@ test('an object that is simply not there is reported at once instead of being as
   await assert.rejects(storage.download('sources/gone/source.mp4', join(dir, 'source.mp4')), /after 1 attempt: The specified key does not exist/);
   assert.equal(s3.calls.filter((call) => call === 'get').length, 1);
 }));
+
+/** A real R2Storage (real SDK client, real sockets) talking to a server we control on this machine. */
+async function withRealClient(server: net.Server, stallTimeoutsMs: { connect: number; idle: number }, work: (context: { storage: R2Storage; dir: string }) => Promise<void>) {
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const dir = await mkdtemp(join(tmpdir(), 'studio-storage-'));
+  try {
+    const storage = new R2Storage('0123456789abcdef0123456789abcdef', 'bucket', 'AKIAFAKEKEYFORTESTS', 'fake-secret-for-tests', { endpoint: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, stallTimeoutsMs, retryDelaysMs: [0, 0] });
+    await work({ storage, dir });
+  } finally {
+    (server as http.Server).closeAllConnections?.(); // only an HTTP server has this; the raw TCP one is cleaned up by its test
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+test('a store that accepts the connection but never answers is given up on, instead of a job waiting for it for ever', { timeout: 40_000 }, async () => {
+  // Measured before the limits existed: a request to such a server was still pending after 8 seconds, and would have stayed that way.
+  const sockets = new Set<net.Socket>();
+  const silent = net.createServer((socket) => { sockets.add(socket); socket.on('data', () => undefined); socket.on('error', () => undefined); });
+  try {
+    await withRealClient(silent, { connect: 500, idle: 500 }, async ({ storage, dir }) => {
+      const video = join(dir, 'source.mp4');
+      await writeFile(video, 'a video');
+      const started = Date.now();
+      await assert.rejects(storage.upload(video, 'sources/j/source.mp4', 'video/mp4'), /Could not save sources\/j\/source.mp4 to durable storage after 3 attempts/);
+      await assert.rejects(storage.download('sources/j/source.mp4', join(dir, 'restored.mp4')), /Could not download/);
+      await assert.rejects(storage.delete('sources/j/source.mp4'), /timed out|did not establish/i);
+      assert.ok(Date.now() - started < 30_000, 'giving up must take seconds, not for ever');
+      assert.deepEqual((await readdir(dir)).sort(), ['source.mp4'], 'no half-written download may remain');
+    });
+  } finally { for (const socket of sockets) socket.destroy(); }
+});
+
+test('the limit is on silence, not on duration: a slow download that keeps moving is not cut off', async () => {
+  const chunk = Buffer.alloc(1024, 'v');
+  const chunks = 12;
+  const slow = http.createServer((_request, response) => {
+    response.writeHead(200, { 'content-length': String(chunk.length * chunks), 'content-type': 'video/mp4' });
+    let sent = 0;
+    const timer = setInterval(() => { response.write(chunk); sent += 1; if (sent === chunks) { clearInterval(timer); response.end(); } }, 150);
+    response.on('close', () => clearInterval(timer));
+  });
+  await withRealClient(slow, { connect: 1000, idle: 1000 }, async ({ storage, dir }) => {
+    const target = join(dir, 'restored.mp4');
+    const started = Date.now();
+    await storage.download('sources/j/source.mp4', target);
+    assert.ok(Date.now() - started > 1000, 'the transfer must have lasted longer than the idle limit for this test to mean anything');
+    assert.equal((await readFile(target)).length, chunk.length * chunks);
+  });
+});
 
 test('delete removes an object, and deleting one that is already gone is fine', () => withStorage(async ({ s3, storage }) => {
   s3.objects.set('job/old.mp4', Buffer.from('x'));
