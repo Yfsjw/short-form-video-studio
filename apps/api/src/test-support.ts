@@ -1,6 +1,6 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
-import type { DurableStorage } from './storage.js';
+import { StoredObjectMissingError, type DurableStorage } from './storage.js';
 
 export const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
@@ -31,6 +31,8 @@ export class MemoryStorage implements DurableStorage {
   failUploads = false;
   /** Make every delete fail. */
   failDeletes = false;
+  /** Make every download fail (the objects are still there), like a storage outage that stops reads. */
+  failDownloads = false;
   async upload(localPath: string, key: string) {
     this.log.push(`upload:${key}`);
     if (this.failUploads) throw new Error('simulated storage outage');
@@ -40,8 +42,9 @@ export class MemoryStorage implements DurableStorage {
   }
   async download(key: string, localPath: string) {
     this.log.push(`download:${key}`);
+    if (this.failDownloads) throw new Error('simulated storage outage');
     const data = this.objects.get(key);
-    if (!data) throw new Error(`no such object ${key}`);
+    if (!data) throw new StoredObjectMissingError(`no such object ${key}`);
     await mkdir(dirname(localPath), { recursive: true });
     await writeFile(localPath, data);
   }

@@ -328,6 +328,69 @@ test('a video restored with the wrong size is rejected rather than processed', a
   } finally { await ctx.cleanup(); }
 });
 
+test('a stored video that cannot be read back right now neither fails the job nor costs the customer their only copy: the job is tried again later', async () => {
+  // Found by the independent review: a restart that coincided with a bad minute at the storage service failed the job for good and
+  // then deleted the stored video (a delete can work while reads do not), although attempts were left.
+  const ctx = await setup({ runtime: { watchdogMs: 100, staleAfterMs: 2000 } });
+  try {
+    const storage = ctx.storage as MemoryStorage;
+    storage.failDownloads = true;
+    await addJob(ctx, 'j15', { status: 'processing', local: false, durable: true, attempts: 1 });
+    await ctx.backdate('j15', 10);
+    assert.deepEqual(await ctx.pipeline.recoverInterruptedJobs(), { resumed: ['j15'], failed: [], waiting: 0 });
+    await untilSettled(ctx);
+
+    const waiting = await ctx.db.getJob('j15');
+    assert.equal(waiting?.status, 'processing', 'trouble with storage is no verdict on the job');
+    assert.equal(waiting?.stage, 'waiting_to_retry');
+    assert.equal(waiting?.attempts, 2);
+    assert.equal(waiting?.sourceStorageKey, 'sources/j15/source.mp4', 'the job must still point at its video');
+    assert.equal(storage.objects.has('sources/j15/source.mp4'), true, 'the stored video is the only copy there is; it must not be deleted');
+    assert.equal(storage.log.includes('delete:sources/j15/source.mp4'), false);
+
+    storage.failDownloads = false; // storage is back; once the job has been quiet for the staleness window it is started again
+    const job = await waitForStatus(ctx, 'j15', ['completed', 'failed'], 10_000);
+    assert.equal(job.status, 'completed', job.errorMessage ?? '');
+    assert.equal(job.attempts, 3);
+  } finally { await ctx.cleanup(); }
+});
+
+test('when storage stays unreadable the job is given up on after its last attempt, with the reason, and only then is the stored video deleted', async () => {
+  const ctx = await setup({ runtime: { watchdogMs: 100, maxAttempts: 2 } });
+  try {
+    const storage = ctx.storage as MemoryStorage;
+    assert.deepEqual(await ctx.pipeline.recoverInterruptedJobs(), { resumed: [], failed: [], waiting: 0 }); // the start-up check, which also starts the watchdog
+    storage.failDownloads = true;
+    await addJob(ctx, 'j16', { status: 'queued', local: false, durable: true });
+    ctx.pipeline.enqueue('j16');
+    await untilSettled(ctx);
+    assert.equal((await ctx.db.getJob('j16'))?.status, 'processing', 'the first failure is not the end');
+    assert.equal(storage.objects.has('sources/j16/source.mp4'), true);
+
+    const job = await waitForStatus(ctx, 'j16', ['completed', 'failed'], 10_000);
+    assert.equal(job.status, 'failed');
+    assert.equal(job.attempts, 2);
+    assert.match(job.errorMessage ?? '', /could not be read back from durable storage/);
+    assert.match(job.errorMessage ?? '', /simulated storage outage/, 'the reason must be given');
+    await untilSettled(ctx);
+    assert.equal(storage.objects.has('sources/j16/source.mp4'), false, 'once the job is over for good its stored video goes');
+    assert.equal((await ctx.db.getJob('j16'))?.sourceStorageKey, null);
+  } finally { await ctx.cleanup(); }
+});
+
+test('a stored video that no longer exists fails the job at once, because trying again cannot bring it back', async () => {
+  const ctx = await setup();
+  try {
+    await addJob(ctx, 'j17', { status: 'processing', local: false, durable: true, attempts: 1 });
+    (ctx.storage as MemoryStorage).objects.delete('sources/j17/source.mp4'); // gone, as opposed to unreadable
+    await ctx.backdate('j17', 10);
+    await ctx.pipeline.recoverInterruptedJobs();
+    const job = await waitForStatus(ctx, 'j17', ['completed', 'failed']);
+    assert.equal(job.status, 'failed');
+    assert.match(job.errorMessage ?? '', /no longer exists in durable storage/);
+  } finally { await ctx.cleanup(); }
+});
+
 test('a failing job reports why and still frees its local copies', async () => {
   const ctx = await setup({ renderer: { render: async () => { throw new Error('ffmpeg exploded'); } } });
   try {

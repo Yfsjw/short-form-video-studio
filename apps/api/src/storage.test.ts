@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
 import { DeleteObjectCommand, GetObjectCommand, HeadObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
-import { NullStorage, R2Storage, createStorage, missingR2Settings, sourceKeyFor } from './storage.js';
+import { NullStorage, R2Storage, StoredObjectMissingError, createStorage, missingR2Settings, sourceKeyFor } from './storage.js';
 
 /** An in-memory stand-in for the S3 API, with switches to simulate the ways a real store misbehaves. */
 class FakeS3 {
@@ -143,13 +143,21 @@ test('a connection that dies halfway through a download is retried from the star
 test('a download gives up with a clear error once every attempt has failed', () => withStorage(async ({ s3, storage, dir }) => {
   s3.objects.set('sources/j/source.mp4', Buffer.from('video'));
   s3.getFailures = 99;
-  await assert.rejects(storage.download('sources/j/source.mp4', join(dir, 'source.mp4')), /Could not download sources\/j\/source.mp4 from durable storage after 3 attempts: simulated network failure/);
+  await assert.rejects(storage.download('sources/j/source.mp4', join(dir, 'source.mp4')), (error: unknown) => {
+    assert.ok(!(error instanceof StoredObjectMissingError), 'a failure that may pass must not be reported as a missing object: the job would be given up on at once');
+    assert.match((error as Error).message, /Could not download sources\/j\/source.mp4 from durable storage after 3 attempts: simulated network failure/);
+    return true;
+  });
   assert.equal(s3.calls.filter((call) => call === 'get').length, 3);
   assert.deepEqual(await readdir(dir), []);
 }));
 
-test('an object that is simply not there is reported at once instead of being asked for again and again', () => withStorage(async ({ s3, storage, dir }) => {
-  await assert.rejects(storage.download('sources/gone/source.mp4', join(dir, 'source.mp4')), /after 1 attempt: The specified key does not exist/);
+test('an object that is simply not there is reported at once instead of being asked for again and again, and as missing rather than as a failure that may pass', () => withStorage(async ({ s3, storage, dir }) => {
+  await assert.rejects(storage.download('sources/gone/source.mp4', join(dir, 'source.mp4')), (error: unknown) => {
+    assert.ok(error instanceof StoredObjectMissingError, 'a missing object must be told apart from a failure that may pass');
+    assert.match((error as Error).message, /after 1 attempt: The specified key does not exist/);
+    return true;
+  });
   assert.equal(s3.calls.filter((call) => call === 'get').length, 1);
 }));
 

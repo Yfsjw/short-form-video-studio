@@ -9,7 +9,7 @@ import type { HighlightDetector, HighlightOptions } from './highlights.js';
 import type { ClipRenderer } from './clips.js';
 import type { GeneratedClip, VideoJob } from './domain.js';
 import { writeSrtCaptions } from './captions.js';
-import { sourceKeyFor, type DurableStorage } from './storage.js';
+import { sourceKeyFor, StoredObjectMissingError, type DurableStorage } from './storage.js';
 
 type PipelineStore = Pick<StudioDatabase, 'getJob' | 'updateJob' | 'replaceTranscript' | 'listTranscript' | 'replaceHighlights' | 'listHighlights' | 'createClip' | 'updateClip' | 'beginAttempt' | 'touchJob' | 'listUnfinishedJobs' | 'listFinishedJobsHoldingSource' | 'claimJobForRecovery' | 'failStaleJob' | 'deleteClipsForJob'>;
 type MediaProcessor = Pick<FfmpegAdapter, 'probe' | 'extractAudio'>;
@@ -45,6 +45,9 @@ export interface RecoverySummary {
 }
 
 const isFile = (path: string) => stat(path).then((info) => info.isFile(), () => false);
+
+/** The uploaded video is (as far as anyone knows) safe in durable storage but cannot be read back at this moment. That says nothing about the job itself. */
+class SourceUnavailableForNow extends Error {}
 
 /** Lets a fixed number of jobs into the heavy stages at once; the rest wait their turn in arrival order. */
 class Semaphore {
@@ -149,7 +152,7 @@ export class VideoPipeline {
 
   private async decideRecovery(job: VideoJob): Promise<{ resume: true } | { resume: false; message: string }> {
     if (job.attempts >= this.options.maxAttempts) {
-      return { resume: false, message: `Processing was interrupted ${job.attempts} times in a row (the server restarted or ran out of memory each time), so it was given up on. Please upload the video again.` };
+      return { resume: false, message: `Processing was interrupted ${job.attempts} times in a row (the server restarted, ran out of memory or could not reach its storage each time), so it was given up on. Please upload the video again.` };
     }
     const obtainable = (job.sourceStorageKey !== null && this.storage.isDurable) || await isFile(join(this.uploadDir, job.storedFilename));
     if (!obtainable) {
@@ -189,8 +192,9 @@ export class VideoPipeline {
     const jobOutputDir = join(this.outputDir, jobId);
     let reachedFinalState = false;
     let sourceIsSafe = job.sourceStorageKey !== null;
+    let attempt = 0;
     try {
-      const attempt = await this.db.beginAttempt(jobId);
+      attempt = await this.db.beginAttempt(jobId);
       if (attempt > 1) this.logger.info({ jobId, attempt }, 'Resuming a job that was interrupted');
       await this.db.updateJob(jobId, { status: 'processing', stage: 'preparing_source', errorMessage: null });
       await this.prepareSource(job, sourcePath);
@@ -207,10 +211,19 @@ export class VideoPipeline {
       }
       reachedFinalState = true;
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Unexpected processing failure';
-      this.logger.error({ err: error, jobId }, 'Video processing failed');
-      await this.db.updateJob(jobId, { status: 'failed', stage: 'failed', errorMessage: message });
-      reachedFinalState = true;
+      if (error instanceof SourceUnavailableForNow && attempt < this.options.maxAttempts) {
+        // Failing the job would end it, delete the only copy of the customer's video and make them upload it all over again, for a
+        // problem that is likely to pass (the storage service having a bad minute while the server restarted). So this attempt is
+        // simply abandoned, like one whose process died: the job keeps looking unfinished, nothing refreshes it, and the periodic look
+        // for abandoned jobs starts it again once it has gone quiet. The number of attempts is still bounded.
+        this.logger.error({ err: error, jobId, attempt }, 'Could not read the uploaded video back from durable storage; the job will be tried again later');
+        await this.db.updateJob(jobId, { stage: 'waiting_to_retry' });
+      } else {
+        const message = error instanceof Error ? error.message : 'Unexpected processing failure';
+        this.logger.error({ err: error, jobId }, 'Video processing failed');
+        await this.db.updateJob(jobId, { status: 'failed', stage: 'failed', errorMessage: message });
+        reachedFinalState = true;
+      }
     } finally {
       // The local video is scratch space only once the outcome is recorded or a durable copy exists. A job that could not even
       // record its failure (database outage) will be resumed, and if its video never reached durable storage this file is all it has.
@@ -269,7 +282,13 @@ export class VideoPipeline {
     if (job.sourceStorageKey) {
       if (haveLocal) return;
       await this.db.updateJob(job.id, { stage: 'restoring_source' });
-      await this.storage.download(job.sourceStorageKey, sourcePath);
+      try {
+        await this.storage.download(job.sourceStorageKey, sourcePath);
+      } catch (error) {
+        // An object that is gone is gone; anything else (the store not answering, a transfer that keeps breaking) may well pass.
+        if (error instanceof StoredObjectMissingError) throw new Error('The saved copy of the uploaded video no longer exists in durable storage, so processing cannot be resumed. Please upload the video again.');
+        throw new SourceUnavailableForNow(`The uploaded video could not be read back from durable storage: ${error instanceof Error ? error.message : String(error)}`);
+      }
       const restoredBytes = (await stat(sourcePath)).size;
       if (restoredBytes !== job.sizeBytes) {
         await rm(sourcePath, { force: true });

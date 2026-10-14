@@ -12,7 +12,7 @@ export interface DurableStorage {
   readonly isDurable: boolean;
   /** Uploads a local file under `key` (a relative path such as "jobId/clipId.mp4") and verifies it arrived complete. Throws if it could not be stored. No-op when storage isn't configured. */
   upload(localPath: string, key: string, contentType: string): Promise<void>;
-  /** Downloads `key` into `localPath` (written to a temporary file first, so a half-finished download is never mistaken for the real file). Throws if the object is missing or incomplete. */
+  /** Downloads `key` into `localPath` (written to a temporary file first, so a half-finished download is never mistaken for the real file). Throws StoredObjectMissingError when nothing is stored under `key`, and an ordinary Error for any other failure (which may pass). */
   download(key: string, localPath: string): Promise<void>;
   /** Removes `key`. Deleting a key that does not exist is not an error. */
   delete(key: string): Promise<void>;
@@ -30,6 +30,11 @@ export interface DurableStorage {
 export function sourceKeyFor(jobId: string, storedFilename: string): string {
   const extension = extname(storedFilename).toLowerCase().replace(/[^a-z0-9.]/g, '');
   return `sources/${jobId}/source${extension}`;
+}
+
+/** The store answered, and said there is nothing under that key. Unlike a failure that may pass, trying again cannot bring the object back. */
+export class StoredObjectMissingError extends Error {
+  constructor(message: string) { super(message); this.name = 'StoredObjectMissingError'; }
 }
 
 /** The only part of S3Client this module relies on, so tests can substitute an in-memory fake. */
@@ -120,7 +125,8 @@ export class R2Storage implements DurableStorage {
         if (isMissingObject(error)) { attempts += 1; break; } // trying again cannot bring back an object that is gone
       }
     }
-    throw new Error(`Could not download ${key} from durable storage after ${attempts} attempt${attempts === 1 ? '' : 's'}: ${describeError(lastError)}`);
+    const message = `Could not download ${key} from durable storage after ${attempts} attempt${attempts === 1 ? '' : 's'}: ${describeError(lastError)}`;
+    throw isMissingObject(lastError) ? new StoredObjectMissingError(message) : new Error(message);
   }
 
   async delete(key: string) {
