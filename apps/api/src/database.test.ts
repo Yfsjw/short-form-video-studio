@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { randomUUID } from 'node:crypto';
-import { Pool } from 'pg';
+import { Pool, type PoolClient } from 'pg';
 import { StudioDatabase } from './database.js';
 import type { GeneratedClip, NewVideoJob } from './domain.js';
-import { eventually } from './test-support.js';
+import { eventually, sleep } from './test-support.js';
 
 const TEST_DATABASE_URL = process.env.DATABASE_URL ?? 'postgresql://postgres:localtest@localhost:5432/studio_local_test';
 const schemaName = (label: string) => `test_${label}_${randomUUID().replaceAll('-', '_')}`;
@@ -136,6 +136,91 @@ test('a connection the server cuts while it sits idle in the pool is noted, does
   } finally {
     await admin.end();
     await db.close({ dropSchema: true });
+  }
+});
+
+test('a connection the server cuts in the middle of a transaction fails that transaction with the real reason, leaves nothing half-written, and does not crash the process', async () => {
+  // Found by the independent review. Unlike an idle connection, one that is in use is not watched by the pool, and the 'error'
+  // event that pg emits on it when the server cuts it ended the whole Node process (every job in flight with it).
+  const applicationName = `tx-probe-${randomUUID()}`;
+  const url = `${TEST_DATABASE_URL}${TEST_DATABASE_URL.includes('?') ? '&' : '?'}application_name=${applicationName}`;
+  const db = await StudioDatabase.connect(url, schemaName('tx_cut'));
+  const admin = new Pool({ connectionString: TEST_DATABASE_URL, max: 1 });
+  try {
+    await db.createJob(makeJob('j1', 'processing'));
+    // Long enough (one statement per segment) that the transaction is still running when the connection is cut.
+    const segments = Array.from({ length: 30_000 }, (_, index) => ({ segmentIndex: index, startSeconds: index, endSeconds: index + 1, text: `segment ${index}` }));
+    const outcome = db.replaceTranscript('j1', segments).then(() => undefined, (error: unknown) => error);
+    // Only this test's own connection is cut (picked out by its application name), never those of tests running alongside.
+    await eventually('the transcript to be in the middle of being written', async () => (await admin.query(`SELECT count(*)::int AS n FROM pg_stat_activity WHERE application_name = $1 AND xact_start IS NOT NULL`, [applicationName])).rows[0].n, (open) => open >= 1);
+    await admin.query(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = $1 AND xact_start IS NOT NULL`, [applicationName]);
+
+    const error = await outcome;
+    assert.ok(error instanceof Error, 'the cut must fail the transaction instead of pretending it worked');
+    assert.match(error.message, /terminating connection due to administrator command/, 'the reason given must be the cut itself, not the failed attempt to roll back or "not queryable" afterwards');
+    assert.equal((await db.listTranscript('j1')).length, 0, 'half a transcript must never be left behind');
+    assert.equal((await db.getJob('j1'))?.id, 'j1', 'the next query must work on a fresh connection');
+  } finally {
+    await admin.end();
+    await db.close({ dropSchema: true });
+  }
+});
+
+test('when the cut lands between two statements of a transaction, the reason reported is the cut and not a vague "not queryable"', async () => {
+  // No query is running at that moment to carry the reason: pg only emits it as an 'error' event on the connection, and the next
+  // statement then fails with a message that says nothing about why.
+  const applicationName = `tx-gap-${randomUUID()}`;
+  const url = `${TEST_DATABASE_URL}${TEST_DATABASE_URL.includes('?') ? '&' : '?'}application_name=${applicationName}`;
+  const db = await StudioDatabase.connect(url, schemaName('tx_gap'));
+  const admin = new Pool({ connectionString: TEST_DATABASE_URL, max: 1 });
+  try {
+    const withTransaction = (db as unknown as { withTransaction(work: (client: PoolClient) => Promise<void>): Promise<void> }).withTransaction.bind(db);
+    let transactionIsIdle!: () => void; const idle = new Promise<void>((resolve) => { transactionIsIdle = resolve; });
+    let connectionWasCut!: () => void; const cut = new Promise<void>((resolve) => { connectionWasCut = resolve; });
+    const outcome = withTransaction(async (client) => {
+      await client.query('SELECT 1');
+      transactionIsIdle();
+      await cut; // the test cuts the connection now, while this transaction sits between two statements
+      await sleep(100); // long enough for the 'error' event to arrive before the next statement is sent
+      await client.query('SELECT 2');
+    }).then(() => undefined, (error: unknown) => error);
+    await idle;
+    await admin.query(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = $1`, [applicationName]);
+    connectionWasCut();
+
+    const error = await outcome;
+    assert.ok(error instanceof Error, 'the cut must fail the transaction');
+    assert.match(error.message, /terminating connection due to administrator command/);
+    assert.equal((await db.getJob('nothing'))?.id, undefined, 'the pool must still work afterwards');
+  } finally {
+    await admin.end();
+    await db.close({ dropSchema: true });
+  }
+});
+
+test('starting up against a database that is already up to date does not queue behind the transactions that are using it', async () => {
+  // ADD COLUMN IF NOT EXISTS asks for an exclusive lock on the table before it checks anything, so every start waited for the
+  // longest open transaction and held up every query that arrived after it. The server runs this at every start, including the
+  // start of the new instance during a redeploy while the old one is still working.
+  const schema = schemaName('boot_lock');
+  const admin = new Pool({ connectionString: TEST_DATABASE_URL });
+  const holder = new Pool({ connectionString: TEST_DATABASE_URL, max: 1 });
+  const transaction = await holder.connect();
+  let booted: Promise<StudioDatabase> | undefined;
+  try {
+    await (await StudioDatabase.connect(TEST_DATABASE_URL, schema)).close(); // the tables now exist, as they do on every later start
+    await transaction.query('BEGIN');
+    await transaction.query(`LOCK TABLE "${schema}".video_jobs IN ROW SHARE MODE`); // what any open transaction that reads or writes the table holds
+    booted = StudioDatabase.connect(TEST_DATABASE_URL, schema);
+    const outcome = await Promise.race([booted.then(() => 'started'), sleep(3000).then(() => 'still waiting for the open transaction')]);
+    assert.equal(outcome, 'started');
+  } finally {
+    await transaction.query('ROLLBACK');
+    transaction.release();
+    await holder.end();
+    await (await booted?.catch(() => undefined))?.close();
+    await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    await admin.end();
   }
 });
 

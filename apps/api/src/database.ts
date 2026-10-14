@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { Pool, type PoolClient } from 'pg';
 import type { GeneratedClip, HighlightCandidate, JobStatus, NewVideoJob, TranscriptSegment, VideoJob } from './domain.js';
 
-const SCHEMA_SQL = `
+const CREATE_TABLES_SQL = `
   CREATE TABLE IF NOT EXISTS video_jobs (
     id TEXT PRIMARY KEY, original_filename TEXT NOT NULL, stored_filename TEXT NOT NULL,
     mime_type TEXT NOT NULL, size_bytes BIGINT NOT NULL, status TEXT NOT NULL, stage TEXT NOT NULL,
@@ -26,10 +26,31 @@ const SCHEMA_SQL = `
     reasons_json TEXT NOT NULL, signals_json TEXT NOT NULL, source_segment_indexes_json TEXT NOT NULL, created_at TEXT NOT NULL,
     UNIQUE(job_id, candidate_index)
   );
-  -- Added after the first production release; IF NOT EXISTS makes them safe on every boot, on old and new databases alike.
-  ALTER TABLE video_jobs ADD COLUMN IF NOT EXISTS source_storage_key TEXT;
-  ALTER TABLE video_jobs ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0;
 `;
+
+/** Columns that were added after the first production release, so a database created by an older release is missing them. */
+const COLUMNS_ADDED_LATER: Array<{ name: string; definition: string }> = [
+  { name: 'source_storage_key', definition: 'TEXT' },
+  { name: 'attempts', definition: 'INTEGER NOT NULL DEFAULT 0' },
+];
+
+type SqlRunner = (sql: string) => Promise<{ rows: any[] }>;
+
+/**
+ * Creates whatever is missing and leaves what exists alone. The ALTER is only issued for a column that really is missing:
+ * `ADD COLUMN IF NOT EXISTS` asks for an exclusive lock on the whole table before it looks, so even when the column is already
+ * there it waits behind every open transaction that touched the table and holds up every query that arrives after it
+ * (reproduced with one transaction left open). This runs at every start, and during a redeploy the previous instance is
+ * still working: its heartbeats and a long transcript insert would stall behind the new instance's start-up.
+ */
+async function ensureSchema(run: SqlRunner) {
+  await run(CREATE_TABLES_SQL);
+  const existing = await run(`SELECT attname FROM pg_attribute WHERE attrelid = to_regclass('video_jobs') AND attnum > 0 AND NOT attisdropped`);
+  const present = new Set(existing.rows.map((row) => String(row.attname)));
+  for (const column of COLUMNS_ADDED_LATER) {
+    if (!present.has(column.name)) await run(`ALTER TABLE video_jobs ADD COLUMN IF NOT EXISTS ${column.name} ${column.definition}`);
+  }
+}
 
 /**
  * Postgres-backed store (previously SQLite, which lived on Render's ephemeral local disk
@@ -68,10 +89,10 @@ export class StudioDatabase {
       const bootstrap = await pool.connect();
       try {
         await bootstrap.query(`CREATE SCHEMA IF NOT EXISTS "${schema}"`);
-        await bootstrap.query(SCHEMA_SQL);
+        await ensureSchema((sql) => bootstrap.query(sql));
       } finally { bootstrap.release(); }
     } else {
-      await pool.query(SCHEMA_SQL);
+      await ensureSchema((sql) => pool.query(sql));
     }
     return new StudioDatabase(pool, schema);
   }
@@ -229,14 +250,27 @@ export class StudioDatabase {
 
   private async withTransaction(work: (client: PoolClient) => Promise<void>) {
     const client = await this.pool.connect();
+    // The pool watches the connections that sit idle, not the ones it has handed out. When the server cuts a connection that is
+    // in use (a serverless database restarting, a network drop) pg emits an 'error' event on the client, and an 'error' event
+    // that nobody listens to ends the whole Node process, every job in flight with it (reproduced by terminating the session in
+    // the middle of a long insert). So the event is listened to, and what it says is kept: when the cut lands between two
+    // statements no query is running to carry the reason, and the next statement would only report "not queryable".
+    let firstProblem: unknown;
+    const noteConnectionError = (error: Error) => { firstProblem ??= error; };
+    client.on('error', noteConnectionError);
     try {
       await client.query('BEGIN');
       await work(client);
       await client.query('COMMIT');
     } catch (error) {
-      await client.query('ROLLBACK');
-      throw error;
+      firstProblem ??= error;
+      // If the connection is gone this fails too (the server drops an unfinished transaction when its connection closes anyway),
+      // and it must not hide the error that matters, which is the first one. The pool discards a connection that has failed,
+      // so the next caller never receives a dead one.
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw firstProblem;
     } finally {
+      client.removeListener('error', noteConnectionError);
       client.release();
     }
   }
