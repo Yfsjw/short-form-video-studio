@@ -242,6 +242,21 @@ test('with REQUIRE_DURABLE_STORAGE the server refuses to start without R2 settin
   });
 });
 
+test('the bare address leads to the upload page instead of an error, and addresses that do not exist are still refused', async () => {
+  const schema = schemaName('root'); const server = await start({ schema });
+  try {
+    const bare = await fetch(`${server.base}/`, { redirect: 'manual' });
+    assert.equal(bare.status, 302);
+    assert.equal(bare.headers.get('location'), '/test-upload');
+    const followed = await fetch(`${server.base}/`);
+    assert.equal(followed.status, 200);
+    assert.match(await followed.text(), /Upload a video/);
+    const unknown = await fetch(`${server.base}/no-such-page`);
+    assert.equal(unknown.status, 404);
+    assert.equal(((await unknown.json()) as { error: { code: string } }).error.code, 'NOT_FOUND');
+  } finally { await server.stop(); await dropSchema(schema); }
+});
+
 test('without R2 settings the server still starts for local development, and says openly that it is local-only', async () => {
   const schema = schemaName('local'); const server = await start({ schema, storage: new NullStorage() });
   try {

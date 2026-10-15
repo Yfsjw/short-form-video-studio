@@ -131,6 +131,9 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
   });
   app.use(express.json({ limit: '32kb' }));
 
+  // The bare address is what people open first and it has no page of its own, so it leads to the upload page instead of an error.
+  app.get('/', (_req, res) => res.redirect(302, '/test-upload'));
+
   app.get('/test-upload', (_req, res) => {
     res.type('html').send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Upload a video</title><style>body{font-family:system-ui,sans-serif;max-width:720px;margin:32px auto;padding:0 16px}button{padding:10px 16px;margin-top:12px}pre{white-space:pre-wrap;word-break:break-word;background:#f5f5f5;padding:12px;border-radius:8px}.note{font-weight:600}</style></head><body><h1>Upload a video</h1><p class="note">Choose a video (MP4, MOV, MKV, WebM, AVI or M4V) of up to ${maxUploadMb} MB.</p><p>It is turned into short vertical clips with captions. The next page shows your clips as soon as they are ready.</p><form action="/test-upload" method="post" enctype="multipart/form-data"><input name="video" type="file" accept="video/*" required><br><button type="submit">Upload video</button></form><pre>Large videos take a while to upload over a mobile connection. Keep this page open and the screen on until the next page appears. Videos are processed one at a time, and videos over about 100 MB have not been tested on this server yet.</pre></body></html>`);
   });

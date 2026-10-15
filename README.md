@@ -179,7 +179,7 @@ All configuration comes from environment variables; see [`.env.example`](.env.ex
 - `GET /api/jobs/:id/highlights` — ranked highlight candidates with their scoring signals.
 - `GET /api/jobs/:jobId/clips/:clipId` — redirects to a short-lived signed R2 link (add `?download=1` to force a download). In local-only mode the file is streamed from disk.
 - `GET /api/health` — `{ status, service, storage: { backend: "r2" | "local-only", selfTest, checkedAt } }`.
-- `GET /test-upload`, `POST /test-upload`, `GET /jobs/:id` — the built-in phone-friendly pages.
+- `GET /test-upload`, `POST /test-upload`, `GET /jobs/:id` — the built-in phone-friendly pages. `GET /` redirects to `/test-upload`.
 
 Accepted extensions: MP4, MOV, MKV, WebM, AVI, M4V. Extension and declared MIME type are checked before a job is created and
 `ffprobe` then checks that the file really contains a readable video stream. An upload that is abandoned halfway, or whose job
