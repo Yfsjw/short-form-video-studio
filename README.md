@@ -33,7 +33,9 @@ job is allowed to depend on the process or its disk surviving:
    three times). Only then is any CPU spent on it. If the copy cannot be made the job fails immediately and says so. Every call
    to R2 is abandoned after 15 seconds without a connection or 60 seconds of complete silence (the limit is on silence, not on
    duration, so a slow but live transfer of a big video is never cut off); without that, a connection that stalls would leave a
-   job waiting for ever while its heartbeat made it look alive.
+   job waiting for ever while its heartbeat made it look alive. Calls are retried, so against an R2 that accepts connections but
+   never answers, an upload or a delete gives up after roughly three minutes and a download after roughly nine (the number of
+   attempts was measured; the times follow from the limits): a slow, honest failure, never an endless wait.
 2. **Running jobs prove they are alive.** Every running job refreshes its database row every `JOB_HEARTBEAT_SECONDS`.
 3. **Interrupted jobs are found and resumed.** When the server starts, and afterwards for as long as the process lives (every
    half of `JOB_STALE_AFTER_SECONDS` while some unfinished job still looks like it belongs to another live server, for example
@@ -45,7 +47,10 @@ job is allowed to depend on the process or its disk surviving:
    - its video never reached R2 and is not on this disk → failed with an honest message ("please upload again");
    - otherwise it is taken over with a single atomic database update (two servers can never both take it), the video is
      restored from R2 (size-checked; a transfer that breaks is retried up to three times), clips left by the interrupted
-     attempt are discarded, and processing starts again.
+     attempt are discarded, and processing starts again from the beginning. If R2 cannot be read at that moment the job is
+     **not** failed (that would delete the only copy of the customer's video for a problem that probably passes): the attempt
+     is abandoned like one whose server died, the job shows the stage `waiting_to_retry`, and it is tried again a little later,
+     within the same `JOB_MAX_ATTEMPTS`. Only an object that R2 says is gone fails the job.
 4. **Nothing is kept longer than needed.** When a job ends, either way, its stored source video is deleted from R2 and the
    local scratch copies are removed. If the process died or R2 failed at exactly that moment, the next recovery pass deletes
    the leftover. The local copy of a video that is *not* yet safe in R2 is never deleted while its job may still be resumed.
@@ -53,9 +58,18 @@ job is allowed to depend on the process or its disk surviving:
    logs `Durable storage self-test passed` (or a loud error). `GET /api/health` reports the result. With
    `REQUIRE_DURABLE_STORAGE=true` the server refuses to start at all when any R2 setting is missing, instead of quietly falling
    back to the local disk.
+6. **Start-up never waits long for R2.** Resuming a job needs only the database; deleting the stored videos of jobs that were
+   given up on or had already finished comes afterwards and is the one step that talks to R2. Start-up waits for it for at most
+   30 seconds, then logs a warning and opens the server while the clean-up carries on in the background. A slow or silent R2
+   can delay a clean-up, but not the opening of the server (a host treats a server that does not open as a failed start) and not
+   the resuming of other jobs.
+7. **The database is expected to fail too.** The start-up schema check takes no lock on the tables when they are already up to
+   date (tested against the lock every open write holds), so a new server starting during a zero-downtime deploy does not queue
+   behind the old server's open transactions; and a connection that the database cuts in the middle of a transaction fails
+   that one request instead of ending the process.
 
 Job stages you can see on the status page: `preparing_source`, `saving_source`, `restoring_source`, `waiting_for_capacity`,
-`probing_video`, `extracting_audio`, `transcribing`, `detecting_highlights`, `extracting_clips`, `clip_extraction_complete`.
+`waiting_to_retry`, `probing_video`, `extracting_audio`, `transcribing`, `detecting_highlights`, `extracting_clips`, `clip_extraction_complete`.
 
 ### Honest limits of this design
 
@@ -63,8 +77,10 @@ Job stages you can see on the status page: `preparing_source`, `saving_source`, 
   inbound traffic and kill whatever is running. Two things try to prevent that while there is work: the job page refreshes
   itself every 5 seconds (but a locked phone stops it), and the server itself requests its own `/api/health` at its public
   address (`RENDER_EXTERNAL_URL`, which Render provides) every 4 minutes **only while a job is being processed or an upload is
-  arriving**, and stops when the work is done (`KEEP_AWAKE_WHILE_PROCESSING=false` switches it off). Render does not document
-  whether a request a service makes to itself counts as inbound traffic, so **whether this really prevents the spin-down has to be
+  arriving**, and stops when the work is done (`KEEP_AWAKE_WHILE_PROCESSING=false` switches it off). That an idle free instance
+  really does fall asleep is confirmed by Render's own logs of this service (after each deploy they stop about 15 minutes later,
+  with no failure in between, although Render's health check runs every few seconds). Render does not document whether a request
+  a service makes to itself counts as inbound traffic, so **whether the keep-awake request really prevents the spin-down has to be
   measured on the live service and has not been**. If it does not work, nothing is lost: the job is resumed from R2 the next time
   anything wakes the service. A paid instance removes the limit for certain.
 - **The first moments of an upload are not covered.** The copy to R2 starts right after the upload is accepted and takes time
@@ -75,6 +91,11 @@ Job stages you can see on the status page: `preparing_source`, `saving_source`, 
 - **A stalled heartbeat is treated as death.** If a live process stopped refreshing its jobs for longer than
   `JOB_STALE_AFTER_SECONDS` (say, a long database outage) another process may take the job over while the first still works on
   it. There is no fencing between them.
+- **A resumed job starts again from the beginning.** Clips made by an interrupted attempt are thrown away rather than reused:
+  that is simpler and cannot mix the output of two attempts, at the price of repeating work after every interruption.
+- **A database that goes silent is not timed out.** node-postgres has no default timeout for connections or queries and none is
+  configured here. A connection the database *closes* is handled (see point 7 above); one that is accepted and then never
+  answered would stall the request or job that uses it.
 - **Clips are kept until deleted.** Source videos are removed after their job; generated clips stay in R2 and the bucket has no
   retention rule. Add a lifecycle rule in the Cloudflare dashboard if clips should expire.
 
@@ -114,7 +135,10 @@ real multipart uploads and real FFmpeg/ffprobe; only R2 (kept in memory) and spe
 They cover: upload → durable copy → clips → signed download; a server killed in the middle of a job and replaced by a fresh
 one with an empty disk, which finishes the job from R2; uploads abandoned halfway; uploads above the old 20 MB cap;
 refusing to start without R2 when `REQUIRE_DURABLE_STORAGE` is on; the keep-awake request being made while a job runs or an
-upload arrives and not otherwise. CI runs the whole suite on every push and pull request.
+upload arrives and not otherwise; a server that still opens, and still resumes other jobs, when R2 has stopped answering during
+start-up; the real AWS SDK giving up on a server that accepts a connection and never answers (with the short limits the tests
+use and with the 6 s-and-over route production uses); the database cutting a connection in the middle of a transaction.
+CI runs the whole suite on every push and pull request.
 What the tests do **not** cover: the real R2 service (checked by the startup self-test instead), real whisper.cpp output,
 large (hundreds of MB) videos on a 512 MB instance, and whether Render really counts the keep-awake request as traffic.
 

@@ -33,6 +33,8 @@ export class MemoryStorage implements DurableStorage {
   failDeletes = false;
   /** Make every download fail (the objects are still there), like a storage outage that stops reads. */
   failDownloads = false;
+  /** When set, every delete waits for this to settle before it does anything: a storage service that has stopped answering. */
+  holdDeletes: Promise<void> | undefined;
   async upload(localPath: string, key: string) {
     this.log.push(`upload:${key}`);
     if (this.failUploads) throw new Error('simulated storage outage');
@@ -50,6 +52,7 @@ export class MemoryStorage implements DurableStorage {
   }
   async delete(key: string) {
     this.log.push(`delete:${key}`);
+    if (this.holdDeletes) await this.holdDeletes;
     if (this.failDeletes) throw new Error('simulated storage outage');
     this.objects.delete(key);
   }

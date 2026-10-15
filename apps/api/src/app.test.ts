@@ -11,6 +11,7 @@ import { promisify } from 'node:util';
 import { Pool } from 'pg';
 import { createApp } from './app.js';
 import { loadConfig } from './config.js';
+import { StudioDatabase } from './database.js';
 import { NullStorage, type DurableStorage } from './storage.js';
 import { MemoryStorage, eventually, sleep } from './test-support.js';
 import type { TranscriptionEngine } from './transcription.js';
@@ -55,7 +56,7 @@ type Studio = Awaited<ReturnType<typeof createApp>>;
 interface RunningServer { base: string; root: string; dirs: { UPLOAD_DIR: string; TEMP_DIR: string; OUTPUT_DIR: string }; studio: Studio; storage: DurableStorage; stop: () => Promise<void> }
 
 /** Boots the real app on a free port, with its own empty upload/temp/output folders (like a freshly started container). */
-async function start(options: { schema: string; storage?: DurableStorage; transcriber?: TranscriptionEngine; env?: Record<string, string>; keepAwakeIntervalMs?: number }): Promise<RunningServer> {
+async function start(options: { schema: string; storage?: DurableStorage; transcriber?: TranscriptionEngine; env?: Record<string, string>; keepAwakeIntervalMs?: number; bootRecoveryWaitMs?: number }): Promise<RunningServer> {
   const root = await mkdtemp(join(workspace, 'server-'));
   const dirs = { UPLOAD_DIR: join(root, 'uploads'), TEMP_DIR: join(root, 'tmp'), OUTPUT_DIR: join(root, 'outputs') };
   const config = loadConfig({
@@ -66,7 +67,7 @@ async function start(options: { schema: string; storage?: DurableStorage; transc
     ...options.env,
   });
   const storage = options.storage ?? new MemoryStorage();
-  const studio = await createApp(config, { storage, transcriber: options.transcriber ?? talk, databaseSchema: options.schema, keepAwakeIntervalMs: options.keepAwakeIntervalMs });
+  const studio = await createApp(config, { storage, transcriber: options.transcriber ?? talk, databaseSchema: options.schema, keepAwakeIntervalMs: options.keepAwakeIntervalMs, bootRecoveryWaitMs: options.bootRecoveryWaitMs });
   const server = createServer(studio.app).listen(0, '127.0.0.1');
   await new Promise<void>((resolve) => server.once('listening', resolve));
   let stopped = false;
@@ -189,6 +190,44 @@ test('RESTART: the server dies in the middle of a job; a new server with an empt
     assert.equal(download.status, 302, 'the clip made after the restart must be downloadable');
     assert.deepEqual(await readdir(second.dirs.UPLOAD_DIR), []);
   } finally { await first.stop(); await second?.stop(); await dropSchema(schema); }
+});
+
+test('start-up does not wait for a storage service that has stopped answering: the server opens, and the clean-up carries on in the background', async () => {
+  const schema = schemaName('slowboot'); const storage = new MemoryStorage();
+  const key = 'sources/stuck/source.mp4';
+  let letStorageAnswer!: () => void;
+  storage.holdDeletes = new Promise<void>((resolve) => { letStorageAnswer = resolve; });
+  storage.objects.set(key, Buffer.from('the uploaded video'));
+  // A job that was interrupted three times already and has gone quiet: recovery gives up on it, and then has to delete its stored video.
+  const longAgo = new Date(Date.now() - 10 * 60_000).toISOString();
+  const seed = await StudioDatabase.connect(TEST_DATABASE_URL, schema);
+  await seed.createJob({ id: 'stuck', originalFilename: 'talk.mp4', storedFilename: 'stuck.mp4', mimeType: 'video/mp4', sizeBytes: 18, status: 'processing', stage: 'transcribing', errorMessage: null, durationSeconds: null, width: null, height: null, createdAt: longAgo, updatedAt: longAgo });
+  for (let attempt = 0; attempt < 3; attempt += 1) await seed.beginAttempt('stuck');
+  await seed.updateJob('stuck', { sourceStorageKey: key });
+  await seed.close();
+  await admin.query(`UPDATE "${schema}".video_jobs SET updated_at = $1 WHERE id = 'stuck'`, [longAgo]);
+
+  const starting = start({ schema, storage, bootRecoveryWaitMs: 300 });
+  let server: RunningServer | undefined;
+  try {
+    const outcome = await Promise.race([starting, sleep(8000).then(() => 'still not open' as const)]);
+    assert.notEqual(outcome, 'still not open', 'the server must open even though storage is not answering');
+    const open = outcome as RunningServer;
+    server = open;
+    assert.equal((await fetch(`${open.base}/api/health`)).status, 200);
+    await eventually('the clean-up to have asked storage to delete the video', () => storage.log, (log) => log.includes(`delete:${key}`));
+    assert.equal(storage.objects.has(key), true, 'storage has not answered, so the video is still there; this test means nothing unless that is so');
+    assert.equal((await open.studio.db.getJob('stuck'))?.status, 'failed', 'the job was given up on without waiting for storage');
+
+    letStorageAnswer();
+    await eventually('the clean-up to carry on in the background and delete the video', () => storage.objects.has(key), (stillThere) => !stillThere);
+    await eventually('the job to stop pointing at the deleted video', async () => (await open.studio.db.getJob('stuck'))?.sourceStorageKey ?? null, (stored) => stored === null);
+  } finally {
+    letStorageAnswer();
+    server ??= await starting.catch(() => undefined); // if start-up did hang, it ends now that storage answers
+    await server?.stop();
+    await dropSchema(schema);
+  }
 });
 
 test('with REQUIRE_DURABLE_STORAGE the server refuses to start without R2 settings, naming only what is missing', async () => {

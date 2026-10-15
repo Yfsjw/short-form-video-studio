@@ -210,7 +210,8 @@ test('starting up against a database that is already up to date does not queue b
   try {
     await (await StudioDatabase.connect(TEST_DATABASE_URL, schema)).close(); // the tables now exist, as they do on every later start
     await transaction.query('BEGIN');
-    await transaction.query(`LOCK TABLE "${schema}".video_jobs IN ROW SHARE MODE`); // what any open transaction that reads or writes the table holds
+    // ROW EXCLUSIVE is what every INSERT, UPDATE and DELETE holds until its transaction ends (a job's heartbeat, a long transcript insert).
+    for (const table of ['video_jobs', 'generated_clips', 'transcript_segments', 'highlight_candidates']) await transaction.query(`LOCK TABLE "${schema}".${table} IN ROW EXCLUSIVE MODE`);
     booted = StudioDatabase.connect(TEST_DATABASE_URL, schema);
     const outcome = await Promise.race([booted.then(() => 'started'), sleep(3000).then(() => 'still waiting for the open transaction')]);
     assert.equal(outcome, 'started');

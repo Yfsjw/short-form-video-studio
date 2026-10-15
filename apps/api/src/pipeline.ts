@@ -121,17 +121,19 @@ export class VideoPipeline {
         if (job.updatedAt >= staleBefore) { summary.waiting += 1; continue; }
         const decision = await this.decideRecovery(job);
         if (!decision.resume) {
+          // The stored video of a job given up on is deleted by the clean-up below, not here. This loop settles the fate of every job and
+          // only talks to the database: the storage service can be slow or silent, and the jobs further down the list must not wait
+          // for it before they are resumed.
           if (await this.db.failStaleJob(job.id, staleBefore, decision.message)) {
             summary.failed.push(job.id);
             this.logger.error({ jobId: job.id, attempts: job.attempts }, `Gave up on an interrupted job: ${decision.message}`);
-            await this.releaseStoredSource(job.id);
           }
         } else if (await this.db.claimJobForRecovery(job.id, staleBefore)) {
           summary.resumed.push(job.id);
           this.enqueue(job.id);
         }
       }
-      await this.sweepFinishedSources();
+      await this.sweepFinishedSources(summary.failed);
     } catch (error) {
       this.logger.error({ err: error }, 'Looking for interrupted jobs failed; will try again shortly');
       this.scheduleRecheck(this.options.recheckMs);
@@ -255,15 +257,20 @@ export class VideoPipeline {
     }
   }
 
-  /** Catches stored videos that outlived their job: the process died, or storage failed, at the very moment the job ended. */
-  private async sweepFinishedSources() {
+  /**
+   * Deletes the stored video of every job that is over: the jobs recovery has just given up on (`justGivenUp`, which includes any whose
+   * video was uploaded but never recorded), and those left behind because the process died, or storage failed, at the very moment the
+   * job ended. Runs after the unfinished jobs have been dealt with, because it is the one step that waits on the storage service.
+   */
+  private async sweepFinishedSources(justGivenUp: readonly string[] = []) {
     if (!this.storage.isDurable) return;
+    const leftBehind = new Set((await this.db.listFinishedJobsHoldingSource()).map((job) => job.id));
     let failuresInARow = 0;
-    for (const job of await this.db.listFinishedJobsHoldingSource()) {
-      if (this.heartbeats.has(job.id)) continue; // its own clean-up is still running
-      if (await this.releaseStoredSource(job.id)) {
+    for (const jobId of new Set([...justGivenUp, ...leftBehind])) {
+      if (this.heartbeats.has(jobId)) continue; // its own clean-up is still running
+      if (await this.releaseStoredSource(jobId)) {
         failuresInARow = 0;
-        this.logger.info({ jobId: job.id }, 'Deleted a stored video that was left behind by a finished job');
+        if (leftBehind.has(jobId)) this.logger.info({ jobId }, 'Deleted a stored video that was left behind by a finished job');
       } else if (++failuresInARow >= 3) {
         // Storage is evidently in trouble. Every further attempt would take as long to fail as these did, and this runs while
         // the server is starting up; the next pass tries again, and nothing has been lost (the jobs still point at their videos).

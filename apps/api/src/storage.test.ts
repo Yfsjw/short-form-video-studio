@@ -162,14 +162,17 @@ test('an object that is simply not there is reported at once instead of being as
 }));
 
 /** A real R2Storage (real SDK client, real sockets) talking to a server we control on this machine. */
-async function withRealClient(server: net.Server, stallTimeoutsMs: { connect: number; idle: number }, work: (context: { storage: R2Storage; dir: string }) => Promise<void>) {
+async function withRealClient(server: net.Server, stallTimeoutsMs: { connect: number; idle: number }, work: (context: { storage: R2Storage; dir: string }) => Promise<void>, retryDelaysMs: number[] = [0, 0]) {
+  const connections = new Set<net.Socket>();
+  server.on('connection', (socket) => { connections.add(socket); socket.once('close', () => connections.delete(socket)); });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   const dir = await mkdtemp(join(tmpdir(), 'studio-storage-'));
   try {
-    const storage = new R2Storage('0123456789abcdef0123456789abcdef', 'bucket', 'AKIAFAKEKEYFORTESTS', 'fake-secret-for-tests', { endpoint: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, stallTimeoutsMs, retryDelaysMs: [0, 0] });
+    const storage = new R2Storage('0123456789abcdef0123456789abcdef', 'bucket', 'AKIAFAKEKEYFORTESTS', 'fake-secret-for-tests', { endpoint: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, stallTimeoutsMs, retryDelaysMs });
     await work({ storage, dir });
   } finally {
-    (server as http.Server).closeAllConnections?.(); // only an HTTP server has this; the raw TCP one is cleaned up by its test
+    // A server that never answers keeps its connections open, and close() would wait for them for ever (a failing test would hang instead of failing).
+    for (const socket of connections) socket.destroy();
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await rm(dir, { recursive: true, force: true });
   }
@@ -191,6 +194,31 @@ test('a store that accepts the connection but never answers is given up on, inst
       assert.deepEqual((await readdir(dir)).sort(), ['source.mp4'], 'no half-written download may remain');
     });
   } finally { for (const socket of sockets) socket.destroy(); }
+});
+
+test('a stalled connection is cut off by limits of the size production uses too, which the SDK arms by a different route than the short ones above', { timeout: 40_000 }, async () => {
+  // Production allows 15 s to connect and 60 s of silence. The SDK arms a limit under 6 s at once (the 0.5 s above) but one of 6 s or more only
+  // 3 s into the request, which is other code, so that route is tried here at the smallest value that takes it. One attempt only: the SDK would
+  // otherwise try three times, each as long as this one.
+  const silent = net.createServer((socket) => { socket.on('data', () => undefined); socket.on('error', () => undefined); });
+  const previousMaxAttempts = process.env.AWS_MAX_ATTEMPTS;
+  process.env.AWS_MAX_ATTEMPTS = '1';
+  try {
+    await withRealClient(silent, { connect: 6000, idle: 6000 }, async ({ storage }) => {
+      const started = Date.now();
+      // Raced against a clock so that, were the limit to stop working, this fails with a message instead of waiting for ever.
+      let clock: NodeJS.Timeout | undefined;
+      const verdict = await Promise.race([
+        storage.delete('sources/j/source.mp4').then(() => 'the store answered', (error: unknown) => (error instanceof Error ? error.message : String(error))),
+        new Promise<string>((resolve) => { clock = setTimeout(() => resolve('still waiting after 20 s'), 20_000); }),
+      ]);
+      clearTimeout(clock);
+      assert.match(verdict, /timed out/i, 'a request to a server that never answers must be given up on by the limit on silence');
+      assert.ok(Date.now() - started < 15_000, `giving up took ${(Date.now() - started) / 1000} s`);
+    }, []);
+  } finally {
+    if (previousMaxAttempts === undefined) delete process.env.AWS_MAX_ATTEMPTS; else process.env.AWS_MAX_ATTEMPTS = previousMaxAttempts;
+  }
 });
 
 test('the limit is on silence, not on duration: a slow download that keeps moving is not cut off', async () => {

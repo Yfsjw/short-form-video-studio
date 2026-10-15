@@ -47,7 +47,11 @@ export interface AppOverrides {
   databaseSchema?: string;
   /** How often the keep-awake check runs (default 4 minutes; tests make it fast). */
   keepAwakeIntervalMs?: number;
+  /** The longest start-up waits for the look at interrupted jobs before the server opens anyway (default 30 seconds; tests make it short). */
+  bootRecoveryWaitMs?: number;
 }
+
+const DEFAULT_BOOT_RECOVERY_WAIT_MS = 30_000;
 
 export async function createApp(config: AppConfig, overrides: AppOverrides = {}) {
   const durableStorage = overrides.storage ?? createStorage(config);
@@ -88,8 +92,20 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
 
   // Jobs a previous process left unfinished (restart, redeploy, free-tier sleep, out-of-memory kill):
   // resume the ones whose video can still be obtained, fail the rest with an honest reason.
-  const recovery = await pipeline.recoverInterruptedJobs();
-  if (recovery.resumed.length || recovery.failed.length || recovery.waiting) logger.info({ resumedJobIds: recovery.resumed, failedJobIds: recovery.failed, stillOwnedByAnotherProcess: recovery.waiting }, 'Checked for jobs interrupted by a previous process');
+  const checkingForInterruptedJobs = pipeline.recoverInterruptedJobs().then((recovery) => {
+    if (recovery.resumed.length || recovery.failed.length || recovery.waiting) logger.info({ resumedJobIds: recovery.resumed, failedJobIds: recovery.failed, stillOwnedByAnotherProcess: recovery.waiting }, 'Checked for jobs interrupted by a previous process');
+  }).catch((error: unknown) => logger.error({ err: error }, 'Checking for jobs interrupted by a previous process failed')); // nobody may be waiting any more, so this must never become an unhandled rejection
+  // Deciding what happens to each job takes a moment, but the clean-up that follows talks to the storage service, and a service that is slow
+  // or has stopped answering must not keep the whole server shut (a host sees that as a failed start). So start-up waits a little, and the
+  // check carries on in the background if it needs longer. Jobs that can be resumed are already running by then.
+  const bootWaitMs = overrides.bootRecoveryWaitMs ?? DEFAULT_BOOT_RECOVERY_WAIT_MS;
+  let giveUpWaiting: NodeJS.Timeout | undefined;
+  const checkFinishedInTime = await Promise.race([
+    checkingForInterruptedJobs.then(() => true),
+    new Promise<boolean>((resolve) => { giveUpWaiting = setTimeout(() => resolve(false), bootWaitMs); }),
+  ]);
+  clearTimeout(giveUpWaiting);
+  if (!checkFinishedInTime) logger.warn(`The check for interrupted jobs is still running after ${Math.round(bootWaitMs / 1000)} s (most likely the storage service is slow or not answering). The server starts now and the check carries on in the background.`);
 
   const maxUploadMb = Math.round(config.MAX_UPLOAD_BYTES / 1024 / 1024);
   const storage = multer.diskStorage({ destination: config.UPLOAD_DIR, filename: (_req, file, cb) => cb(null, `${randomUUID()}${extname(file.originalname).toLowerCase()}`) });

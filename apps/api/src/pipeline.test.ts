@@ -541,6 +541,33 @@ test('a video that was uploaded but never recorded on its job is deleted when th
   } finally { await ctx.cleanup(); }
 });
 
+test('a storage service that stops answering while recovery clears up after a job it gave up on does not hold up the jobs that are to be resumed', async () => {
+  const storage = new MemoryStorage();
+  let letStorageAnswer!: () => void;
+  storage.holdDeletes = new Promise<void>((resolve) => { letStorageAnswer = resolve; });
+  const ctx = await setup({ storage });
+  try {
+    await addJob(ctx, 'gave-up', { status: 'processing', local: false, durable: true, attempts: 3 }); // created first, so recovery looks at it first
+    await addJob(ctx, 'resumable', { status: 'processing', local: false, durable: true, attempts: 1 });
+    await ctx.backdate('gave-up', 10);
+    await ctx.backdate('resumable', 10);
+
+    let recoveryReturned = false;
+    const recovery = ctx.pipeline.recoverInterruptedJobs().then((summary) => { recoveryReturned = true; return summary; });
+    const finished = await waitForStatus(ctx, 'resumable', ['completed', 'failed']);
+    assert.equal(finished.status, 'completed', finished.errorMessage ?? '');
+    await eventually('recovery to have asked storage to delete the video of the job it gave up on', () => storage.log, (log) => log.includes('delete:sources/gave-up/source.mp4'));
+    assert.equal(recoveryReturned, false, 'storage has not answered, so the call that clears up is still waiting; this test means nothing unless that is so');
+    assert.equal((await ctx.db.getJob('gave-up'))?.status, 'failed', 'the job was given up on without waiting for storage');
+
+    letStorageAnswer();
+    assert.deepEqual(await recovery, { resumed: ['resumable'], failed: ['gave-up'], waiting: 0 });
+    await untilSettled(ctx);
+    assert.equal(storage.objects.has('sources/gave-up/source.mp4'), false, 'once storage answers, the video of the job given up on is deleted');
+    assert.equal((await ctx.db.getJob('gave-up'))?.sourceStorageKey, null);
+  } finally { letStorageAnswer(); await ctx.cleanup(); }
+});
+
 test('when neither the failure nor the durable copy could be saved, the only copy of the video stays on the disk and the job is resumed from it', async () => {
   let outage = false; let uploads = 0;
   class FlakyStorage extends MemoryStorage {
