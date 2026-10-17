@@ -99,6 +99,21 @@ Job stages you can see on the status page: `preparing_source`, `saving_source`, 
 - **Clips are kept until deleted.** Source videos are removed after their job; generated clips stay in R2 and the bucket has no
   retention rule. Add a lifecycle rule in the Cloudflare dashboard if clips should expire.
 
+### What the free instance has actually done
+
+One real video, uploaded from a phone on 15 October 2026: 45 seconds, 1080×1920, 28.1 MB. It reached R2 within seconds and went
+from the saved upload to the finished clip (one highlight, one clip) in 10 minutes 51 seconds, about 14 times the length of the
+video. Render's metrics for that run: the CPU was at or close to its limit for ten minutes in a row (every minute averaged 0.13–0.15 of
+the 0.15 limit, while Render's documentation lists the free plan as 0.1 CPU), and memory peaked at about 475 MiB of the 512 MiB
+limit (93%). Memory was about 80 MB before the job and about 187 MB for the 15 minutes after it, so it did not return to its
+starting level; whether a second job right after the first still fits has not been tested.
+
+This is one sample, not a benchmark, and it was a short video: longer, larger or higher-resolution videos, and back-to-back jobs,
+have not been tried. What it does show is that the free instance is good for demonstrations with short videos and not for
+customers. Render's documentation (October 2026) lists these web service sizes: Starter 0.5 CPU / 512 MB, Standard 1 CPU / 2 GB,
+Pro 2 CPU / 4 GB. Starter has the same memory as the free plan, so it would not relieve the memory pressure; prices are on
+render.com/pricing.
+
 ## Prerequisites
 
 - Node.js **22+**.
@@ -209,8 +224,9 @@ processing continues; the job completes only if at least one clip was made.
 ## Not implemented
 
 Face or speaker tracking (reframing is a fixed centre crop), semantic or LLM highlight selection, languages other than English
-out of the box, user accounts and authentication (**anyone who can reach the service can upload**), per-user quotas, malware
-scanning, a separate worker tier, and retention rules for generated clips. YouTube ingestion depends on a third-party Cobalt
+out of the box (that needs a multilingual model instead of the English-only `ggml-base.en` that `setup:whisper` downloads, and
+`TRANSCRIPTION_LANGUAGE` set to the language code; neither has been tried), user accounts and authentication (**anyone who can reach the service can upload**), per-user quotas,
+malware scanning, a separate worker tier, and retention rules for generated clips. YouTube ingestion depends on a third-party Cobalt
 service whose availability and terms of use are outside this repository. Operators are responsible for having the right to
 process the videos users upload.
 
@@ -225,6 +241,7 @@ in the root `package.json` fetches one exact commit (`7e26d3b0…`, the one the 
 of whatever is newest, because the upstream project changes daily and a change to its command line or output would only show up
 when a customer's job reaches transcription. To move to a newer whisper.cpp, change that hash, build it, and run a real
 transcription before deploying. Set the four `R2_*` variables,
-`DATABASE_URL`, and `REQUIRE_DURABLE_STORAGE=true` there. whisper.cpp on a shared CPU takes roughly the duration of the source
-media or longer, so long videos need patience (or a bigger instance). For anything beyond a single small instance use
+`DATABASE_URL`, and `REQUIRE_DURABLE_STORAGE=true` there. On the free instance one real test took about 14 times the length of
+the video (see "What the free instance has actually done"), so only short videos are practical there and a bigger instance is
+the fix. For anything beyond a single small instance use
 authenticated uploads with quotas, a separate worker tier fed by a durable queue, and resource limits.
