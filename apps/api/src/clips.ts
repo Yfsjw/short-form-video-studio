@@ -2,9 +2,11 @@ import { execFile } from 'node:child_process';
 import { rm, stat } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { promisify } from 'node:util';
+import type { QualityChoice } from './domain.js';
+import { outputSizeFor } from './options.js';
 
 const execFileAsync = promisify(execFile);
-export interface ClipRenderRequest { sourcePath: string; startSeconds: number; endSeconds: number; outputPath: string; captionPath?: string | null; }
+export interface ClipRenderRequest { sourcePath: string; startSeconds: number; endSeconds: number; outputPath: string; captionPath?: string | null; /** `standard` renders at two thirds of the configured size; the default is the configured size. */ quality?: QualityChoice; }
 export interface RenderedClip { durationSeconds: number; sizeBytes: number; }
 export interface ClipRenderer { render(request: ClipRenderRequest): Promise<RenderedClip>; }
 export type FfmpegRunner = (binary: string, arguments_: string[], options: { maxBuffer: number; timeout: number; cwd: string }) => Promise<void>;
@@ -25,7 +27,8 @@ export class FfmpegClipRenderer implements ClipRenderer {
   async render(request: ClipRenderRequest): Promise<RenderedClip> {
     const durationSeconds = request.endSeconds - request.startSeconds;
     if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) throw new Error('Clip range must have a positive duration.');
-    const videoFilter = this.buildVideoFilter(request.captionPath);
+    const size = outputSizeFor({ width: this.verticalWidth, height: this.verticalHeight }, request.quality ?? 'hd');
+    const videoFilter = this.buildVideoFilter(request.captionPath, size);
     const args = [
       // `-ss` goes BEFORE `-i` on purpose. Placed after it, FFmpeg decodes everything from the start of the file and cuts at the very end
       // of the filter chain, so the caption filter would see the ORIGINAL timeline (a clip that starts 40 s into the video would look for
@@ -52,8 +55,8 @@ export class FfmpegClipRenderer implements ClipRenderer {
     }
   }
 
-  private buildVideoFilter(captionPath?: string | null) {
-    const crop = `scale=${this.verticalWidth}:${this.verticalHeight}:force_original_aspect_ratio=increase,crop=${this.verticalWidth}:${this.verticalHeight}`;
+  private buildVideoFilter(captionPath: string | null | undefined, size: { width: number; height: number }) {
+    const crop = `scale=${size.width}:${size.height}:force_original_aspect_ratio=increase,crop=${size.width}:${size.height}`;
     if (!captionPath) return crop;
     const escapedPath = escapeFilterPath(captionPath);
     return `${crop},subtitles='${escapedPath}':force_style='FontName=Arial,FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=3,Shadow=0,Alignment=2,MarginV=110'`;

@@ -3,7 +3,7 @@ import test from 'node:test';
 import { randomUUID } from 'node:crypto';
 import { Pool, type PoolClient } from 'pg';
 import { StudioDatabase } from './database.js';
-import type { GeneratedClip, NewVideoJob } from './domain.js';
+import { defaultJobOptions, type GeneratedClip, type NewVideoJob } from './domain.js';
 import { eventually, sleep } from './test-support.js';
 
 const TEST_DATABASE_URL = process.env.DATABASE_URL ?? 'postgresql://postgres:localtest@localhost:5432/studio_local_test';
@@ -32,6 +32,38 @@ test('a new job starts with no durable copy of its video and zero attempts; both
   assert.equal((await db.getJob('j1'))?.attempts, 2);
 }));
 
+test('a job keeps the options it was created with, and its progress and stage timings can be recorded', () => withDatabase('job_options', async (db) => {
+  await db.createJob({ ...makeJob('plain', 'queued') });
+  assert.deepEqual((await db.getJob('plain'))?.options, defaultJobOptions, 'no options chosen means the defaults');
+
+  const chosen = { clipCount: 2, clipLength: 'short', quality: 'standard', captionStyle: 'none' } as const;
+  await db.createJob({ ...makeJob('chosen', 'queued'), options: chosen });
+  assert.deepEqual((await db.getJob('chosen'))?.options, chosen);
+
+  await db.updateJob('chosen', { stage: 'transcribing', progress: 42, stageTimings: { preparing_source: 1200, probing_video: 40 } });
+  const job = await db.getJob('chosen');
+  assert.equal(job?.progress, 42);
+  assert.deepEqual(job?.stageTimings, { preparing_source: 1200, probing_video: 40 });
+  assert.deepEqual(job?.options, chosen, 'updating a job must not disturb its options');
+
+  await db.updateJob('chosen', { progress: 50 });
+  assert.deepEqual((await db.getJob('chosen'))?.stageTimings, { preparing_source: 1200, probing_video: 40 }, 'an update that does not mention the timings leaves them alone');
+}));
+
+test('a job taken over after its process died starts again from zero progress', async () => {
+  const schema = schemaName('progress_reset');
+  const db = await StudioDatabase.connect(TEST_DATABASE_URL, schema);
+  const raw = new Pool({ connectionString: TEST_DATABASE_URL, options: `-c search_path="${schema}"` });
+  try {
+    await db.createJob(makeJob('j', 'processing'));
+    await raw.query(`UPDATE video_jobs SET progress = 63, updated_at = $1 WHERE id = 'j'`, [minutesAgo(10)]);
+    assert.ok(await db.claimJobForRecovery('j', minutesAgo(1)));
+    const job = await db.getJob('j');
+    assert.equal(job?.status, 'queued');
+    assert.equal(job?.progress, 0, 'a queued job must not show the progress of the attempt that died');
+  } finally { await raw.end(); await db.close({ dropSchema: true }); }
+});
+
 test('upgrades a database created before durable sources existed, keeping its jobs', async () => {
   const schema = schemaName('migrate');
   const admin = new Pool({ connectionString: TEST_DATABASE_URL });
@@ -53,6 +85,9 @@ test('upgrades a database created before durable sources existed, keeping its jo
         assert.equal(job?.status, 'completed');
         assert.equal(job?.sourceStorageKey, null);
         assert.equal(job?.attempts, 0);
+        assert.deepEqual(job?.options, defaultJobOptions, 'a job from before options existed is processed with the defaults');
+        assert.deepEqual(job?.stageTimings, {});
+        assert.equal(job?.progress, 0);
         await db.createJob(makeJob(`new-${boot}`, 'queued'));
         assert.equal((await db.getJob(`new-${boot}`))?.attempts, 0);
       } finally { await db.close(); }

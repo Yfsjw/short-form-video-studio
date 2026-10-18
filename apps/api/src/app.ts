@@ -18,13 +18,11 @@ import { DeterministicHighlightDetector, type HighlightOptions } from './highlig
 import { FfmpegClipRenderer, isSafeClipIdentifier, resolveClipOutputPath } from './clips.js';
 import { downloadYouTubeVideo } from './youtube.js';
 import { KeepAwake } from './keepawake.js';
+import { parseJobOptions } from './options.js';
+import { escapeHtml, renderJobPage, renderMessagePage, renderUploadPage } from './pages.js';
 
 const acceptedExtensions = new Set(['.mp4', '.mov', '.mkv', '.webm', '.avi', '.m4v']);
 const acceptedMimeTypes = new Set(['video/mp4', 'video/quicktime', 'video/x-matroska', 'video/webm', 'video/x-msvideo', 'video/x-m4v']);
-
-function escapeHtml(text: string): string {
-  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-}
 
 /** What the API shows about a job: the internal storage key stays on the server. */
 function toPublicJob(job: VideoJob): Omit<VideoJob, 'sourceStorageKey'> {
@@ -135,7 +133,7 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
   app.get('/', (_req, res) => res.redirect(302, '/test-upload'));
 
   app.get('/test-upload', (_req, res) => {
-    res.type('html').send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Upload a video</title><style>body{font-family:system-ui,sans-serif;max-width:720px;margin:32px auto;padding:0 16px}button{padding:10px 16px;margin-top:12px}pre{white-space:pre-wrap;word-break:break-word;background:#f5f5f5;padding:12px;border-radius:8px}.note{font-weight:600}</style></head><body><h1>Upload a video</h1><p class="note">Choose a video (MP4, MOV, MKV, WebM, AVI or M4V) of up to ${maxUploadMb} MB.</p><p>It is turned into short vertical clips with captions. The next page shows your clips as soon as they are ready.</p><form action="/test-upload" method="post" enctype="multipart/form-data"><input name="video" type="file" accept="video/*" required><br><button type="submit">Upload video</button></form><pre>Large videos take a while to upload over a mobile connection. Keep this page open and the screen on until the next page appears. Videos are processed one at a time, and videos over about 100 MB have not been tested on this server yet.</pre></body></html>`);
+    res.type('html').send(renderUploadPage({ maxUploadMb, defaultClipCount: config.CLIP_MAX_CANDIDATES, defaultClipSeconds: { min: config.HIGHLIGHT_MIN_DURATION_SECONDS, max: config.HIGHLIGHT_MAX_DURATION_SECONDS }, clipSize: { width: config.CLIP_VERTICAL_WIDTH, height: config.CLIP_VERTICAL_HEIGHT } }));
   });
 
   app.post('/test-upload', (req, res, next) => {
@@ -145,15 +143,18 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
           ? `This video is larger than the ${maxUploadMb} MB limit.`
           : error instanceof Error ? error.message : 'Upload failed unexpectedly.';
         req.log.error({ err: error }, 'Upload failed');
-        return res.status(400).type('html').send(`<!doctype html><html><body><h1>Upload failed</h1><p>${escapeHtml(message)}</p><p><a href="/test-upload">Try again</a></p></body></html>`);
+        return res.status(400).type('html').send(renderMessagePage('Upload failed', message));
       }
       try {
-        if (!req.file) return res.status(400).type('html').send('<h1>Upload failed</h1><p>No video file was received.</p><p><a href="/test-upload">Try again</a></p>');
+        if (!req.file) return res.status(400).type('html').send(renderMessagePage('Upload failed', 'No video file was received.'));
+        const options = parseJobOptions(req.body);
+        if (!options.ok) { await discardUpload(req.file.filename); return res.status(400).type('html').send(renderMessagePage('Upload failed', options.message)); }
         const now = new Date().toISOString();
-        const job: NewVideoJob = { id: randomUUID(), originalFilename: req.file.originalname, storedFilename: req.file.filename, mimeType: req.file.mimetype, sizeBytes: req.file.size, status: 'queued', stage: 'queued', errorMessage: null, durationSeconds: null, width: null, height: null, createdAt: now, updatedAt: now };
+        const job: NewVideoJob = { id: randomUUID(), originalFilename: req.file.originalname, storedFilename: req.file.filename, mimeType: req.file.mimetype, sizeBytes: req.file.size, status: 'queued', stage: 'queued', errorMessage: null, durationSeconds: null, width: null, height: null, createdAt: now, updatedAt: now, options: options.options };
         try { await db.createJob(job); } catch (error) { await discardUpload(req.file.filename); throw error; }
         pipeline.enqueue(job.id);
-        res.type('html').send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Upload received</title></head><body><h1>Upload received</h1><p>Your video reached the backend successfully.</p><pre>Job ID: ${job.id}\nFile: ${escapeHtml(req.file.originalname)}\nSize: ${(req.file.size / 1024 / 1024).toFixed(1)} MB\nStatus: queued</pre><p>Open <a href="/jobs/${job.id}">the job status</a> to monitor processing.</p><p><a href="/test-upload">Upload another video</a></p></body></html>`);
+        // Straight to the page that follows the job, instead of a confirmation page with a link to tap.
+        res.redirect(303, `/jobs/${job.id}`);
       } catch (error) {
         next(error);
       }
@@ -166,11 +167,13 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
       if (!config.COBALT_API_URL) return res.status(503).json({ error: { code: 'YOUTUBE_INGESTION_NOT_CONFIGURED', message: 'YouTube ingestion is not configured on this deployment.' } });
       const youtubeUrl = typeof req.body?.url === 'string' ? req.body.url.trim() : '';
       if (!youtubeUrl) return res.status(400).json({ error: { code: 'YOUTUBE_URL_REQUIRED', message: 'Provide a YouTube URL in the “url” field.' } });
+      const options = parseJobOptions(req.body);
+      if (!options.ok) return res.status(400).json({ error: { code: 'INVALID_OPTIONS', message: options.message } });
 
       const id = randomUUID();
       const now = new Date().toISOString();
       const downloaded = await downloadYouTubeVideo({ youtubeUrl, cobaltUrl: config.COBALT_API_URL, cobaltApiKey: config.COBALT_API_KEY, outputDir: config.UPLOAD_DIR, jobId: id, timeoutMs: config.YOUTUBE_DOWNLOAD_TIMEOUT_MS });
-      const job: NewVideoJob = { id, originalFilename: downloaded.originalFilename, storedFilename: downloaded.storedFilename, mimeType: downloaded.mimeType, sizeBytes: downloaded.sizeBytes, status: 'queued', stage: 'queued', errorMessage: null, durationSeconds: null, width: null, height: null, createdAt: now, updatedAt: now };
+      const job: NewVideoJob = { id, originalFilename: downloaded.originalFilename, storedFilename: downloaded.storedFilename, mimeType: downloaded.mimeType, sizeBytes: downloaded.sizeBytes, status: 'queued', stage: 'queued', errorMessage: null, durationSeconds: null, width: null, height: null, createdAt: now, updatedAt: now, options: options.options };
       try { await db.createJob(job); } catch (error) { await discardUpload(downloaded.storedFilename); throw error; }
       pipeline.enqueue(job.id);
       res.status(202).json({ job, source: 'youtube' });
@@ -180,8 +183,10 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
   app.post('/api/jobs', upload.single('video'), async (req, res, next) => {
     try {
       if (!req.file) return res.status(400).json({ error: { code: 'VIDEO_REQUIRED', message: 'Attach one video file using the “video” field.' } });
+      const options = parseJobOptions(req.body);
+      if (!options.ok) { await discardUpload(req.file.filename); return res.status(400).json({ error: { code: 'INVALID_OPTIONS', message: options.message } }); }
       const now = new Date().toISOString();
-      const job: NewVideoJob = { id: randomUUID(), originalFilename: req.file.originalname, storedFilename: req.file.filename, mimeType: req.file.mimetype, sizeBytes: req.file.size, status: 'queued', stage: 'queued', errorMessage: null, durationSeconds: null, width: null, height: null, createdAt: now, updatedAt: now };
+      const job: NewVideoJob = { id: randomUUID(), originalFilename: req.file.originalname, storedFilename: req.file.filename, mimeType: req.file.mimetype, sizeBytes: req.file.size, status: 'queued', stage: 'queued', errorMessage: null, durationSeconds: null, width: null, height: null, createdAt: now, updatedAt: now, options: options.options };
       try { await db.createJob(job); } catch (error) { await discardUpload(req.file.filename); throw error; }
       pipeline.enqueue(job.id);
       res.status(202).json({ job });
@@ -192,40 +197,13 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
     if (!job) return res.status(404).json({ error: { code: 'JOB_NOT_FOUND', message: 'No processing job exists for this id.' } });
     res.json({ job: toPublicJob(job), clips: await db.listClips(job.id) });
   });
-  // Human-friendly counterpart to the JSON route above: a big clickable download
-  // link instead of asking the person to read raw JSON and copy a clip id by hand
-  // on a phone screen. No JavaScript at all -- auto-refresh is a plain <meta> tag,
-  // so there's no inline <script> here to ever break again the way /test-upload did.
+  // Human-friendly counterpart to the JSON route above: a progress bar while the job runs, and the clips playable on the page
+  // (with a big download button each) once it is over. No JavaScript at all -- auto-refresh is a plain <meta> tag, so there is
+  // no inline <script> here to ever break again the way /test-upload did.
   app.get('/jobs/:id', async (req, res) => {
     const job = await db.getJob(req.params.id);
-    if (!job) return res.status(404).type('html').send('<!doctype html><html><body><h1>Not found</h1><p>No job exists for this id.</p></body></html>');
-    const clips = await db.listClips(job.id);
-    const stillWorking = job.status !== 'completed' && job.status !== 'failed';
-    res.type('html').send(String.raw`<!doctype html>
-<html>
-<head>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-${stillWorking ? '<meta http-equiv="refresh" content="5">' : ''}
-<title>Job status</title>
-<style>
-  body{font-family:system-ui,sans-serif;max-width:480px;margin:32px auto;padding:0 16px}
-  .status{padding:12px;border-radius:8px;background:#f5f5f5;margin:12px 0}
-  .download{display:block;text-align:center;padding:16px;margin:12px 0;background:#1a73e8;color:#fff;text-decoration:none;border-radius:8px;font-weight:bold}
-  .error{background:#fdecea;color:#a33}
-</style>
-</head>
-<body>
-<h1>Video status</h1>
-<div class="status ${job.status === 'failed' ? 'error' : ''}">
-  <div>Status: <strong>${job.status}</strong> (${job.stage})</div>
-  ${job.status === 'failed' && job.errorMessage ? `<div style="margin-top:8px">${escapeHtml(job.errorMessage)}</div>` : ''}
-  ${stillWorking ? '<div style="margin-top:8px">Still working -- this page refreshes itself every 5 seconds.</div>' : ''}
-  ${stillWorking && job.attempts > 1 ? `<div style="margin-top:8px">Resumed automatically after the server restarted (attempt ${job.attempts}).</div>` : ''}
-</div>
-${clips.filter((clip) => clip.status === 'completed').map((clip) => `<a class="download" href="/api/jobs/${job.id}/clips/${clip.id}?download=1">Download clip (${clip.durationSeconds ? Math.round(clip.durationSeconds) + 's' : ''})</a>`).join('')}
-<p><a href="/test-upload">Upload another video</a></p>
-</body>
-</html>`);
+    if (!job) return res.status(404).type('html').send(renderMessagePage('Not found', 'No job exists for this id.', { href: '/test-upload', text: 'Upload a video' }));
+    res.type('html').send(renderJobPage(job, await db.listClips(job.id)));
   });
   app.get('/api/jobs/:id/transcript', async (req, res) => {
     const job = await db.getJob(req.params.id);

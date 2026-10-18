@@ -9,6 +9,8 @@ import type { HighlightDetector, HighlightOptions } from './highlights.js';
 import type { ClipRenderer } from './clips.js';
 import type { GeneratedClip, VideoJob } from './domain.js';
 import { writeSrtCaptions } from './captions.js';
+import { highlightOptionsFor } from './options.js';
+import { StageClock, stageProgress, totalMilliseconds } from './progress.js';
 import { sourceKeyFor, StoredObjectMissingError, type DurableStorage } from './storage.js';
 
 type PipelineStore = Pick<StudioDatabase, 'getJob' | 'updateJob' | 'replaceTranscript' | 'listTranscript' | 'replaceHighlights' | 'listHighlights' | 'createClip' | 'updateClip' | 'beginAttempt' | 'touchJob' | 'listUnfinishedJobs' | 'listFinishedJobsHoldingSource' | 'claimJobForRecovery' | 'failStaleJob' | 'deleteClipsForJob'>;
@@ -77,6 +79,11 @@ class Semaphore {
  */
 export class VideoPipeline {
   private readonly heartbeats = new Map<string, NodeJS.Timeout>();
+  /** Times the stages of the jobs this process is working on right now. */
+  private readonly clocks = new Map<string, StageClock>();
+  private readonly lastProgress = new Map<string, { percent: number; at: number }>();
+  /** The latest progress write of each running job; the next stage change waits for it so an old value can never overwrite a newer one. */
+  private readonly progressWrites = new Map<string, Promise<void>>();
   private readonly slots: Semaphore;
   private recheckTimer: NodeJS.Timeout | undefined;
   private closed = false;
@@ -195,18 +202,20 @@ export class VideoPipeline {
     let reachedFinalState = false;
     let sourceIsSafe = job.sourceStorageKey !== null;
     let attempt = 0;
+    const clock = new StageClock();
+    this.clocks.set(jobId, clock);
     try {
       attempt = await this.db.beginAttempt(jobId);
       if (attempt > 1) this.logger.info({ jobId, attempt }, 'Resuming a job that was interrupted');
-      await this.db.updateJob(jobId, { status: 'processing', stage: 'preparing_source', errorMessage: null });
+      await this.enterStage(jobId, 'preparing_source', { status: 'processing', errorMessage: null });
       await this.prepareSource(job, sourcePath);
       sourceIsSafe = true;
       // Everything up to here is plain file transfer and runs for every job at once, so a video is in
       // durable storage as early as possible even while another job occupies the CPU.
-      if (this.slots.isFull) await this.db.updateJob(jobId, { status: 'queued', stage: 'waiting_for_capacity' });
+      if (this.slots.isFull) await this.enterStage(jobId, 'waiting_for_capacity', { status: 'queued' });
       await this.slots.acquire();
       try {
-        await this.db.updateJob(jobId, { status: 'processing', stage: 'probing_video' });
+        await this.enterStage(jobId, 'probing_video', { status: 'processing' });
         await this.renderClips(job, sourcePath, jobOutputDir);
       } finally {
         this.slots.release();
@@ -219,11 +228,12 @@ export class VideoPipeline {
         // simply abandoned, like one whose process died: the job keeps looking unfinished, nothing refreshes it, and the periodic look
         // for abandoned jobs starts it again once it has gone quiet. The number of attempts is still bounded.
         this.logger.error({ err: error, jobId, attempt }, 'Could not read the uploaded video back from durable storage; the job will be tried again later');
-        await this.db.updateJob(jobId, { stage: 'waiting_to_retry' });
+        await this.db.updateJob(jobId, { stage: 'waiting_to_retry', stageTimings: clock.finish() });
       } else {
         const message = error instanceof Error ? error.message : 'Unexpected processing failure';
         this.logger.error({ err: error, jobId }, 'Video processing failed');
-        await this.db.updateJob(jobId, { status: 'failed', stage: 'failed', errorMessage: message });
+        await this.progressWrites.get(jobId)?.catch(() => undefined);
+        await this.db.updateJob(jobId, { status: 'failed', stage: 'failed', errorMessage: message, stageTimings: clock.finish() });
         reachedFinalState = true;
       }
     } finally {
@@ -232,7 +242,34 @@ export class VideoPipeline {
       await this.removeLocalCopies(sourcePath, jobOutputDir, { keepSource: !reachedFinalState && !sourceIsSafe });
       // Only once the outcome is safely recorded: a job that will be resumed still needs its stored video.
       if (reachedFinalState) await this.releaseStoredSource(jobId);
+      this.clocks.delete(jobId); this.lastProgress.delete(jobId); this.progressWrites.delete(jobId);
     }
+  }
+
+  /** Moves a job into a stage: closes the timing of the stage before it and records the stage with its place on the progress scale. */
+  private async enterStage(jobId: string, stage: string, fields: Partial<Pick<VideoJob, 'status' | 'errorMessage' | 'durationSeconds' | 'width' | 'height'>> = {}) {
+    await this.progressWrites.get(jobId)?.catch(() => undefined);
+    const clock = this.clocks.get(jobId);
+    clock?.enter(stage);
+    const progress = stageProgress(stage);
+    this.lastProgress.set(jobId, { percent: progress, at: Date.now() });
+    await this.db.updateJob(jobId, { ...fields, stage, progress, ...(clock ? { stageTimings: clock.snapshot() } : {}) });
+  }
+
+  /**
+   * Moves the progress forward inside a long stage (whisper.cpp's percentage, clips finished). It never waits for the database
+   * and never throws, only moves forward, and writes at most about once per percent point (or every ten seconds).
+   */
+  private reportProgress(jobId: string, percent: number) {
+    const last = this.lastProgress.get(jobId);
+    const now = Date.now();
+    if (last && (percent <= last.percent || (percent < last.percent + 1 && now - last.at < 10_000))) return;
+    this.lastProgress.set(jobId, { percent, at: now });
+    const write = (this.progressWrites.get(jobId) ?? Promise.resolve())
+      .catch(() => undefined)
+      .then(() => this.db.updateJob(jobId, { progress: percent }))
+      .catch((error: unknown) => { this.logger.error({ err: error, jobId }, 'Could not record the progress of the job'); });
+    this.progressWrites.set(jobId, write);
   }
 
   /**
@@ -288,7 +325,7 @@ export class VideoPipeline {
     }
     if (job.sourceStorageKey) {
       if (haveLocal) return;
-      await this.db.updateJob(job.id, { stage: 'restoring_source' });
+      await this.enterStage(job.id, 'restoring_source');
       try {
         await this.storage.download(job.sourceStorageKey, sourcePath);
       } catch (error) {
@@ -305,7 +342,7 @@ export class VideoPipeline {
       return;
     }
     if (!haveLocal) throw new Error('The uploaded video is no longer on the server and was never saved to durable storage. Please upload it again.');
-    await this.db.updateJob(job.id, { stage: 'saving_source' });
+    await this.enterStage(job.id, 'saving_source');
     const key = sourceKeyFor(job.id, job.storedFilename);
     await this.storage.upload(sourcePath, key, job.mimeType || 'application/octet-stream');
     await this.db.updateJob(job.id, { sourceStorageKey: key });
@@ -341,23 +378,24 @@ export class VideoPipeline {
     const jobId = job.id;
     await this.discardPreviousClips(jobId, jobOutputDir);
     const metadata = await this.ffmpeg.probe(sourcePath);
-    await this.db.updateJob(jobId, { stage: 'extracting_audio', ...metadata });
+    await this.enterStage(jobId, 'extracting_audio', { ...metadata });
     const workDir = await mkdtemp(join(this.tempDir, `${jobId}-`));
     try {
       const audioPath = join(workDir, 'audio.wav');
       await this.ffmpeg.extractAudio(sourcePath, audioPath);
-      await this.db.updateJob(jobId, { stage: 'transcribing' });
-      const segments = await this.transcriber.transcribe(audioPath, workDir);
+      await this.enterStage(jobId, 'transcribing');
+      const segments = await this.transcriber.transcribe(audioPath, workDir, (fraction) => this.reportProgress(jobId, stageProgress('transcribing', fraction)));
       await this.db.replaceTranscript(jobId, segments);
-      await this.db.updateJob(jobId, { stage: 'detecting_highlights' });
-      const highlights = this.highlightDetector.detect({ segments: await this.db.listTranscript(jobId), durationSeconds: metadata.durationSeconds, metadata: { width: metadata.width, height: metadata.height }, options: this.highlightOptions });
+      await this.enterStage(jobId, 'detecting_highlights');
+      const options = job.options;
+      const highlights = this.highlightDetector.detect({ segments: await this.db.listTranscript(jobId), durationSeconds: metadata.durationSeconds, metadata: { width: metadata.width, height: metadata.height }, options: highlightOptionsFor(this.highlightOptions, options) });
       await this.db.replaceHighlights(jobId, highlights);
-      const candidates = (await this.db.listHighlights(jobId)).slice(0, this.maxClipCandidates);
+      const candidates = (await this.db.listHighlights(jobId)).slice(0, options.clipCount ?? this.maxClipCandidates);
       if (!candidates.length) throw new Error('Highlight detection produced no valid candidate ranges for clip extraction.');
-      await this.db.updateJob(jobId, { stage: 'extracting_clips' });
+      await this.enterStage(jobId, 'extracting_clips');
       await mkdir(jobOutputDir, { recursive: true });
       let completedCount = 0;
-      for (const candidate of candidates) {
+      for (const [candidateNumber, candidate] of candidates.entries()) {
         const clipId = randomUUID();
         const outputFilename = `${clipId}.mp4`;
         const outputPath = join(jobOutputDir, outputFilename);
@@ -367,8 +405,8 @@ export class VideoPipeline {
         await this.db.createClip(clip); await this.db.updateClip(clipId, { status: 'processing' });
         try {
           const transcriptSegments = await this.db.listTranscript(jobId);
-          const captionCount = await writeSrtCaptions(captionPath, transcriptSegments, candidate.startSeconds, candidate.endSeconds);
-          const rendered = await this.clipRenderer.render({ sourcePath, startSeconds: candidate.startSeconds, endSeconds: candidate.endSeconds, outputPath, captionPath: captionCount ? captionPath : null });
+          const captionCount = options.captionStyle === 'none' ? 0 : await writeSrtCaptions(captionPath, transcriptSegments, candidate.startSeconds, candidate.endSeconds);
+          const rendered = await this.clipRenderer.render({ sourcePath, startSeconds: candidate.startSeconds, endSeconds: candidate.endSeconds, outputPath, captionPath: captionCount ? captionPath : null, quality: options.quality });
           await this.storage.upload(outputPath, clip.outputPath, 'video/mp4');
           if (captionCount) await this.storage.upload(captionPath, `${jobId}/${clipId}.srt`, 'application/x-subrip');
           await this.db.updateClip(clipId, { status: 'completed', durationSeconds: rendered.durationSeconds, errorMessage: null, captionPath }); completedCount += 1;
@@ -376,10 +414,13 @@ export class VideoPipeline {
           await rm(captionPath, { force: true });
           const message = error instanceof Error ? error.message : 'Unexpected clip extraction failure'; await this.db.updateClip(clipId, { status: 'failed', errorMessage: message }); this.logger.error({ err: error, jobId, clipId, candidateId: candidate.id }, 'Clip extraction failed');
         }
+        this.reportProgress(jobId, stageProgress('extracting_clips', (candidateNumber + 1) / candidates.length));
       }
       if (!completedCount) throw new Error(`Clip extraction failed for all ${candidates.length} ranked candidate(s).`);
-      await this.db.updateJob(jobId, { status: 'completed', stage: 'clip_extraction_complete' });
-      this.logger.info({ jobId, metadata, transcriptSegmentCount: segments.length, highlightCandidateCount: highlights.length, completedClipCount: completedCount }, 'Video processing, vertical rendering, and caption burn-in completed');
+      await this.progressWrites.get(jobId)?.catch(() => undefined);
+      const stageTimings = this.clocks.get(jobId)?.finish() ?? {};
+      await this.db.updateJob(jobId, { status: 'completed', stage: 'clip_extraction_complete', progress: 100, stageTimings });
+      this.logger.info({ jobId, metadata, options, stageTimingsMs: stageTimings, totalMs: totalMilliseconds(stageTimings), transcriptSegmentCount: segments.length, highlightCandidateCount: highlights.length, completedClipCount: completedCount }, 'Video processing, vertical rendering, and caption burn-in completed');
     } finally {
       await rm(workDir, { recursive: true, force: true });
     }

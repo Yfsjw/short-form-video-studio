@@ -277,10 +277,9 @@ test('the upload page states the configured size limit, and the upload route acc
     assert.ok(big.length > 22 * 1024 * 1024);
     const response = await upload(server.base, '/test-upload', big);
     assert.equal(response.status, 200);
-    const html = await response.text();
-    assert.match(html, /Upload received/);
-    const id = html.match(/Job ID: ([0-9a-f-]{36})/)?.[1];
-    assert.ok(id, 'the confirmation page must show the job id');
+    const id = response.url.match(/\/jobs\/([0-9a-f-]{36})$/)?.[1];
+    assert.ok(id, 'an upload must lead straight to the page that follows the job');
+    assert.match(await response.text(), /Processing your video|Your clips/);
 
     const finished = await waitForJob(server.base, id);
     assert.equal(finished.job.status, 'completed', finished.job.errorMessage ?? '');
@@ -302,7 +301,7 @@ test('a video over the configured limit is refused with a clear message and leav
   } finally { await server.stop(); await dropSchema(schema); }
 });
 
-test('file names are escaped on the confirmation page, so an upload cannot inject markup', needsFfmpeg, async () => {
+test('file names are escaped on the page an upload leads to, so an upload cannot inject markup', needsFfmpeg, async () => {
   const schema = schemaName('xss'); const server = await start({ schema });
   try {
     const response = await upload(server.base, '/test-upload', await readFile(sampleVideo), '<img src=x onerror=alert(1)>.mp4');
@@ -310,7 +309,7 @@ test('file names are escaped on the confirmation page, so an upload cannot injec
     const html = await response.text();
     assert.ok(html.includes('&lt;img src=x onerror=alert(1)&gt;.mp4'));
     assert.ok(!html.includes('<img src=x'));
-    const id = html.match(/Job ID: ([0-9a-f-]{36})/)![1];
+    const id = response.url.match(/\/jobs\/([0-9a-f-]{36})$/)![1];
     await waitForJob(server.base, id);
   } finally { await server.stop(); await dropSchema(schema); }
 });
@@ -366,6 +365,108 @@ test('the job page tells the truth about a resumed job and about a failed one, w
     assert.ok(failedPage.includes('It broke: &lt;b&gt;boom&lt;/b&gt;'));
     assert.ok(!failedPage.includes('<b>boom</b>'));
     assert.doesNotMatch(failedPage, /http-equiv="refresh"/);
+  } finally { await server.stop(); await dropSchema(schema); }
+});
+
+const uploadWith = (base: string, route: string, bytes: Buffer, fields: Record<string, string>, filename = 'match.mp4') => {
+  const form = new FormData();
+  for (const [name, value] of Object.entries(fields)) form.append(name, value);
+  form.append('video', new Blob([new Uint8Array(bytes)], { type: 'video/mp4' }), filename);
+  return fetch(`${base}${route}`, { method: 'POST', body: form });
+};
+
+test('options chosen at upload are kept with the job and shape the clip, and the finished job reports its progress and timings', needsFfmpeg, async () => {
+  const schema = schemaName('options'); const server = await start({ schema, env: { CLIP_VERTICAL_WIDTH: '1080', CLIP_VERTICAL_HEIGHT: '1920' } });
+  try {
+    const response = await uploadWith(server.base, '/api/jobs', await readFile(sampleVideo), { clipCount: '1', quality: 'standard', captionStyle: 'none' });
+    assert.equal(response.status, 202);
+    const { job } = await response.json() as { job: { id: string; options: unknown } };
+    assert.deepEqual(job.options, { clipCount: 1, clipLength: 'auto', quality: 'standard', captionStyle: 'none' });
+
+    const finished = await waitForJob(server.base, job.id) as JobView & { job: { progress: number; stageTimings: Record<string, number>; options: unknown } };
+    assert.equal(finished.job.status, 'completed', finished.job.errorMessage ?? '');
+    assert.equal(finished.job.progress, 100);
+    assert.ok(Object.keys(finished.job.stageTimings).includes('transcribing') && Object.keys(finished.job.stageTimings).includes('extracting_clips'), 'the stages must be timed');
+    assert.deepEqual(finished.job.options, { clipCount: 1, clipLength: 'auto', quality: 'standard', captionStyle: 'none' });
+    await untilSettled(server);
+
+    const clip = finished.clips[0];
+    const clipFile = join(workspace, `${clip.id}.mp4`);
+    await writeFile(clipFile, (server.storage as MemoryStorage).objects.get(clip.outputPath)!);
+    const facts = await inspect(clipFile);
+    assert.deepEqual({ width: facts.width, height: facts.height }, { width: 720, height: 1280 }, 'the faster quality is two thirds of the configured 1080x1920');
+    assert.equal((server.storage as MemoryStorage).objects.has(`${job.id}/${clip.id}.srt`), false, 'no captions were asked for, so none are made');
+
+    const page = await (await fetch(`${server.base}/jobs/${job.id}`)).text();
+    assert.match(page, /Done in /);
+    assert.match(page, /Where the time went/);
+    assert.match(page, /<video controls[^>]*src="\/api\/jobs\/[0-9a-f-]{36}\/clips\/[0-9a-f-]{36}#t=0\.1"/, 'a finished job plays its clips on the page');
+    assert.doesNotMatch(page, /http-equiv="refresh"/);
+  } finally { await server.stop(); await dropSchema(schema); }
+});
+
+test('the options from the upload form are read, kept, and shown as choices on the upload page', needsFfmpeg, async () => {
+  const schema = schemaName('form'); const server = await start({ schema });
+  try {
+    const page = await (await fetch(`${server.base}/test-upload`)).text();
+    for (const name of ['clipCount', 'clipLength', 'quality', 'captionStyle']) assert.ok(page.includes(`name="${name}"`), `the form has no ${name} choice`);
+    assert.match(page, /Automatic \(up to 1\)/, 'the automatic choice says what it means on this server');
+    assert.match(page, /Automatic \(2–6 s\)/);
+
+    const response = await uploadWith(server.base, '/test-upload', await readFile(sampleVideo), { clipCount: '1', clipLength: '', quality: 'hd', captionStyle: 'classic' });
+    assert.equal(response.status, 200);
+    const id = response.url.match(/\/jobs\/([0-9a-f-]{36})$/)![1];
+    const finished = await waitForJob(server.base, id) as JobView & { job: { options: unknown } };
+    assert.deepEqual(finished.job.options, { clipCount: 1, clipLength: 'auto', quality: 'hd', captionStyle: 'classic' }, 'a blank choice means automatic');
+    assert.equal(finished.job.status, 'completed', finished.job.errorMessage ?? '');
+  } finally { await server.stop(); await dropSchema(schema); }
+});
+
+test('an option that is not allowed is refused with a plain message and leaves nothing behind', async () => {
+  const schema = schemaName('badopt'); const server = await start({ schema });
+  try {
+    const api = await uploadWith(server.base, '/api/jobs', Buffer.alloc(64 * 1024, 3), { clipCount: '9' });
+    assert.equal(api.status, 400);
+    const body = await api.json() as { error: { code: string; message: string } };
+    assert.equal(body.error.code, 'INVALID_OPTIONS');
+    assert.match(body.error.message, /clipCount/);
+
+    const form = await uploadWith(server.base, '/test-upload', Buffer.alloc(64 * 1024, 3), { quality: '8k' });
+    assert.equal(form.status, 400);
+    assert.match(await form.text(), /“quality” is not valid/);
+
+    assert.deepEqual(await readdir(server.dirs.UPLOAD_DIR), [], 'the refused videos must not stay on the disk');
+    assert.equal((await server.studio.db.listUnfinishedJobs()).length, 0);
+  } finally { await server.stop(); await dropSchema(schema); }
+});
+
+test('the job page shows a progress bar while a job runs and the clips as players when it is done', async () => {
+  const schema = schemaName('jobpage'); const server = await start({ schema });
+  try {
+    const now = new Date().toISOString();
+    const base = { originalFilename: 'talk.mp4', storedFilename: 'talk.mp4', mimeType: 'video/mp4', sizeBytes: 1, errorMessage: null, durationSeconds: null, width: null, height: null, createdAt: now, updatedAt: now };
+    const working = randomUUID(); const done = randomUUID(); const clipId = randomUUID();
+    await server.studio.db.createJob({ ...base, id: working, status: 'processing', stage: 'transcribing' });
+    await server.studio.db.updateJob(working, { progress: 40 });
+    await server.studio.db.createJob({ ...base, id: done, status: 'completed', stage: 'clip_extraction_complete' });
+    await server.studio.db.updateJob(done, { progress: 100, stageTimings: { transcribing: 61_000, extracting_clips: 125_000 } });
+    await server.studio.db.createClip({ id: clipId, jobId: done, candidateId: 'c', startSeconds: 0, endSeconds: 12, durationSeconds: 12, outputPath: `${done}/${clipId}.mp4`, outputFilename: `${clipId}.mp4`, status: 'completed', errorMessage: null, captionPath: null, createdAt: now, updatedAt: now });
+
+    const workingPage = await (await fetch(`${server.base}/jobs/${working}`)).text();
+    assert.match(workingPage, /<progress value="40" max="100">/);
+    assert.match(workingPage, /Listening to the speech/);
+    assert.match(workingPage, /http-equiv="refresh"/);
+    assert.doesNotMatch(workingPage, /<video/, 'a page that reloads itself must not offer players that would be cut off');
+
+    const donePage = await (await fetch(`${server.base}/jobs/${done}`)).text();
+    assert.ok(donePage.includes(`<video controls playsinline preload="metadata" src="/api/jobs/${done}/clips/${clipId}#t=0.1">`));
+    assert.ok(donePage.includes(`href="/api/jobs/${done}/clips/${clipId}?download=1"`));
+    assert.match(donePage, /Done in 3 min 06 s/);
+    assert.match(donePage, /Listening to the speech<\/td><td>1 min 01 s/);
+    assert.doesNotMatch(donePage, /http-equiv="refresh"/);
+
+    const missing = await fetch(`${server.base}/jobs/${randomUUID()}`);
+    assert.equal(missing.status, 404);
   } finally { await server.stop(); await dropSchema(schema); }
 });
 

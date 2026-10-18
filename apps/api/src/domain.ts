@@ -1,6 +1,25 @@
 export const jobStatuses = ['queued', 'processing', 'completed', 'failed'] as const;
 export type JobStatus = (typeof jobStatuses)[number];
 
+/** How long the clips should be: `auto` leaves it to the server's defaults (HIGHLIGHT_MIN/MAX_DURATION_SECONDS). */
+export const clipLengthChoices = ['auto', 'short', 'medium', 'long'] as const;
+export type ClipLengthChoice = (typeof clipLengthChoices)[number];
+/** `hd` is the server's configured size (1080x1920 unless changed); `standard` is two thirds of it (720x1280), which renders much faster. */
+export const qualityChoices = ['hd', 'standard'] as const;
+export type QualityChoice = (typeof qualityChoices)[number];
+export const captionStyles = ['classic', 'none'] as const;
+export type CaptionStyle = (typeof captionStyles)[number];
+
+/** What the person asked for when uploading. Stored with the job so a resumed job is finished the way it was started. */
+export interface JobOptions {
+  /** At most this many clips; null leaves it to the server's default (CLIP_MAX_CANDIDATES). */
+  clipCount: number | null;
+  clipLength: ClipLengthChoice;
+  quality: QualityChoice;
+  captionStyle: CaptionStyle;
+}
+export const defaultJobOptions: JobOptions = { clipCount: null, clipLength: 'auto', quality: 'hd', captionStyle: 'classic' };
+
 export interface VideoJob {
   id: string; originalFilename: string; storedFilename: string; mimeType: string; sizeBytes: number;
   status: JobStatus; stage: string; errorMessage: string | null; durationSeconds: number | null;
@@ -9,9 +28,14 @@ export interface VideoJob {
   sourceStorageKey: string | null;
   /** How many times processing has been started for this job; the first run counts as 1. */
   attempts: number;
+  options: JobOptions;
+  /** How long each stage of the latest attempt took, in milliseconds (a stage appears once it has finished). */
+  stageTimings: Record<string, number>;
+  /** How far along processing is, 0 to 100. */
+  progress: number;
 }
-/** What a caller supplies to create a job; the pipeline owns the storage key and the attempt counter. */
-export type NewVideoJob = Omit<VideoJob, 'sourceStorageKey' | 'attempts'>;
+/** What a caller supplies to create a job; the pipeline owns the storage key, the attempt counter, the timings and the progress. */
+export type NewVideoJob = Omit<VideoJob, 'sourceStorageKey' | 'attempts' | 'options' | 'stageTimings' | 'progress'> & { options?: JobOptions };
 
 export const clipStatuses = ['queued', 'processing', 'completed', 'failed'] as const;
 export type ClipStatus = (typeof clipStatuses)[number];

@@ -6,13 +6,13 @@ import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { Pool } from 'pg';
 import { StudioDatabase } from './database.js';
-import type { NewVideoJob } from './domain.js';
+import type { JobOptions, NewVideoJob } from './domain.js';
 import { VideoPipeline, type PipelineRuntimeOptions } from './pipeline.js';
 import { NullStorage, type DurableStorage } from './storage.js';
 import { MemoryStorage, eventually, sleep } from './test-support.js';
 import type { TranscriptionEngine } from './transcription.js';
 import { DeterministicHighlightDetector } from './highlights.js';
-import type { ClipRenderer } from './clips.js';
+import type { ClipRenderer, ClipRenderRequest } from './clips.js';
 
 const TEST_DATABASE_URL = process.env.DATABASE_URL ?? 'postgresql://postgres:localtest@localhost:5432/studio_local_test';
 const VIDEO = 'pretend these are the bytes of an uploaded video';
@@ -34,7 +34,7 @@ function unreachableWhile(isDown: () => boolean, db: StudioDatabase): StudioData
   } });
 }
 
-async function setup(options: { storage?: DurableStorage; transcriber?: TranscriptionEngine; renderer?: ClipRenderer; runtime?: Partial<PipelineRuntimeOptions>; database?: (db: StudioDatabase) => StudioDatabase } = {}) {
+async function setup(options: { storage?: DurableStorage; transcriber?: TranscriptionEngine; renderer?: ClipRenderer; runtime?: Partial<PipelineRuntimeOptions>; database?: (db: StudioDatabase) => StudioDatabase; media?: typeof fakeMedia } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'studio-pipeline-'));
   const uploadDir = join(root, 'uploads'); const tempDir = join(root, 'tmp'); const outputDir = join(root, 'outputs');
   await Promise.all([mkdir(uploadDir), mkdir(tempDir), mkdir(outputDir)]);
@@ -46,7 +46,7 @@ async function setup(options: { storage?: DurableStorage; transcriber?: Transcri
   const logger = { info: () => undefined, error: (_fields: unknown, message?: string) => { errors.push(String(message)); } };
   const pipelines: VideoPipeline[] = [];
   const makePipeline = () => {
-    const pipeline = new VideoPipeline(options.database ? options.database(db) : db, fakeMedia, options.transcriber ?? speech, new DeterministicHighlightDetector(), highlightOptions, options.renderer ?? writingRenderer, 1, uploadDir, tempDir, outputDir, logger, storage, { ...fastRuntime, ...options.runtime });
+    const pipeline = new VideoPipeline(options.database ? options.database(db) : db, options.media ?? fakeMedia, options.transcriber ?? speech, new DeterministicHighlightDetector(), highlightOptions, options.renderer ?? writingRenderer, 1, uploadDir, tempDir, outputDir, logger, storage, { ...fastRuntime, ...options.runtime });
     pipelines.push(pipeline);
     return pipeline;
   };
@@ -58,10 +58,10 @@ async function setup(options: { storage?: DurableStorage; transcriber?: Transcri
   };
 }
 
-async function addJob(ctx: Context, id: string, overrides: { status?: NewVideoJob['status']; local?: boolean; durable?: boolean; attempts?: number } = {}) {
+async function addJob(ctx: Context, id: string, overrides: { status?: NewVideoJob['status']; local?: boolean; durable?: boolean; attempts?: number; options?: JobOptions } = {}) {
   const now = new Date().toISOString();
   const storedFilename = `${id}.mp4`;
-  await ctx.db.createJob({ id, originalFilename: 'talk.mp4', storedFilename, mimeType: 'video/mp4', sizeBytes: Buffer.byteLength(VIDEO), status: overrides.status ?? 'queued', stage: overrides.status ?? 'queued', errorMessage: null, durationSeconds: null, width: null, height: null, createdAt: now, updatedAt: now });
+  await ctx.db.createJob({ id, originalFilename: 'talk.mp4', storedFilename, mimeType: 'video/mp4', sizeBytes: Buffer.byteLength(VIDEO), status: overrides.status ?? 'queued', stage: overrides.status ?? 'queued', errorMessage: null, durationSeconds: null, width: null, height: null, createdAt: now, updatedAt: now, options: overrides.options });
   if (overrides.local ?? true) await writeFile(join(ctx.uploadDir, storedFilename), VIDEO);
   if (overrides.durable) {
     const key = `sources/${id}/source.mp4`;
@@ -605,5 +605,75 @@ test('the pipeline can say how many jobs it is still working on, clean-up includ
     await ctx.pipeline.run('counted');
     assert.equal(during, 1, 'a job being transcribed is active');
     assert.equal(ctx.pipeline.activeJobCount, 0, 'a finished job is not');
+  } finally { await ctx.cleanup(); }
+});
+
+
+test('records how long each stage took and moves the progress from 0 to 100, following the speech recognition as it goes', async () => {
+  const transcriber: TranscriptionEngine = { transcribe: async (_audio, _dir, onProgress) => {
+    for (const fraction of [0.25, 0.5, 1]) { await sleep(20); onProgress?.(fraction); }
+    return [{ segmentIndex: 0, startSeconds: 0, endSeconds: 2, text: 'Adapter-provided transcript.' }];
+  } };
+  const ctx = await setup({ transcriber });
+  try {
+    const written: number[] = [];
+    const original = ctx.db.updateJob.bind(ctx.db);
+    ctx.db.updateJob = async (id, fields) => { if (fields.progress !== undefined) written.push(fields.progress); await original(id, fields); };
+    await addJob(ctx, 'j-progress');
+    await ctx.pipeline.run('j-progress');
+
+    const job = await ctx.db.getJob('j-progress');
+    assert.equal(job?.status, 'completed');
+    assert.equal(job?.progress, 100);
+    for (const stage of ['preparing_source', 'saving_source', 'probing_video', 'extracting_audio', 'transcribing', 'detecting_highlights', 'extracting_clips']) {
+      assert.equal(typeof job?.stageTimings[stage], 'number', `no timing for ${stage}`);
+      assert.ok(job.stageTimings[stage] >= 0);
+    }
+    assert.ok(job.stageTimings.transcribing >= 50, `transcribing took ${job.stageTimings.transcribing} ms but the engine alone waited 60 ms`);
+    assert.deepEqual(written, [...written].sort((a, b) => a - b), `progress went backwards: ${written}`);
+    for (const percent of [25, 40, 70]) assert.ok(written.includes(percent), `the engine's progress (${percent}%) never reached the job: ${written}`);
+    assert.equal(written.at(-1), 100);
+  } finally { await ctx.cleanup(); }
+});
+
+test('a job that fails keeps the timings of the stages it went through and does not pretend to be nearly done', async () => {
+  const ctx = await setup({ transcriber: { transcribe: async () => { await sleep(30); throw new Error('speech recognition exploded'); } } });
+  try {
+    await addJob(ctx, 'j-broken');
+    await ctx.pipeline.run('j-broken');
+    const job = await ctx.db.getJob('j-broken');
+    assert.equal(job?.status, 'failed');
+    assert.match(job?.errorMessage ?? '', /speech recognition exploded/);
+    assert.ok(job.stageTimings.transcribing >= 25, 'the stage that failed must be timed too');
+    assert.ok(job.progress < 100);
+  } finally { await ctx.cleanup(); }
+});
+
+test('makes the clips the way the person asked: how many, how long, with or without captions, at which quality', async () => {
+  const requests: ClipRenderRequest[] = [];
+  const renderer: ClipRenderer = { render: async (request) => { requests.push(request); await writeFile(request.outputPath, 'rendered clip'); return { durationSeconds: request.endSeconds - request.startSeconds, sizeBytes: 13 }; } };
+  // Three minutes of talk in sentences of five seconds, so there are plenty of places to cut.
+  const talk = Array.from({ length: 36 }, (_, index) => ({ segmentIndex: index, startSeconds: index * 5, endSeconds: index * 5 + 5, text: index % 3 === 2 ? 'Is this the best part of all?' : `Sentence number ${index} makes a point.` }));
+  const ctx = await setup({ transcriber: { transcribe: async () => talk }, renderer, media: { ...fakeMedia, probe: async () => ({ durationSeconds: 180, width: 1920, height: 1080 }) } });
+  try {
+    await addJob(ctx, 'j-chosen', { options: { clipCount: 2, clipLength: 'short', quality: 'standard', captionStyle: 'none' } });
+    await ctx.pipeline.run('j-chosen');
+    assert.equal((await ctx.db.getJob('j-chosen'))?.status, 'completed');
+    assert.equal(requests.length, 2, 'two clips were asked for');
+    for (const request of requests) {
+      const length = request.endSeconds - request.startSeconds;
+      assert.ok(length >= 15 && length <= 30, `a short clip must last 15 to 30 s, not ${length}`);
+      assert.equal(request.captionPath, null, 'captions were switched off');
+      assert.equal(request.quality, 'standard');
+    }
+
+    requests.length = 0;
+    await addJob(ctx, 'j-plain');
+    await ctx.pipeline.run('j-plain');
+    assert.equal(requests.length, 1, 'without a choice the server default (one clip in this test setup) applies');
+    assert.ok(requests[0].captionPath, 'captions are on by default');
+    assert.equal(requests[0].quality, 'hd');
+    const length = requests[0].endSeconds - requests[0].startSeconds;
+    assert.ok(length >= 1 && length <= 10, 'the default clip length comes from the server settings');
   } finally { await ctx.cleanup(); }
 });

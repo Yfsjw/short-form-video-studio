@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { Pool, type PoolClient } from 'pg';
-import type { GeneratedClip, HighlightCandidate, JobStatus, NewVideoJob, TranscriptSegment, VideoJob } from './domain.js';
+import { defaultJobOptions, type GeneratedClip, type HighlightCandidate, type JobStatus, type NewVideoJob, type TranscriptSegment, type VideoJob } from './domain.js';
+import { readStoredOptions } from './options.js';
 
 const CREATE_TABLES_SQL = `
   CREATE TABLE IF NOT EXISTS video_jobs (
@@ -32,9 +33,21 @@ const CREATE_TABLES_SQL = `
 const COLUMNS_ADDED_LATER: Array<{ name: string; definition: string }> = [
   { name: 'source_storage_key', definition: 'TEXT' },
   { name: 'attempts', definition: 'INTEGER NOT NULL DEFAULT 0' },
+  { name: 'options_json', definition: 'TEXT' },
+  { name: 'stage_timings_json', definition: 'TEXT' },
+  { name: 'progress', definition: 'INTEGER NOT NULL DEFAULT 0' },
 ];
 
 type SqlRunner = (sql: string) => Promise<{ rows: any[] }>;
+
+/** The stage timings of a job as stored (JSON text); anything unreadable counts as "nothing recorded". */
+function parseTimings(json: string | null | undefined): Record<string, number> {
+  try {
+    const parsed: unknown = json ? JSON.parse(json) : {};
+    if (!parsed || typeof parsed !== 'object') return {};
+    return Object.fromEntries(Object.entries(parsed as Record<string, unknown>).filter(([, value]) => typeof value === 'number' && Number.isFinite(value))) as Record<string, number>;
+  } catch { return {}; }
+}
 
 /**
  * Creates whatever is missing and leaves what exists alone. The ALTER is only issued for a column that really is missing:
@@ -99,15 +112,16 @@ export class StudioDatabase {
 
   async createJob(job: NewVideoJob) {
     await this.pool.query(
-      'INSERT INTO video_jobs (id, original_filename, stored_filename, mime_type, size_bytes, status, stage, error_message, duration_seconds, width, height, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)',
-      [job.id, job.originalFilename, job.storedFilename, job.mimeType, job.sizeBytes, job.status, job.stage, job.errorMessage, job.durationSeconds, job.width, job.height, job.createdAt, job.updatedAt]
+      'INSERT INTO video_jobs (id, original_filename, stored_filename, mime_type, size_bytes, status, stage, error_message, duration_seconds, width, height, created_at, updated_at, options_json) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)',
+      [job.id, job.originalFilename, job.storedFilename, job.mimeType, job.sizeBytes, job.status, job.stage, job.errorMessage, job.durationSeconds, job.width, job.height, job.createdAt, job.updatedAt, JSON.stringify(job.options ?? defaultJobOptions)]
     );
   }
 
-  async updateJob(id: string, fields: Partial<Pick<VideoJob, 'status' | 'stage' | 'errorMessage' | 'durationSeconds' | 'width' | 'height' | 'sourceStorageKey'>>) {
-    const entries = Object.entries(fields).filter(([, value]) => value !== undefined);
+  async updateJob(id: string, fields: Partial<Pick<VideoJob, 'status' | 'stage' | 'errorMessage' | 'durationSeconds' | 'width' | 'height' | 'sourceStorageKey' | 'progress' | 'stageTimings'>>) {
+    const { stageTimings, ...plain } = fields;
+    const entries = Object.entries({ ...plain, stageTimings: stageTimings === undefined ? undefined : JSON.stringify(stageTimings) }).filter(([, value]) => value !== undefined);
     if (!entries.length) return;
-    const column: Record<string, string> = { errorMessage: 'error_message', durationSeconds: 'duration_seconds', sourceStorageKey: 'source_storage_key' };
+    const column: Record<string, string> = { errorMessage: 'error_message', durationSeconds: 'duration_seconds', sourceStorageKey: 'source_storage_key', stageTimings: 'stage_timings_json' };
     const setClauses = entries.map(([key], i) => `${column[key] ?? key} = $${i + 1}`);
     const values = entries.map(([, value]) => value ?? null);
     await this.pool.query(
@@ -219,7 +233,7 @@ export class StudioDatabase {
    */
   async claimJobForRecovery(id: string, staleBefore: string): Promise<boolean> {
     const result = await this.pool.query(
-      `UPDATE video_jobs SET status = 'queued', stage = 'queued', error_message = NULL, updated_at = $1 WHERE id = $2 AND status IN ('queued', 'processing') AND updated_at < $3`,
+      `UPDATE video_jobs SET status = 'queued', stage = 'queued', error_message = NULL, progress = 0, updated_at = $1 WHERE id = $2 AND status IN ('queued', 'processing') AND updated_at < $3`,
       [new Date().toISOString(), id, staleBefore]
     );
     return result.rowCount === 1;
@@ -275,7 +289,7 @@ export class StudioDatabase {
     }
   }
 
-  private mapJob(row: any): VideoJob | undefined { if (!row) return undefined; return { id: row.id, originalFilename: row.original_filename, storedFilename: row.stored_filename, mimeType: row.mime_type, sizeBytes: Number(row.size_bytes), status: row.status as JobStatus, stage: row.stage, errorMessage: row.error_message, durationSeconds: row.duration_seconds, width: row.width, height: row.height, createdAt: row.created_at, updatedAt: row.updated_at, sourceStorageKey: row.source_storage_key ?? null, attempts: Number(row.attempts ?? 0) }; }
+  private mapJob(row: any): VideoJob | undefined { if (!row) return undefined; return { id: row.id, originalFilename: row.original_filename, storedFilename: row.stored_filename, mimeType: row.mime_type, sizeBytes: Number(row.size_bytes), status: row.status as JobStatus, stage: row.stage, errorMessage: row.error_message, durationSeconds: row.duration_seconds, width: row.width, height: row.height, createdAt: row.created_at, updatedAt: row.updated_at, sourceStorageKey: row.source_storage_key ?? null, attempts: Number(row.attempts ?? 0), options: readStoredOptions(row.options_json), stageTimings: parseTimings(row.stage_timings_json), progress: Number(row.progress ?? 0) }; }
   private mapClip(row: any): GeneratedClip | undefined { if (!row) return undefined; return { id: row.id, jobId: row.job_id, candidateId: row.candidate_id, startSeconds: row.start_seconds, endSeconds: row.end_seconds, durationSeconds: row.duration_seconds, outputPath: row.output_path, outputFilename: row.output_filename, status: row.status, errorMessage: row.error_message, captionPath: row.caption_path, createdAt: row.created_at, updatedAt: row.updated_at }; }
   private mapTranscript(row: any): TranscriptSegment { return { id: row.id, jobId: row.job_id, segmentIndex: row.segment_index, startSeconds: row.start_seconds, endSeconds: row.end_seconds, text: row.text, createdAt: row.created_at }; }
   private mapHighlight(row: any): HighlightCandidate { return { id: row.id, jobId: row.job_id, candidateIndex: row.candidate_index, startSeconds: row.start_seconds, endSeconds: row.end_seconds, score: row.score, quality: row.quality, reasons: JSON.parse(row.reasons_json), signals: JSON.parse(row.signals_json), sourceSegmentIndexes: JSON.parse(row.source_segment_indexes_json), createdAt: row.created_at }; }

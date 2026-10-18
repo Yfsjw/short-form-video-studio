@@ -21,7 +21,7 @@ upload ─► job row (Postgres) ─► video copied to Cloudflare R2 ─► ffp
 | File storage | Cloudflare R2 (S3 API). The uploaded video is kept there while a job is unfinished; finished clips are served from there through short-lived signed links. |
 | Speech | `whisper.cpp` on the CPU (`ggml-base.en`, English). |
 | Video | `ffprobe` / `ffmpeg`. |
-| Pages | The service serves two small phone-friendly pages itself: `/test-upload` (upload form) and `/jobs/<id>` (progress and download links). `apps/web` is a separate React client that is **not** part of the current deployment. |
+| Pages | The service serves two small phone-friendly pages itself, with no JavaScript: `/test-upload` (upload form with a few options) and `/jobs/<id>` (a progress bar while the job runs; the clips playable on the page, each with a download button, once it is done). An upload leads straight to its `/jobs/<id>` page. `apps/web` is a separate React client that is **not** part of the current deployment. |
 
 ## Durability and recovery
 
@@ -187,14 +187,33 @@ All configuration comes from environment variables; see [`.env.example`](.env.ex
 
 ## API
 
-- `POST /api/jobs` — multipart request with one `video` field. Returns `202` with the job.
-- `POST /api/youtube` — JSON `{ "url": "<YouTube URL>" }`; only available when `COBALT_API_URL` is configured.
-- `GET /api/jobs/:id` — the job (`status`, `stage`, `attempts`, `errorMessage`, …) and its clips. The internal storage location is never exposed.
+- `POST /api/jobs` — multipart request with one `video` field and, optionally, the job options below. Returns `202` with the job. An option that is not allowed is refused with `400` (`INVALID_OPTIONS`) before anything is stored.
+- `POST /api/youtube` — JSON `{ "url": "<YouTube URL>" }` (the job options below can be added); only available when `COBALT_API_URL` is configured.
+- `GET /api/jobs/:id` — the job (`status`, `stage`, `progress`, `stageTimings`, `options`, `attempts`, `errorMessage`, …) and its clips. The internal storage location is never exposed.
 - `GET /api/jobs/:id/transcript` — timestamped transcript segments.
 - `GET /api/jobs/:id/highlights` — ranked highlight candidates with their scoring signals.
 - `GET /api/jobs/:jobId/clips/:clipId` — redirects to a short-lived signed R2 link (add `?download=1` to force a download). In local-only mode the file is streamed from disk.
 - `GET /api/health` — `{ status, service, storage: { backend: "r2" | "local-only", selfTest, checkedAt } }`.
 - `GET /test-upload`, `POST /test-upload`, `GET /jobs/:id` — the built-in phone-friendly pages. `GET /` redirects to `/test-upload`.
+
+### Job options
+
+Chosen per upload (the upload page has them under "Options"; a blank choice means "automatic"), stored with the job, so a job that
+is resumed after a restart is finished the way it was started.
+
+| Option | Values | Meaning |
+| --- | --- | --- |
+| `clipCount` | `1`–`5` | At most this many clips (default: `CLIP_MAX_CANDIDATES`). |
+| `clipLength` | `auto`, `short` (15–30 s), `medium` (30–60 s), `long` (60–90 s) | Length of each clip (`auto` uses `HIGHLIGHT_MIN/MAX_DURATION_SECONDS`). |
+| `quality` | `hd`, `standard` | `hd` is the configured clip size (1080×1920 by default); `standard` is two thirds of it (720×1280), which renders noticeably faster on a small server. |
+| `captionStyle` | `classic`, `none` | Burn the transcript in as captions, or leave the picture clean. |
+
+### Progress and timings
+
+`progress` (0–100) follows the real work: whisper.cpp's own percentage (`-pp`) fills the long transcription stage, the clips fill
+the last stage one by one. `stageTimings` records how long each stage of the latest attempt took in milliseconds (a stage appears
+once it has finished), and the totals are written to the log line that ends every job. On a small server this is how to see
+where the time goes before deciding what to speed up.
 
 Accepted extensions: MP4, MOV, MKV, WebM, AVI, M4V. Extension and declared MIME type are checked before a job is created and
 `ffprobe` then checks that the file really contains a readable video stream. An upload that is abandoned halfway, or whose job

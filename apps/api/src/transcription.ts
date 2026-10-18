@@ -1,12 +1,13 @@
-import { execFile } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { access, readFile } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
-import { promisify } from 'node:util';
 import type { TranscriptSegment } from './domain.js';
 
-const execFileAsync = promisify(execFile);
 export type TranscriptInput = Array<Omit<TranscriptSegment, 'id' | 'jobId' | 'createdAt'>>;
-export interface TranscriptionEngine { transcribe(audioPath: string, workDir: string): Promise<TranscriptInput>; }
+export interface TranscriptionEngine {
+  /** `onProgress` (optional) is told how far along the work is, as a fraction from 0 to 1, whenever the engine knows. */
+  transcribe(audioPath: string, workDir: string, onProgress?: (fraction: number) => void): Promise<TranscriptInput>;
+}
 
 type WhisperJson = { transcription?: Array<{ text?: unknown; offsets?: { from?: unknown; to?: unknown }; timestamps?: { from?: unknown; to?: unknown } }> };
 
@@ -32,6 +33,52 @@ function parseTimestamp(value: unknown): number | undefined {
   return Number(match[1]) * 3600 + Number(match[2]) * 60 + Number(match[3]) + Number(match[4]) / 1000;
 }
 
+/** How much of a program's output is kept for error messages: the end of it, which is where the reason for a failure is. */
+const KEPT_OUTPUT_CHARS = 64 * 1024;
+
+/**
+ * Runs a program and hands everything it prints on stderr to `onStderr` as it happens (so progress can be followed),
+ * keeping only the tail of both outputs. Unlike execFile with a size limit, a program that prints a lot is not killed for it.
+ * A failure carries `stdout` and `stderr`, like execFile's.
+ */
+export function runProgram(executable: string, args: string[], options: { cwd: string; timeoutMs: number; onStderr?: (text: string) => void }): Promise<{ stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(executable, args, { cwd: options.cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = ''; let stderr = ''; let timedOut = false; let finished = false;
+    const keepTail = (kept: string, text: string) => { const joined = kept + text; return joined.length > KEPT_OUTPUT_CHARS ? joined.slice(-KEPT_OUTPUT_CHARS) : joined; };
+    const timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, options.timeoutMs);
+    child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (text: string) => { stdout = keepTail(stdout, text); });
+    child.stderr.on('data', (text: string) => { stderr = keepTail(stderr, text); try { options.onStderr?.(text); } catch { /* a listener must never break the run */ } });
+    const fail = (message: string) => { if (finished) return; finished = true; clearTimeout(timer); reject(Object.assign(new Error(message), { stdout, stderr })); };
+    child.on('error', (error) => fail(`Could not start ${executable}: ${error.message}`));
+    child.on('close', (code, signal) => {
+      if (finished) return;
+      if (timedOut) return fail(`${basename(executable)} was stopped after the ${Math.round(options.timeoutMs / 1000)} s time limit`);
+      if (code !== 0) return fail(`Command failed: ${basename(executable)} (${signal ? `signal ${signal}` : `exit code ${code}`})`);
+      finished = true; clearTimeout(timer); resolve({ stdout, stderr });
+    });
+  });
+}
+
+/** Follows whisper.cpp's `-pp` lines ("progress =  45%") in the text it prints, even when a line arrives in pieces. */
+export function createProgressListener(onProgress: ((fraction: number) => void) | undefined) {
+  let carry = '';
+  let highest = -1;
+  return (text: string) => {
+    if (!onProgress) return;
+    carry += text;
+    const lines = carry.split(/\r?\n/);
+    carry = lines.pop() ?? '';
+    for (const line of lines) {
+      const match = /progress\s*=\s*(\d{1,3})\s*%/.exec(line);
+      if (!match) continue;
+      const percent = Math.min(100, Number(match[1]));
+      if (percent > highest) { highest = percent; onProgress(percent / 100); }
+    }
+  };
+}
+
 function trimDiagnostic(value: string): string {
   const trimmed = value.trim();
   if (!trimmed) return '(no output)';
@@ -40,14 +87,15 @@ function trimDiagnostic(value: string): string {
 
 export class WhisperCppTranscriber implements TranscriptionEngine {
   constructor(private readonly executablePath: string, private readonly modelPath: string, private readonly language: string, private readonly timeoutMs: number) {}
-  async transcribe(audioPath: string, workDir: string): Promise<TranscriptInput> {
+  async transcribe(audioPath: string, workDir: string, onProgress?: (fraction: number) => void): Promise<TranscriptInput> {
     const outputBase = join(workDir, basename(audioPath, '.wav'));
     let stdout = '';
     let stderr = '';
     try {
       // Render's free service is CPU-only. Force whisper.cpp to stay on CPU instead of
       // attempting GPU initialization, which makes the process fail before transcription.
-      const result = await execFileAsync(this.executablePath, ['-m', this.modelPath, '-f', audioPath, '-l', this.language, '-ng', '-nfa', '-oj', '-of', outputBase], { timeout: this.timeoutMs, maxBuffer: 2 * 1024 * 1024, cwd: dirname(audioPath) });
+      // `-pp` makes whisper.cpp report its percentage on stderr, which is what the progress bar follows.
+      const result = await runProgram(this.executablePath, ['-m', this.modelPath, '-f', audioPath, '-l', this.language, '-ng', '-nfa', '-pp', '-oj', '-of', outputBase], { timeoutMs: this.timeoutMs, cwd: dirname(audioPath), onStderr: createProgressListener(onProgress) });
       stdout = result.stdout;
       stderr = result.stderr;
     } catch (error) {
