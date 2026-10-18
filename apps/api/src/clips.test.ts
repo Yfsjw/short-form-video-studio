@@ -30,6 +30,6 @@ test('FFmpeg renderer builds a 9:16 timestamped MP4 command with a mocked proces
   try {
     const renderer = new FfmpegClipRenderer('ffmpeg', 'libx264', 'aac', 23, 'veryfast', 1080, 1920, async (_binary, args) => { arguments_ = args; await writeFile(outputPath, 'mock mp4 bytes'); });
     const rendered = await renderer.render({ sourcePath: join(root, 'source.mp4'), startSeconds: 12.5, endSeconds: 18.25, outputPath });
-    assert.equal(rendered.durationSeconds, 5.75); assert.ok(rendered.sizeBytes > 0); assert.deepEqual(arguments_.slice(0, 8), ['-nostdin', '-y', '-i', join(root, 'source.mp4'), '-ss', '12.500', '-t', '5.750']); assert.ok(arguments_.includes('-movflags')); assert.ok(arguments_.includes('-vf')); assert.ok(arguments_.some((arg) => arg.includes('scale=1080:1920')));
+    assert.equal(rendered.durationSeconds, 5.75); assert.ok(rendered.sizeBytes > 0); assert.deepEqual(arguments_.slice(0, 8), ['-nostdin', '-y', '-ss', '12.500', '-i', join(root, 'source.mp4'), '-t', '5.750']); assert.ok(arguments_.includes('-movflags')); assert.ok(arguments_.includes('-vf')); assert.ok(arguments_.some((arg) => arg.includes('scale=1080:1920')));
   } finally { await rm(root, { recursive: true, force: true }); }
 });

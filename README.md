@@ -215,8 +215,10 @@ changing the API or the rendering stage.
 
 ### Clip rendering
 
-For each highest-ranked candidate (up to `CLIP_MAX_CANDIDATES`) FFmpeg cuts the exact requested range (post-input seeking, so
-the range does not depend on source keyframes), **scales the picture to fill 9:16 and crops the centre**, burns in the
+For each highest-ranked candidate (up to `CLIP_MAX_CANDIDATES`) FFmpeg cuts the exact requested range (a frame-accurate seek
+placed before the input, so the range does not depend on source keyframes, the clip's own timeline starts at zero, which is
+what the captions are counted from, and a clip deep inside a long video does not require decoding everything before it),
+**scales the picture to fill 9:16 and crops the centre**, burns in the
 transcript segments that fall inside the range as captions, and encodes H.264/AAC with `+faststart`. The crop is fixed to the
 centre of the frame: nothing follows faces or speakers. A candidate that fails keeps a failed clip record with its error and
 processing continues; the job completes only if at least one clip was made.

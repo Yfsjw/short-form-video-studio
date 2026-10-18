@@ -27,8 +27,13 @@ export class FfmpegClipRenderer implements ClipRenderer {
     if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) throw new Error('Clip range must have a positive duration.');
     const videoFilter = this.buildVideoFilter(request.captionPath);
     const args = [
-      '-nostdin', '-y', '-i', request.sourcePath,
-      '-ss', request.startSeconds.toFixed(3), '-t', durationSeconds.toFixed(3),
+      // `-ss` goes BEFORE `-i` on purpose. Placed after it, FFmpeg decodes everything from the start of the file and cuts at the very end
+      // of the filter chain, so the caption filter would see the ORIGINAL timeline (a clip that starts 40 s into the video would look for
+      // its captions at 40 s onwards while ours are counted from the start of the clip, and they would never show up or show at the wrong
+      // moment). Placed before it, the seek is still frame-accurate, the clip's own timeline starts at 0, and a clip deep inside a long video
+      // no longer costs the time of decoding everything before it.
+      '-nostdin', '-y', '-ss', request.startSeconds.toFixed(3), '-i', request.sourcePath,
+      '-t', durationSeconds.toFixed(3),
       '-map', '0:v:0', '-map', '0:a?',
       '-vf', videoFilter,
       '-c:v', this.videoCodec, '-preset', this.preset, '-crf', String(this.crf),
