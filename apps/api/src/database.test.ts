@@ -77,6 +77,11 @@ test('upgrades a database created before durable sources existed, keeping its jo
       created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`);
     const now = new Date().toISOString();
     await admin.query(`INSERT INTO "${schema}".video_jobs VALUES ('old','a.mp4','b.mp4','video/mp4',5,'completed','done',NULL,NULL,NULL,NULL,$1,$1)`, [now]);
+    // A transcript stored by the release before words were kept (no words_json column).
+    await admin.query(`CREATE TABLE "${schema}".transcript_segments (
+      id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES "${schema}".video_jobs(id), segment_index INTEGER NOT NULL,
+      start_seconds DOUBLE PRECISION NOT NULL, end_seconds DOUBLE PRECISION NOT NULL, text TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(job_id, segment_index))`);
+    await admin.query(`INSERT INTO "${schema}".transcript_segments VALUES ('s0','old',0,0,2,'An old transcript.',$1)`, [now]);
 
     for (let boot = 1; boot <= 2; boot += 1) { // booting twice proves the migration is idempotent
       const db = await StudioDatabase.connect(TEST_DATABASE_URL, schema);
@@ -88,6 +93,15 @@ test('upgrades a database created before durable sources existed, keeping its jo
         assert.deepEqual(job?.options, defaultJobOptions, 'a job from before options existed is processed with the defaults');
         assert.deepEqual(job?.stageTimings, {});
         assert.equal(job?.progress, 0);
+        const transcript = await db.listTranscript('old');
+        assert.equal(transcript.length, 1);
+        if (boot === 1) {
+          assert.equal(transcript[0].text, 'An old transcript.');
+          assert.ok(!('words' in transcript[0]), 'an old transcript has no word timing, and says so by having none');
+          await db.replaceTranscript('old', [{ segmentIndex: 0, startSeconds: 0, endSeconds: 2, text: 'A new one.', words: [{ text: 'A', startSeconds: 0, endSeconds: 0.5 }, { text: 'new', startSeconds: 0.5, endSeconds: 1 }, { text: 'one.', startSeconds: 1, endSeconds: 2 }] }]);
+        } else {
+          assert.deepEqual(transcript[0].words?.map((word) => word.text), ['A', 'new', 'one.'], 'words written after the upgrade survive the next start');
+        }
         await db.createJob(makeJob(`new-${boot}`, 'queued'));
         assert.equal((await db.getJob(`new-${boot}`))?.attempts, 0);
       } finally { await db.close(); }
@@ -97,6 +111,17 @@ test('upgrades a database created before durable sources existed, keeping its jo
     await admin.end();
   }
 });
+
+test('the words of a transcript are stored with their timing; segments without words read back without them', () => withDatabase('words', async (db) => {
+  await db.createJob(makeJob('j-words', 'processing'));
+  await db.replaceTranscript('j-words', [
+    { segmentIndex: 0, startSeconds: 0, endSeconds: 2, text: 'Hello there.', words: [{ text: 'Hello', startSeconds: 0.1, endSeconds: 0.9 }, { text: 'there.', startSeconds: 1, endSeconds: 1.8 }] },
+    { segmentIndex: 1, startSeconds: 2, endSeconds: 3, text: 'No words here' },
+  ]);
+  const [first, second] = await db.listTranscript('j-words');
+  assert.deepEqual(first.words, [{ text: 'Hello', startSeconds: 0.1, endSeconds: 0.9 }, { text: 'there.', startSeconds: 1, endSeconds: 1.8 }]);
+  assert.ok(!('words' in second));
+}));
 
 test('lists only unfinished jobs, oldest first', () => withDatabase('unfinished', async (db) => {
   await db.createJob(makeJob('b-processing', 'processing', minutesAgo(1)));

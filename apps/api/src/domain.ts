@@ -7,7 +7,11 @@ export type ClipLengthChoice = (typeof clipLengthChoices)[number];
 /** `hd` is the server's configured size (1080x1920 unless changed); `standard` is two thirds of it (720x1280), which renders much faster. */
 export const qualityChoices = ['hd', 'standard'] as const;
 export type QualityChoice = (typeof qualityChoices)[number];
-export const captionStyles = ['classic', 'none'] as const;
+/**
+ * How captions look. `classic`: short phrases in white. `highlight`: the same phrases with the word being spoken in colour.
+ * `pop`: a few big upper-case words at a time, the word being spoken in colour, popping in. `none`: no captions.
+ */
+export const captionStyles = ['classic', 'highlight', 'pop', 'none'] as const;
 export type CaptionStyle = (typeof captionStyles)[number];
 
 /** What the person asked for when uploading. Stored with the job so a resumed job is finished the way it was started. */
@@ -40,6 +44,12 @@ export type NewVideoJob = Omit<VideoJob, 'sourceStorageKey' | 'attempts' | 'opti
 export const clipStatuses = ['queued', 'processing', 'completed', 'failed'] as const;
 export type ClipStatus = (typeof clipStatuses)[number];
 export interface GeneratedClip { id: string; jobId: string; candidateId: string; startSeconds: number; endSeconds: number; durationSeconds: number; outputPath: string; outputFilename: string; status: ClipStatus; errorMessage: string | null; captionPath: string | null; createdAt: string; updatedAt: string; }
-export interface TranscriptSegment { id: string; jobId: string; segmentIndex: number; startSeconds: number; endSeconds: number; text: string; createdAt: string; }
+/** One spoken word with the moment it starts and ends, in seconds from the start of the video. */
+export interface TranscriptWord { text: string; startSeconds: number; endSeconds: number; }
+export interface TranscriptSegment {
+  id: string; jobId: string; segmentIndex: number; startSeconds: number; endSeconds: number; text: string; createdAt: string;
+  /** The words of the segment with their own timing, when the speech recognition provided it (older transcripts and other engines may not). */
+  words?: TranscriptWord[];
+}
 export type HighlightSignals = Record<string, { value: number; weight: number; contribution: number }>;
 export interface HighlightCandidate { id: string; jobId: string; candidateIndex: number; startSeconds: number; endSeconds: number; score: number; quality: 'low' | 'medium' | 'high'; reasons: string[]; signals: HighlightSignals; sourceSegmentIndexes: number[]; createdAt: string; }

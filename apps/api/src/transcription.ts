@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import { access, readFile } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 import type { TranscriptSegment } from './domain.js';
+import { wordsFromTokens, type RawToken } from './words.js';
 
 export type TranscriptInput = Array<Omit<TranscriptSegment, 'id' | 'jobId' | 'createdAt'>>;
 export interface TranscriptionEngine {
@@ -9,9 +10,19 @@ export interface TranscriptionEngine {
   transcribe(audioPath: string, workDir: string, onProgress?: (fraction: number) => void): Promise<TranscriptInput>;
 }
 
-type WhisperJson = { transcription?: Array<{ text?: unknown; offsets?: { from?: unknown; to?: unknown }; timestamps?: { from?: unknown; to?: unknown } }> };
+type WhisperTimes = { offsets?: { from?: unknown; to?: unknown }; timestamps?: { from?: unknown; to?: unknown } };
+type WhisperJson = { transcription?: Array<WhisperTimes & { text?: unknown; tokens?: unknown }> };
 
-/** Parses whisper.cpp JSON output. Offset values are milliseconds; timestamp strings are a fallback. */
+/** The pieces of one segment from whisper.cpp's full JSON (`-ojf`), with the times it reported for each. */
+function readTokens(tokens: unknown): RawToken[] {
+  if (!Array.isArray(tokens)) return [];
+  return tokens.flatMap((token: WhisperTimes & { text?: unknown }) => {
+    if (!token || typeof token !== 'object' || typeof token.text !== 'string') return [];
+    return [{ text: token.text, startSeconds: parseTimestamp(token.offsets?.from ?? token.timestamps?.from), endSeconds: parseTimestamp(token.offsets?.to ?? token.timestamps?.to) }];
+  });
+}
+
+/** Parses whisper.cpp JSON output (plain or full). Offset values are milliseconds; timestamp strings are a fallback. A segment gets `words` only when the output has usable per-word timing. */
 export function parseWhisperCppJson(raw: string): TranscriptInput {
   const document = JSON.parse(raw) as WhisperJson;
   if (!Array.isArray(document.transcription)) throw new Error('whisper.cpp did not produce a transcription array.');
@@ -21,7 +32,8 @@ export function parseWhisperCppJson(raw: string): TranscriptInput {
     const endSeconds = parseTimestamp(item.offsets?.to ?? item.timestamps?.to);
     if (!text) throw new Error(`whisper.cpp returned an empty transcript segment at index ${segmentIndex}.`);
     if (startSeconds === undefined || endSeconds === undefined || endSeconds < startSeconds) throw new Error(`whisper.cpp returned invalid timestamps at segment ${segmentIndex}.`);
-    return { segmentIndex, startSeconds, endSeconds, text };
+    const words = wordsFromTokens(readTokens(item.tokens), startSeconds, endSeconds);
+    return words ? { segmentIndex, startSeconds, endSeconds, text, words } : { segmentIndex, startSeconds, endSeconds, text };
   });
 }
 
@@ -95,7 +107,8 @@ export class WhisperCppTranscriber implements TranscriptionEngine {
       // Render's free service is CPU-only. Force whisper.cpp to stay on CPU instead of
       // attempting GPU initialization, which makes the process fail before transcription.
       // `-pp` makes whisper.cpp report its percentage on stderr, which is what the progress bar follows.
-      const result = await runProgram(this.executablePath, ['-m', this.modelPath, '-f', audioPath, '-l', this.language, '-ng', '-nfa', '-pp', '-oj', '-of', outputBase], { timeoutMs: this.timeoutMs, cwd: dirname(audioPath), onStderr: createProgressListener(onProgress) });
+      // `-ojf` writes the JSON with the pieces of every segment and their own times (that is what makes word-by-word captions possible).
+      const result = await runProgram(this.executablePath, ['-m', this.modelPath, '-f', audioPath, '-l', this.language, '-ng', '-nfa', '-pp', '-ojf', '-of', outputBase], { timeoutMs: this.timeoutMs, cwd: dirname(audioPath), onStderr: createProgressListener(onProgress) });
       stdout = result.stdout;
       stderr = result.stderr;
     } catch (error) {

@@ -19,6 +19,31 @@ test('parses timestamped whisper.cpp JSON output', () => {
   assert.deepEqual(segments, [{ segmentIndex: 0, startSeconds: 1.25, endSeconds: 3.75, text: 'A real timestamped segment.' }]);
 });
 
+/** What whisper.cpp's full JSON (-ojf) looks like for one segment: every piece of text with its own offsets (milliseconds), special tokens included. */
+const piece = (text: string, from?: number, to?: number) => ({ text, ...(from === undefined ? {} : { timestamps: { from: '00:00:00,000', to: '00:00:00,000' }, offsets: { from, to } }), id: 1, p: 0.9, t_dtw: -1 });
+const FULL_JSON = JSON.stringify({
+  systeminfo: 'AVX = 1', model: { type: 'base' }, params: { model: 'm', language: 'en', translate: false }, result: { language: 'en' },
+  transcription: [
+    { timestamps: { from: '00:00:00,000', to: '00:00:02,400' }, offsets: { from: 0, to: 2400 }, text: ' Hello there, world.', tokens: [
+      piece('[_BEG_]', 0, 0), piece(' Hello', 160, 620), piece(' there', 620, 1100), piece(',', 1100, 1180), piece(' world', 1300, 1900), piece('.', 1900, 2000), piece('[_TT_120]', 2400, 2400)] },
+    { timestamps: { from: '00:00:02,400', to: '00:00:04,000' }, offsets: { from: 2400, to: 4000 }, text: ' No pieces here.' },
+    { timestamps: { from: '00:00:04,000', to: '00:00:06,000' }, offsets: { from: 4000, to: 6000 }, text: ' Times missing.', tokens: [piece(' Times'), piece(' missing'), piece('.')] },
+  ],
+});
+
+test('reads the words of every segment, with their own times, from whisper.cpp full JSON', () => {
+  const segments = parseWhisperCppJson(FULL_JSON);
+  assert.equal(segments.length, 3);
+  assert.deepEqual(segments[0].words, [
+    { text: 'Hello', startSeconds: 0.16, endSeconds: 0.62 },
+    { text: 'there,', startSeconds: 0.62, endSeconds: 1.18 },
+    { text: 'world.', startSeconds: 1.3, endSeconds: 2.0 },
+  ]);
+  assert.equal(segments[0].text, 'Hello there, world.', 'the text of the segment is unchanged');
+  assert.ok(!('words' in segments[1]), 'a segment without pieces has no words (the captions spread its text instead)');
+  assert.ok(!('words' in segments[2]), 'pieces without any times are no use for timing');
+});
+
 test('stores and returns transcript segments in segment order', async () => {
   const db = await StudioDatabase.connect(TEST_DATABASE_URL, `test_transcript_${randomUUID().replaceAll('-', '_')}`);
   try {
@@ -81,7 +106,16 @@ ${HELLO_JSON}`);
     assert.deepEqual(segments, [{ segmentIndex: 0, startSeconds: 0, endSeconds: 2, text: 'Hello there.' }]);
     assert.deepEqual(seen, [0.05, 0.5, 1]);
     const args = (await readFile(join(root, 'audio.args'), 'utf8')).split('\n').filter(Boolean);
-    assert.deepEqual(args, ['-m', '/models/base.bin', '-f', audio, '-l', 'en', '-ng', '-nfa', '-pp', '-oj', '-of', join(root, 'audio')]);
+    assert.deepEqual(args, ['-m', '/models/base.bin', '-f', audio, '-l', 'en', '-ng', '-nfa', '-pp', '-ojf', '-of', join(root, 'audio')]);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('the program output is read as full JSON, words included', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'studio-whisper-'));
+  try {
+    const program = await fakeWhisper(root, `cat > "$base.json" <<'JSON'\n${FULL_JSON}\nJSON`);
+    const segments = await new WhisperCppTranscriber(program, 'm', 'en', 30_000).transcribe(await audioIn(root), root);
+    assert.deepEqual(segments[0].words?.map((word) => word.text), ['Hello', 'there,', 'world.']);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { defaultJobOptions } from './domain.js';
+import { captionStyles, defaultJobOptions } from './domain.js';
 import { highlightOptionsFor, MAX_CLIP_COUNT, outputSizeFor, parseJobOptions, readStoredOptions } from './options.js';
 
 const base = { minDurationSeconds: 20, maxDurationSeconds: 60, maxCandidates: 5, overlapThreshold: 0.65, weights: { density: 1 } };
@@ -13,6 +13,15 @@ test('no options at all, or an untouched form, mean the defaults', () => {
 
 test('reads what the upload form sends (everything arrives as text)', () => {
   assert.deepEqual(parseJobOptions({ clipCount: '2', clipLength: 'short', quality: 'standard', captionStyle: 'none' }), { ok: true, options: { clipCount: 2, clipLength: 'short', quality: 'standard', captionStyle: 'none' } });
+});
+
+test('every caption style on offer is accepted, and each one survives being stored and read back', () => {
+  for (const captionStyle of captionStyles) {
+    const parsed = parseJobOptions({ captionStyle });
+    assert.deepEqual(parsed, { ok: true, options: { ...defaultJobOptions, captionStyle } });
+    assert.equal(readStoredOptions(JSON.stringify((parsed as { options: unknown }).options)).captionStyle, captionStyle);
+  }
+  assert.deepEqual([...captionStyles], ['classic', 'highlight', 'pop', 'none']);
 });
 
 test('ignores fields it does not know, and refuses values that are not allowed with a plain message', () => {

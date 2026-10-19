@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { Pool, type PoolClient } from 'pg';
 import { defaultJobOptions, type GeneratedClip, type HighlightCandidate, type JobStatus, type NewVideoJob, type TranscriptSegment, type VideoJob } from './domain.js';
 import { readStoredOptions } from './options.js';
+import { parseStoredWords } from './words.js';
 
 const CREATE_TABLES_SQL = `
   CREATE TABLE IF NOT EXISTS video_jobs (
@@ -30,12 +31,13 @@ const CREATE_TABLES_SQL = `
 `;
 
 /** Columns that were added after the first production release, so a database created by an older release is missing them. */
-const COLUMNS_ADDED_LATER: Array<{ name: string; definition: string }> = [
-  { name: 'source_storage_key', definition: 'TEXT' },
-  { name: 'attempts', definition: 'INTEGER NOT NULL DEFAULT 0' },
-  { name: 'options_json', definition: 'TEXT' },
-  { name: 'stage_timings_json', definition: 'TEXT' },
-  { name: 'progress', definition: 'INTEGER NOT NULL DEFAULT 0' },
+const COLUMNS_ADDED_LATER: Array<{ table: string; name: string; definition: string }> = [
+  { table: 'video_jobs', name: 'source_storage_key', definition: 'TEXT' },
+  { table: 'video_jobs', name: 'attempts', definition: 'INTEGER NOT NULL DEFAULT 0' },
+  { table: 'video_jobs', name: 'options_json', definition: 'TEXT' },
+  { table: 'video_jobs', name: 'stage_timings_json', definition: 'TEXT' },
+  { table: 'video_jobs', name: 'progress', definition: 'INTEGER NOT NULL DEFAULT 0' },
+  { table: 'transcript_segments', name: 'words_json', definition: 'TEXT' },
 ];
 
 type SqlRunner = (sql: string) => Promise<{ rows: any[] }>;
@@ -58,10 +60,13 @@ function parseTimings(json: string | null | undefined): Record<string, number> {
  */
 async function ensureSchema(run: SqlRunner) {
   await run(CREATE_TABLES_SQL);
-  const existing = await run(`SELECT attname FROM pg_attribute WHERE attrelid = to_regclass('video_jobs') AND attnum > 0 AND NOT attisdropped`);
-  const present = new Set(existing.rows.map((row) => String(row.attname)));
+  const present = new Map<string, Set<string>>();
+  for (const table of new Set(COLUMNS_ADDED_LATER.map((column) => column.table))) {
+    const existing = await run(`SELECT attname FROM pg_attribute WHERE attrelid = to_regclass('${table}') AND attnum > 0 AND NOT attisdropped`);
+    present.set(table, new Set(existing.rows.map((row) => String(row.attname))));
+  }
   for (const column of COLUMNS_ADDED_LATER) {
-    if (!present.has(column.name)) await run(`ALTER TABLE video_jobs ADD COLUMN IF NOT EXISTS ${column.name} ${column.definition}`);
+    if (!present.get(column.table)?.has(column.name)) await run(`ALTER TABLE ${column.table} ADD COLUMN IF NOT EXISTS ${column.name} ${column.definition}`);
   }
 }
 
@@ -170,8 +175,8 @@ export class StudioDatabase {
       const createdAt = new Date().toISOString();
       for (const segment of segments) {
         await client.query(
-          'INSERT INTO transcript_segments (id, job_id, segment_index, start_seconds, end_seconds, text, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7)',
-          [randomUUID(), jobId, segment.segmentIndex, segment.startSeconds, segment.endSeconds, segment.text, createdAt]
+          'INSERT INTO transcript_segments (id, job_id, segment_index, start_seconds, end_seconds, text, created_at, words_json) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
+          [randomUUID(), jobId, segment.segmentIndex, segment.startSeconds, segment.endSeconds, segment.text, createdAt, segment.words?.length ? JSON.stringify(segment.words) : null]
         );
       }
     });
@@ -291,6 +296,9 @@ export class StudioDatabase {
 
   private mapJob(row: any): VideoJob | undefined { if (!row) return undefined; return { id: row.id, originalFilename: row.original_filename, storedFilename: row.stored_filename, mimeType: row.mime_type, sizeBytes: Number(row.size_bytes), status: row.status as JobStatus, stage: row.stage, errorMessage: row.error_message, durationSeconds: row.duration_seconds, width: row.width, height: row.height, createdAt: row.created_at, updatedAt: row.updated_at, sourceStorageKey: row.source_storage_key ?? null, attempts: Number(row.attempts ?? 0), options: readStoredOptions(row.options_json), stageTimings: parseTimings(row.stage_timings_json), progress: Number(row.progress ?? 0) }; }
   private mapClip(row: any): GeneratedClip | undefined { if (!row) return undefined; return { id: row.id, jobId: row.job_id, candidateId: row.candidate_id, startSeconds: row.start_seconds, endSeconds: row.end_seconds, durationSeconds: row.duration_seconds, outputPath: row.output_path, outputFilename: row.output_filename, status: row.status, errorMessage: row.error_message, captionPath: row.caption_path, createdAt: row.created_at, updatedAt: row.updated_at }; }
-  private mapTranscript(row: any): TranscriptSegment { return { id: row.id, jobId: row.job_id, segmentIndex: row.segment_index, startSeconds: row.start_seconds, endSeconds: row.end_seconds, text: row.text, createdAt: row.created_at }; }
+  private mapTranscript(row: any): TranscriptSegment {
+    const words = parseStoredWords(row.words_json);
+    return { id: row.id, jobId: row.job_id, segmentIndex: row.segment_index, startSeconds: row.start_seconds, endSeconds: row.end_seconds, text: row.text, createdAt: row.created_at, ...(words ? { words } : {}) };
+  }
   private mapHighlight(row: any): HighlightCandidate { return { id: row.id, jobId: row.job_id, candidateIndex: row.candidate_index, startSeconds: row.start_seconds, endSeconds: row.end_seconds, score: row.score, quality: row.quality, reasons: JSON.parse(row.reasons_json), signals: JSON.parse(row.signals_json), sourceSegmentIndexes: JSON.parse(row.source_segment_indexes_json), createdAt: row.created_at }; }
 }

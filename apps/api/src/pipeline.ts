@@ -8,7 +8,7 @@ import type { TranscriptionEngine } from './transcription.js';
 import type { HighlightDetector, HighlightOptions } from './highlights.js';
 import type { ClipRenderer } from './clips.js';
 import type { GeneratedClip, VideoJob } from './domain.js';
-import { writeSrtCaptions } from './captions.js';
+import { writeAssCaptions, writeSrtCaptions } from './captions.js';
 import { highlightOptionsFor } from './options.js';
 import { StageClock, stageProgress, totalMilliseconds } from './progress.js';
 import { sourceKeyFor, StoredObjectMissingError, type DurableStorage } from './storage.js';
@@ -400,18 +400,26 @@ export class VideoPipeline {
         const outputFilename = `${clipId}.mp4`;
         const outputPath = join(jobOutputDir, outputFilename);
         const captionPath = join(jobOutputDir, `${clipId}.srt`);
+        const styledCaptionPath = join(jobOutputDir, `${clipId}.ass`);
         const now = new Date().toISOString();
         const clip: GeneratedClip = { id: clipId, jobId, candidateId: candidate.id, startSeconds: candidate.startSeconds, endSeconds: candidate.endSeconds, durationSeconds: candidate.endSeconds - candidate.startSeconds, outputPath: join(jobId, outputFilename), outputFilename, status: 'queued', errorMessage: null, captionPath: null, createdAt: now, updatedAt: now };
         await this.db.createClip(clip); await this.db.updateClip(clipId, { status: 'processing' });
         try {
           const transcriptSegments = await this.db.listTranscript(jobId);
-          const captionCount = options.captionStyle === 'none' ? 0 : await writeSrtCaptions(captionPath, transcriptSegments, candidate.startSeconds, candidate.endSeconds);
-          const rendered = await this.clipRenderer.render({ sourcePath, startSeconds: candidate.startSeconds, endSeconds: candidate.endSeconds, outputPath, captionPath: captionCount ? captionPath : null, quality: options.quality });
+          // The .srt (short phrases) is kept with the clip; the .ass is the styled version that is burned into the picture, then thrown away.
+          const captionStyle = options.captionStyle;
+          let captionCount = 0; let styledCount = 0;
+          if (captionStyle !== 'none') {
+            captionCount = await writeSrtCaptions(captionPath, transcriptSegments, candidate.startSeconds, candidate.endSeconds);
+            styledCount = await writeAssCaptions(styledCaptionPath, transcriptSegments, candidate.startSeconds, candidate.endSeconds, captionStyle);
+          }
+          const rendered = await this.clipRenderer.render({ sourcePath, startSeconds: candidate.startSeconds, endSeconds: candidate.endSeconds, outputPath, captionPath: styledCount ? styledCaptionPath : null, quality: options.quality });
+          await rm(styledCaptionPath, { force: true });
           await this.storage.upload(outputPath, clip.outputPath, 'video/mp4');
           if (captionCount) await this.storage.upload(captionPath, `${jobId}/${clipId}.srt`, 'application/x-subrip');
           await this.db.updateClip(clipId, { status: 'completed', durationSeconds: rendered.durationSeconds, errorMessage: null, captionPath }); completedCount += 1;
         } catch (error) {
-          await rm(captionPath, { force: true });
+          await rm(captionPath, { force: true }); await rm(styledCaptionPath, { force: true });
           const message = error instanceof Error ? error.message : 'Unexpected clip extraction failure'; await this.db.updateClip(clipId, { status: 'failed', errorMessage: message }); this.logger.error({ err: error, jobId, clipId, candidateId: candidate.id }, 'Clip extraction failed');
         }
         this.reportProgress(jobId, stageProgress('extracting_clips', (candidateNumber + 1) / candidates.length));

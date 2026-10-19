@@ -410,6 +410,7 @@ test('the options from the upload form are read, kept, and shown as choices on t
   try {
     const page = await (await fetch(`${server.base}/test-upload`)).text();
     for (const name of ['clipCount', 'clipLength', 'quality', 'captionStyle']) assert.ok(page.includes(`name="${name}"`), `the form has no ${name} choice`);
+    for (const style of ['classic', 'highlight', 'pop', 'none']) assert.ok(page.includes(`<option value="${style}">`), `the form does not offer the ${style} captions`);
     assert.match(page, /Automatic \(up to 1\)/, 'the automatic choice says what it means on this server');
     assert.match(page, /Automatic \(2–6 s\)/);
 

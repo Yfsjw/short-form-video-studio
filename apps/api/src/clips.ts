@@ -1,11 +1,19 @@
 import { execFile } from 'node:child_process';
 import { rm, stat } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import type { QualityChoice } from './domain.js';
 import { outputSizeFor } from './options.js';
 
 const execFileAsync = promisify(execFile);
+
+/**
+ * The font the captions are drawn with ships with the program (apps/api/assets/fonts, with its licence) instead of being looked up on the
+ * server: a server without the font would draw captions in whatever it has, or with missing letters. The same relative path works for the
+ * source files (src/) and the compiled ones (dist/).
+ */
+export const BUNDLED_FONTS_DIRECTORY = fileURLToPath(new URL('../assets/fonts', import.meta.url));
 export interface ClipRenderRequest { sourcePath: string; startSeconds: number; endSeconds: number; outputPath: string; captionPath?: string | null; /** `standard` renders at two thirds of the configured size; the default is the configured size. */ quality?: QualityChoice; }
 export interface RenderedClip { durationSeconds: number; sizeBytes: number; }
 export interface ClipRenderer { render(request: ClipRenderRequest): Promise<RenderedClip>; }
@@ -22,6 +30,7 @@ export class FfmpegClipRenderer implements ClipRenderer {
     private readonly verticalWidth: number,
     private readonly verticalHeight: number,
     private readonly runner: FfmpegRunner = async (binary, arguments_, options) => { await execFileAsync(binary, arguments_, options); },
+    private readonly fontsDirectory: string = BUNDLED_FONTS_DIRECTORY,
   ) {}
 
   async render(request: ClipRenderRequest): Promise<RenderedClip> {
@@ -59,6 +68,8 @@ export class FfmpegClipRenderer implements ClipRenderer {
     const crop = `scale=${size.width}:${size.height}:force_original_aspect_ratio=increase,crop=${size.width}:${size.height}`;
     if (!captionPath) return crop;
     const escapedPath = escapeFilterPath(captionPath);
+    // A styled caption file (.ass) brings its own look and is drawn with the bundled font; a plain .srt gets the fixed look below.
+    if (captionPath.toLowerCase().endsWith('.ass')) return `${crop},ass='${escapedPath}':fontsdir='${escapeFilterPath(this.fontsDirectory)}'`;
     return `${crop},subtitles='${escapedPath}':force_style='FontName=Arial,FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=3,Shadow=0,Alignment=2,MarginV=110'`;
   }
 }

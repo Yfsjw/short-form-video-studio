@@ -98,7 +98,12 @@ export function renderUploadPage(info: UploadPageInfo): string {
     <label class="field"><span class="label">Quality</span>
       <select name="quality"><option value="hd">Best (${sizeText(info.clipSize)})</option>${fast.width === info.clipSize.width ? '' : `<option value="standard">Faster (${sizeText(fast)})</option>`}</select></label>
     <label class="field"><span class="label">Captions</span>
-      <select name="captionStyle"><option value="classic">Burned into the video</option><option value="none">No captions</option></select></label>
+      <select name="captionStyle">
+        <option value="classic">Plain phrases</option>
+        <option value="highlight">Phrases, the spoken word lit</option>
+        <option value="pop">Big words that pop in</option>
+        <option value="none">No captions</option>
+      </select></label>
   </details>
   <button type="submit">Upload video</button>
 </form>

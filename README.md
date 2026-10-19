@@ -206,7 +206,7 @@ is resumed after a restart is finished the way it was started.
 | `clipCount` | `1`–`5` | At most this many clips (default: `CLIP_MAX_CANDIDATES`). |
 | `clipLength` | `auto`, `short` (15–30 s), `medium` (30–60 s), `long` (60–90 s) | Length of each clip (`auto` uses `HIGHLIGHT_MIN/MAX_DURATION_SECONDS`). |
 | `quality` | `hd`, `standard` | `hd` is the configured clip size (1080×1920 by default); `standard` is two thirds of it (720×1280), which renders noticeably faster on a small server. |
-| `captionStyle` | `classic`, `none` | Burn the transcript in as captions, or leave the picture clean. |
+| `captionStyle` | `classic`, `highlight`, `pop`, `none` | `classic`: short phrases in white. `highlight`: the same phrases with the word being spoken lit in gold. `pop`: a few big upper-case words at a time, the spoken word lit, popping in. `none`: leave the picture clean. See [Captions](#captions). |
 
 ### Progress and timings
 
@@ -238,9 +238,34 @@ For each highest-ranked candidate (up to `CLIP_MAX_CANDIDATES`) FFmpeg cuts the 
 placed before the input, so the range does not depend on source keyframes, the clip's own timeline starts at zero, which is
 what the captions are counted from, and a clip deep inside a long video does not require decoding everything before it),
 **scales the picture to fill 9:16 and crops the centre**, burns in the
-transcript segments that fall inside the range as captions, and encodes H.264/AAC with `+faststart`. The crop is fixed to the
+captions for the words spoken inside the range (see below), and encodes H.264/AAC with `+faststart`. The crop is fixed to the
 centre of the frame: nothing follows faces or speakers. A candidate that fails keeps a failed clip record with its error and
 processing continues; the job completes only if at least one clip was made.
+
+### Captions
+
+whisper.cpp is started with `-ojf`, which reports the pieces of every segment with their own times; the program joins them into
+words (a piece that starts with a space starts a new word; punctuation stays with its word) and stores the words with the
+transcript (`transcript_segments.words_json`). Times that cannot be trusted (none reported, everything at the same instant, all
+squeezed into a corner of the segment) are discarded, and a segment without word timing, such as a transcript stored by an earlier
+release, has its words spread over the segment by length instead: the captions are then a little off but never missing. These are
+the engine's own estimates (whisper.cpp's token timestamps, not a forced alignment), so on some voices a lit word runs a little
+early or late; this has been checked on synthetic timings and on the format of whisper.cpp's output read from its source, **not
+yet on a real recording** on the server.
+
+What is on screen at once is decided by plain rules, not a model: a group ends at the end of a sentence, after a comma once it is
+long enough, at a pause, or when it would no longer fit (about 30 characters for `classic`, 22 for `highlight`, 16 for `pop`); it
+does not end on a word such as "a" or "the" that belongs with the next one; a sentence does not end on a group of one word when
+the group before it can spare a word; a group stays up a moment after its last word, never into the next group. A word wider than
+the picture is set smaller instead of running off its edge.
+
+Each clip gets two caption files: a plain `.srt` of the same phrases, kept in storage next to the clip, and a styled `.ass` that
+FFmpeg's libass burns into the picture (and that is thrown away afterwards). The letters are drawn with **Inter ExtraBold, which
+ships with the program** (`apps/api/assets/fonts`, with its SIL Open Font License): a server without fonts of its own draws no
+captions at all (reproduced locally with a font configuration that lists no fonts), so the font is not left to whatever the server
+happens to have. A test renders a clip with such an empty font configuration and checks the captions are there. Inter covers Latin,
+Greek and Cyrillic; other scripts (Arabic, CJK, Devanagari, Thai) need their own font files added to the same directory and are not
+supported yet.
 
 ## Not implemented
 

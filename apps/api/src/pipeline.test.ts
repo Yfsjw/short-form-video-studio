@@ -1,12 +1,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { randomUUID } from 'node:crypto';
-import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { Pool } from 'pg';
 import { StudioDatabase } from './database.js';
-import type { JobOptions, NewVideoJob } from './domain.js';
+import { defaultJobOptions, type JobOptions, type NewVideoJob } from './domain.js';
 import { VideoPipeline, type PipelineRuntimeOptions } from './pipeline.js';
 import { NullStorage, type DurableStorage } from './storage.js';
 import { MemoryStorage, eventually, sleep } from './test-support.js';
@@ -675,5 +676,50 @@ test('makes the clips the way the person asked: how many, how long, with or with
     assert.equal(requests[0].quality, 'hd');
     const length = requests[0].endSeconds - requests[0].startSeconds;
     assert.ok(length >= 1 && length <= 10, 'the default clip length comes from the server settings');
+  } finally { await ctx.cleanup(); }
+});
+
+test('burns the styled captions the person chose into each clip (with the spoken words timed), keeps the plain .srt with the clip, and leaves no scratch file behind', async () => {
+  const seen: Array<{ path: string; text: string }> = [];
+  const renderer: ClipRenderer = { render: async (request) => {
+    assert.ok(request.captionPath, 'captions were asked for');
+    seen.push({ path: request.captionPath, text: await readFile(request.captionPath, 'utf8') });
+    await writeFile(request.outputPath, 'rendered clip');
+    return { durationSeconds: request.endSeconds - request.startSeconds, sizeBytes: 13 };
+  } };
+  const word = (text: string, startSeconds: number, endSeconds: number) => ({ text, startSeconds, endSeconds });
+  const transcriber: TranscriptionEngine = { transcribe: async () => [{ segmentIndex: 0, startSeconds: 0, endSeconds: 4, text: 'Nobody tells you this.', words: [word('Nobody', 0.2, 1), word('tells', 1, 1.8), word('you', 1.8, 2.5), word('this.', 2.5, 3.6)] }] };
+  const ctx = await setup({ transcriber, renderer });
+  try {
+    await addJob(ctx, 'j-styled', { options: { ...defaultJobOptions, captionStyle: 'highlight' } });
+    await ctx.pipeline.run('j-styled');
+    assert.equal((await ctx.db.getJob('j-styled'))?.status, 'completed');
+    assert.equal(seen.length, 1);
+    assert.match(seen[0].path, /\.ass$/, 'the styled file is what gets burned in');
+    assert.match(seen[0].text, /Style: Caption,Inter ExtraBold,/);
+    assert.equal([...seen[0].text.matchAll(/\\1c&H0000D7FF&/g)].length, 4, 'one lit word per spoken word: the stored word timing was used');
+    assert.ok(!existsSync(seen[0].path), 'the styled file is scratch and is removed once the clip is made');
+
+    const [clip] = await ctx.db.listClips('j-styled');
+    const stored = (ctx.storage as MemoryStorage).objects;
+    assert.equal(stored.get(`j-styled/${clip.id}.srt`)?.toString('utf8').includes('Nobody tells you this.'), true, 'the plain phrases are kept with the clip');
+    assert.ok(![...stored.keys()].some((key) => key.endsWith('.ass')), 'the styled file is not stored');
+
+    seen.length = 0;
+    await addJob(ctx, 'j-default');
+    await ctx.pipeline.run('j-default');
+    assert.doesNotMatch(seen[0].text, /\\1c&H/, 'the default style does not light words');
+  } finally { await ctx.cleanup(); }
+});
+
+test('a transcript that was stored without word timing (made before words were kept) still gets captions', async () => {
+  const seen: string[] = [];
+  const renderer: ClipRenderer = { render: async (request) => { seen.push(request.captionPath ? await readFile(request.captionPath, 'utf8') : ''); await writeFile(request.outputPath, 'rendered clip'); return { durationSeconds: 2, sizeBytes: 13 }; } };
+  const ctx = await setup({ renderer });
+  try {
+    await addJob(ctx, 'j-old', { options: { ...defaultJobOptions, captionStyle: 'pop' } });
+    await ctx.pipeline.run('j-old');
+    assert.equal((await ctx.db.getJob('j-old'))?.status, 'completed');
+    assert.match(seen[0], /ADAPTER-PROVIDED/, 'the text of a segment with no word timing is spread over its time and shown');
   } finally { await ctx.cleanup(); }
 });

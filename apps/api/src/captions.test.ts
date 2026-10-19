@@ -3,26 +3,180 @@ import test from 'node:test';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { formatSrtTime, writeSrtCaptions } from './captions.js';
+import { buildCaptionChunks, captionLooks, chunkRules, chunkWords, clipWords, formatAssTime, formatSrtTime, renderAss, wordSpans, writeAssCaptions, writeSrtCaptions, type CaptionSegmentInput, type CaptionWord } from './captions.js';
 
-test('formats SRT timestamps', () => {
+/** Words one after the other, each lasting `length` seconds, from `start` (so tests can say what is spoken and not worry about every time). */
+function spoken(text: string, start = 0, length = 0.4): CaptionWord[] {
+  return text.split(' ').map((word, index) => ({ text: word, startSeconds: start + index * length, endSeconds: start + (index + 1) * length }));
+}
+const phrases = (chunks: Array<{ words: CaptionWord[] }>) => chunks.map((chunk) => chunk.words.map((word) => word.text).join(' '));
+
+test('formats SRT and ASS timestamps', () => {
   assert.equal(formatSrtTime(0), '00:00:00,000');
   assert.equal(formatSrtTime(61.234), '00:01:01,234');
   assert.equal(formatSrtTime(3661.999), '01:01:01,999');
+  assert.equal(formatAssTime(0), '0:00:00.00');
+  assert.equal(formatAssTime(61.234), '0:01:01.23');
+  assert.equal(formatAssTime(3661.999), '1:01:02.00');
+  assert.equal(formatAssTime(-1), '0:00:00.00');
 });
 
-test('writes clip-relative captions for segments overlapping the candidate range', async () => {
+test('only the words spoken inside the clip are captioned, with times counted from the start of the clip', () => {
+  const segments: CaptionSegmentInput[] = [
+    { startSeconds: 8, endSeconds: 12, text: 'Before the clip. Then it starts.', words: [
+      { text: 'Before', startSeconds: 8, endSeconds: 8.5 }, { text: 'the', startSeconds: 8.5, endSeconds: 8.8 }, { text: 'clip.', startSeconds: 8.8, endSeconds: 9.4 },
+      { text: 'Then', startSeconds: 10.2, endSeconds: 10.5 }, { text: 'it', startSeconds: 10.5, endSeconds: 10.7 }, { text: 'starts.', startSeconds: 10.7, endSeconds: 11.4 }] },
+    { startSeconds: 19, endSeconds: 22, text: 'And then it ends', words: [
+      { text: 'And', startSeconds: 19, endSeconds: 19.2 }, { text: 'then', startSeconds: 19.2, endSeconds: 19.5 }, { text: 'it', startSeconds: 19.5, endSeconds: 19.8 }, { text: 'ends', startSeconds: 19.8, endSeconds: 20.4 }] },
+  ];
+  const words = clipWords(segments, 10, 20);
+  assert.deepEqual(words.map((word) => word.text), ['Then', 'it', 'starts.', 'And', 'then', 'it'], '"ends" is mostly after the clip, so it is left out');
+  assert.ok(Math.abs(words[0].startSeconds - 0.2) < 1e-9 && Math.abs(words[0].endSeconds - 0.5) < 1e-9, 'counted from the start of the clip');
+  assert.ok(words.every((word) => word.startSeconds >= 0 && word.endSeconds <= 10), 'nothing before the start or after the end of the clip');
+  assert.equal(clipWords(segments, 30, 40).length, 0);
+});
+
+test('a word that is cut by the start of the clip is kept when most of it is inside, and dropped when only a sliver is', () => {
+  const segment = (word: { text: string; startSeconds: number; endSeconds: number }): CaptionSegmentInput[] => [{ startSeconds: 9, endSeconds: 12, text: word.text, words: [word] }];
+  const kept = clipWords(segment({ text: 'mostly', startSeconds: 9.8, endSeconds: 10.6 }), 10, 20);
+  assert.equal(kept.length, 1);
+  assert.ok(kept[0].startSeconds === 0 && Math.abs(kept[0].endSeconds - 0.6) < 1e-9, 'cut at the start of the clip');
+  assert.equal(clipWords(segment({ text: 'sliver', startSeconds: 9.5, endSeconds: 10.1 }), 10, 20).length, 0);
+});
+
+test('a segment without word timing still gets captions: its words are spread over its time', () => {
+  const words = clipWords([{ startSeconds: 0, endSeconds: 4, text: 'no timing at all' }], 0, 10);
+  assert.deepEqual(words.map((word) => word.text), ['no', 'timing', 'at', 'all']);
+  assert.equal(words[0].startSeconds, 0);
+  assert.ok(Math.abs(words[3].endSeconds - 4) < 1e-9);
+});
+
+test('words are grouped at the end of a sentence, after a comma once the group has some length, at a pause, and when they would not fit', () => {
+  const classic = chunkRules.classic;
+  assert.deepEqual(phrases(chunkWords(spoken('I came. I saw. I won.'), classic)), ['I came.', 'I saw.', 'I won.'], 'a sentence end always ends the group');
+  assert.deepEqual(phrases(chunkWords(spoken('When the music stops, everyone must sit down'), classic)), ['When the music stops,', 'everyone must sit down'], 'a comma ends a group that is already long enough');
+  assert.deepEqual(phrases(chunkWords(spoken('So, we go'), classic)), ['So, we go'], 'but not one that is still short');
+  const withPause = [...spoken('hello there', 0), ...spoken('my friend', 3)];
+  assert.deepEqual(phrases(chunkWords(withPause, classic)), ['hello there', 'my friend'], 'a pause of more than the allowed gap ends the group');
+  const long = chunkWords(spoken('one two three four five six seven eight nine ten'), classic);
+  assert.ok(long.every((chunk) => chunk.words.length <= classic.maxWords && chunk.words.map((word) => word.text).join(' ').length <= classic.maxChars), 'no group is longer than the rules allow');
+  assert.deepEqual(long.flatMap((chunk) => chunk.words.map((word) => word.text)), 'one two three four five six seven eight nine ten'.split(' '), 'no word is lost or repeated');
+  assert.deepEqual(phrases(chunkWords(spoken('supercalifragilisticexpialidocious'), classic)), ['supercalifragilisticexpialidocious'], 'a word that is longer than a group still gets a group of its own');
+});
+
+test('a group does not end on a word that belongs with the next one, and a sentence does not end with a group of one word when it can be avoided', () => {
+  assert.deepEqual(phrases(chunkWords(spoken('tell them about the big plan'), chunkRules.highlight)), ['tell them about', 'the big plan'], '"the" starts the next group instead of ending a full one');
+  assert.deepEqual(phrases(chunkWords(spoken('I told them everything honestly.'), chunkRules.classic)), ['I told them', 'everything honestly.'], 'a lone last word takes the word before it along');
+  assert.deepEqual(phrases(chunkWords(spoken('I came. Yes.'), chunkRules.classic)), ['I came.', 'Yes.'], 'but a short sentence of its own stays alone');
+});
+
+test('what is on screen stays up a moment after its last word, never into the next group, and never past the end of the clip', () => {
+  const segment: CaptionSegmentInput = { startSeconds: 0, endSeconds: 9, text: 'x', words: [...spoken('first part.', 1, 0.5), ...spoken('second part.', 3.2, 0.5), ...spoken('last words.', 8.6, 0.3)] };
+  const chunks = buildCaptionChunks([segment], 0, 9.2, 'classic');
+  assert.equal(chunks.length, 3);
+  assert.equal(chunks[0].endSeconds, 2 + chunkRules.classic.holdSeconds, 'a short moment after the last word (which ends at 2 s)');
+  assert.equal(chunks[1].startSeconds, 3.2);
+  assert.equal(chunks[1].endSeconds, 4.2 + chunkRules.classic.holdSeconds);
+  const crowded = buildCaptionChunks([{ ...segment, words: [...spoken('first part.', 1, 0.5), ...spoken('second part.', 2.2, 0.5)] }], 0, 9.2, 'classic');
+  assert.equal(crowded[0].endSeconds, 2.2, 'it goes when the next group comes, not later');
+  assert.ok(chunks[1].endSeconds <= chunks[2].startSeconds, 'groups do not overlap');
+  assert.equal(chunks[2].endSeconds, 9.2, 'the last group stops when the clip does');
+  const quick = buildCaptionChunks([{ startSeconds: 0, endSeconds: 5, text: 'x', words: [{ text: 'Hi.', startSeconds: 1, endSeconds: 1.05 }] }], 0, 5, 'classic');
+  assert.ok(quick[0].endSeconds - quick[0].startSeconds >= 0.3, 'even a very short word is on screen long enough to read');
+});
+
+test('writes an SRT of short phrases with clip-relative times', async () => {
   const root = await mkdtemp(join(tmpdir(), 'studio-captions-')); const path = join(root, 'clip.srt');
   try {
     const count = await writeSrtCaptions(path, [
-      { startSeconds: 8, endSeconds: 12, text: 'Before the clip' },
-      { startSeconds: 10, endSeconds: 15, text: 'First caption' },
-      { startSeconds: 15, endSeconds: 22, text: 'Second caption' },
+      { startSeconds: 12, endSeconds: 14, text: 'Second part here.', words: [{ text: 'Second', startSeconds: 12, endSeconds: 12.6 }, { text: 'part', startSeconds: 12.6, endSeconds: 13 }, { text: 'here.', startSeconds: 13, endSeconds: 13.6 }] },
+      { startSeconds: 8, endSeconds: 12, text: 'Before the clip. Then it starts.', words: [{ text: 'Before', startSeconds: 8, endSeconds: 8.5 }, { text: 'the', startSeconds: 8.5, endSeconds: 8.8 }, { text: 'clip.', startSeconds: 8.8, endSeconds: 9.4 }, { text: 'Then', startSeconds: 10.2, endSeconds: 10.5 }, { text: 'it', startSeconds: 10.5, endSeconds: 10.7 }, { text: 'starts.', startSeconds: 10.7, endSeconds: 11.4 }] },
     ], 10, 20);
-    const srt = await readFile(path, 'utf8');
-    assert.equal(count, 3);
-    assert.match(srt, /00:00:00,000 --> 00:00:02,000\nBefore the clip/);
-    assert.match(srt, /00:00:00,000 --> 00:00:05,000\nFirst caption/);
-    assert.match(srt, /00:00:05,000 --> 00:00:10,000\nSecond caption/);
+    assert.equal(count, 2);
+    assert.equal(await readFile(path, 'utf8'), '1\n00:00:00,200 --> 00:00:01,650\nThen it starts.\n\n2\n00:00:02,000 --> 00:00:03,850\nSecond part here.\n');
+    assert.equal(await writeSrtCaptions(path, [], 0, 10), 0, 'nothing was said: no captions');
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+const SAMPLE: CaptionSegmentInput[] = [{ startSeconds: 0, endSeconds: 6, text: 'x', words: [...spoken('Nobody tells you this', 0.5, 0.5)] }];
+const dialogues = (ass: string) => ass.split('\n').filter((line) => line.startsWith('Dialogue:'));
+/** The text of a caption line without our own formatting tags. */
+const plain = (line: string) => line.split(',').slice(9).join(',').replace(/\{[^}]*\}/g, '');
+
+test('the caption file is written for a 9:16 picture and names the font that ships with the program', () => {
+  const ass = renderAss(buildCaptionChunks(SAMPLE, 0, 6, 'classic'), 'classic');
+  assert.match(ass, /PlayResX: 1080\nPlayResY: 1920/);
+  assert.match(ass, /ScaledBorderAndShadow: yes/);
+  assert.match(ass, /\nStyle: Caption,Inter ExtraBold,/);
+});
+
+test('classic captions: one line per group, white, no formatting inside', () => {
+  const lines = dialogues(renderAss(buildCaptionChunks(SAMPLE, 0, 6, 'classic'), 'classic'));
+  assert.equal(lines.length, 1);
+  assert.equal(plain(lines[0]), 'Nobody tells you this');
+  assert.ok(!lines[0].includes('{'), 'no formatting tags at all');
+  assert.match(lines[0], /^Dialogue: 0,0:00:00\.50,0:00:02\.75,Caption,/);
+});
+
+test('highlighted captions: the word being spoken is lit, one at a time, and the lines follow each other without gaps or overlaps', () => {
+  const chunks = buildCaptionChunks(SAMPLE, 0, 6, 'highlight');
+  const lines = dialogues(renderAss(chunks, 'highlight'));
+  assert.equal(lines.length, 4, 'one line per word');
+  lines.forEach((line, index) => {
+    assert.equal(plain(line), 'Nobody tells you this', 'the whole group stays on screen');
+    const lit = [...line.matchAll(/\{\\1c&H0000D7FF&\}([^{]+)\{\\1c&H00FFFFFF&\}/g)].map((match) => match[1]);
+    assert.deepEqual(lit, [['Nobody', 'tells', 'you', 'this'][index]], 'exactly the word being spoken is lit');
+  });
+  const times = lines.map((line) => /^Dialogue: 0,([^,]+),([^,]+),/.exec(line)!.slice(1, 3));
+  for (let index = 1; index < times.length; index += 1) assert.equal(times[index][0], times[index - 1][1], 'each line starts when the one before it ends');
+  assert.equal(times[0][0], '0:00:00.50');
+});
+
+test('during a pause nobody is lit: the group stays up with no word highlighted', () => {
+  const chunk = { startSeconds: 0, endSeconds: 3, words: [{ text: 'well', startSeconds: 0, endSeconds: 0.5 }, { text: 'okay', startSeconds: 2, endSeconds: 2.5 }] };
+  const spans = wordSpans(chunk);
+  assert.deepEqual(spans.map((span) => span.index), [0, null, 1]);
+  assert.deepEqual(spans.map((span) => [span.startSeconds, span.endSeconds]), [[0, 0.5], [0.5, 2], [2, 3]]);
+});
+
+test('pop captions: upper case, centred, and the group pops in once when it appears (not again for each word)', () => {
+  const lines = dialogues(renderAss(buildCaptionChunks(SAMPLE, 0, 6, 'pop'), 'pop'));
+  assert.ok(lines.length >= 2);
+  assert.ok(lines.every((line) => /\{\\an5\\pos\(540,1180\)/.test(line)), 'every line is centred on the same spot');
+  assert.match(lines[0], /\\t\(0,110,\\fscx100\\fscy100\)/);
+  assert.ok(lines.slice(1).every((line, index) => !/\\t\(/.test(line) || plain(line) !== plain(lines[index])), 'later lines of the same group do not animate again');
+  assert.equal(plain(lines[0]), plain(lines[0]).toUpperCase());
+  assert.equal(captionLooks.pop.uppercase, true);
+});
+
+test('what a person says cannot turn into formatting', () => {
+  const nasty: CaptionSegmentInput[] = [{ startSeconds: 0, endSeconds: 3, text: 'x', words: [{ text: '{\\an9\\pos(0,0)}', startSeconds: 0, endSeconds: 1 }, { text: 'back\\Nslash', startSeconds: 1, endSeconds: 2 }, { text: '}{', startSeconds: 2, endSeconds: 3 }] }];
+  for (const style of ['classic', 'highlight', 'pop'] as const) {
+    for (const line of dialogues(renderAss(buildCaptionChunks(nasty, 0, 3, style), style))) {
+      const text = plain(line);
+      assert.ok(!/[{}\\]/.test(text), `${style}: formatting characters survived in "${text}"`);
+    }
+  }
+});
+
+test('a word wider than the picture is set smaller instead of running off its edge', () => {
+  const long: CaptionSegmentInput[] = [{ startSeconds: 0, endSeconds: 3, text: 'x', words: [{ text: 'Telecommunications', startSeconds: 0, endSeconds: 1 }] }];
+  for (const style of ['classic', 'highlight', 'pop'] as const) {
+    const line = dialogues(renderAss(buildCaptionChunks(long, 0, 3, style), style))[0];
+    const size = Number(/\\fs(\d+)/.exec(line)?.[1]);
+    assert.ok(size > 0 && size < captionLooks[style].fontSize, `${style}: expected a smaller size, got ${size}`);
+    assert.ok(size >= 36, 'but never unreadably small');
+  }
+  const short = dialogues(renderAss(buildCaptionChunks(SAMPLE, 0, 6, 'highlight'), 'highlight'))[0];
+  assert.ok(!/\\fs\d/.test(short), 'ordinary words keep the normal size');
+});
+
+test('a caption file is written only when something was said inside the clip', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'studio-captions-')); const path = join(root, 'clip.ass');
+  try {
+    assert.equal(await writeAssCaptions(path, SAMPLE, 20, 30, 'highlight'), 0);
+    await assert.rejects(readFile(path), /ENOENT/);
+    assert.equal(await writeAssCaptions(path, SAMPLE, 0, 6, 'highlight'), 1);
+    assert.match(await readFile(path, 'utf8'), /\[Events\]\nFormat: Layer/);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
