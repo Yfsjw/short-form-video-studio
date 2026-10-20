@@ -35,7 +35,7 @@ function unreachableWhile(isDown: () => boolean, db: StudioDatabase): StudioData
   } });
 }
 
-async function setup(options: { storage?: DurableStorage; transcriber?: TranscriptionEngine; renderer?: ClipRenderer; runtime?: Partial<PipelineRuntimeOptions>; database?: (db: StudioDatabase) => StudioDatabase; media?: typeof fakeMedia } = {}) {
+async function setup(options: { highlights?: Partial<typeof highlightOptions>; storage?: DurableStorage; transcriber?: TranscriptionEngine; renderer?: ClipRenderer; runtime?: Partial<PipelineRuntimeOptions>; database?: (db: StudioDatabase) => StudioDatabase; media?: typeof fakeMedia } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'studio-pipeline-'));
   const uploadDir = join(root, 'uploads'); const tempDir = join(root, 'tmp'); const outputDir = join(root, 'outputs');
   await Promise.all([mkdir(uploadDir), mkdir(tempDir), mkdir(outputDir)]);
@@ -47,7 +47,7 @@ async function setup(options: { storage?: DurableStorage; transcriber?: Transcri
   const logger = { info: () => undefined, error: (_fields: unknown, message?: string) => { errors.push(String(message)); } };
   const pipelines: VideoPipeline[] = [];
   const makePipeline = () => {
-    const pipeline = new VideoPipeline(options.database ? options.database(db) : db, options.media ?? fakeMedia, options.transcriber ?? speech, new DeterministicHighlightDetector(), highlightOptions, options.renderer ?? writingRenderer, 1, uploadDir, tempDir, outputDir, logger, storage, { ...fastRuntime, ...options.runtime });
+    const pipeline = new VideoPipeline(options.database ? options.database(db) : db, options.media ?? fakeMedia, options.transcriber ?? speech, new DeterministicHighlightDetector(), { ...highlightOptions, ...options.highlights }, options.renderer ?? writingRenderer, 1, uploadDir, tempDir, outputDir, logger, storage, { ...fastRuntime, ...options.runtime });
     pipelines.push(pipeline);
     return pipeline;
   };
@@ -154,7 +154,7 @@ test('after a restart the job resumes from the durable copy even though the disk
   try {
     await addJob(ctx, 'j2', { status: 'processing', local: false, durable: true, attempts: 1 });
     const now = new Date().toISOString();
-    await ctx.db.createClip({ id: 'old-clip', jobId: 'j2', candidateId: 'c', startSeconds: 0, endSeconds: 2, durationSeconds: 2, outputPath: 'j2/old-clip.mp4', outputFilename: 'old-clip.mp4', status: 'processing', errorMessage: null, captionPath: null, createdAt: now, updatedAt: now });
+    await ctx.db.createClip({ id: 'old-clip', jobId: 'j2', candidateId: 'c', startSeconds: 0, endSeconds: 2, durationSeconds: 2, outputPath: 'j2/old-clip.mp4', outputFilename: 'old-clip.mp4', status: 'processing', errorMessage: null, captionPath: null, createdAt: now, updatedAt: now, title: null, score: null, reasons: [] });
     const storage = ctx.storage as MemoryStorage;
     storage.objects.set('j2/old-clip.mp4', Buffer.from('half-made'));
     storage.objects.set('j2/old-clip.srt', Buffer.from('half-made captions'));
@@ -721,5 +721,69 @@ test('a transcript that was stored without word timing (made before words were k
     await ctx.pipeline.run('j-old');
     assert.equal((await ctx.db.getJob('j-old'))?.status, 'completed');
     assert.match(seen[0], /ADAPTER-PROVIDED/, 'the text of a segment with no word timing is spread over its time and shown');
+  } finally { await ctx.cleanup(); }
+});
+
+test('a clip is cut with a little room around its speech but never into the words next to it, and keeps the title, score and reasons of its passage', async () => {
+  const requests: ClipRenderRequest[] = [];
+  const renderer: ClipRenderer = { render: async (request) => { requests.push(request); await writeFile(request.outputPath, 'rendered clip'); return { durationSeconds: request.endSeconds - request.startSeconds, sizeBytes: 13 }; } };
+  const word = (text: string, startSeconds: number, endSeconds: number) => ({ text, startSeconds, endSeconds });
+  const transcriber: TranscriptionEngine = { transcribe: async () => [
+    { segmentIndex: 0, startSeconds: 1, endSeconds: 2, text: 'First thought here.', words: [word('First', 1, 1.3), word('thought', 1.3, 1.7), word('here.', 1.7, 2)] },
+    { segmentIndex: 1, startSeconds: 2.1, endSeconds: 4.5, text: 'Then a slower sentence.', words: [word('Then', 2.1, 2.5), word('a', 2.5, 2.7), word('slower', 2.7, 3.5), word('sentence.', 3.5, 4.5)] },
+  ] };
+  const ctx = await setup({ transcriber, renderer });
+  try {
+    await addJob(ctx, 'j-padded');
+    await ctx.pipeline.run('j-padded');
+    assert.equal((await ctx.db.getJob('j-padded'))?.status, 'completed');
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].startSeconds, 0.75, 'a quarter of a second before the first word');
+    assert.equal(requests[0].endSeconds, 2.08, 'the next word starts at 2.1 s, so the clip stops just before it rather than 0.4 s after the last word');
+
+    const [clip] = await ctx.db.listClips('j-padded');
+    assert.deepEqual([clip.startSeconds, clip.endSeconds], [0.75, 2.08], 'the clip record is the range that was really cut');
+    assert.ok(Math.abs(clip.durationSeconds - 1.33) < 1e-9);
+    assert.equal(clip.title, 'First thought here');
+    assert.equal(clip.score, 100);
+    assert.deepEqual(clip.reasons, ['high transcript density']);
+  } finally { await ctx.cleanup(); }
+});
+
+test('a video with no speech fails with a message that says so, and one with only a blink of speech says that instead', async () => {
+  const ctx = await setup({ transcriber: { transcribe: async () => [] } });
+  try {
+    await addJob(ctx, 'j-silent');
+    await ctx.pipeline.run('j-silent');
+    const job = await ctx.db.getJob('j-silent');
+    assert.equal(job?.status, 'failed');
+    assert.match(job?.errorMessage ?? '', /No speech was recognised/);
+    assert.equal((await ctx.db.listClips('j-silent')).length, 0);
+  } finally { await ctx.cleanup(); }
+
+  const blink = await setup({ transcriber: { transcribe: async () => [{ segmentIndex: 0, startSeconds: 0, endSeconds: 0.5, text: 'Hi.' }] } });
+  try {
+    await addJob(blink, 'j-blink');
+    await blink.pipeline.run('j-blink');
+    const job = await blink.db.getJob('j-blink');
+    assert.equal(job?.status, 'failed');
+    assert.match(job?.errorMessage ?? '', /No stretch of the speech was long enough/);
+  } finally { await blink.cleanup(); }
+});
+
+test('a video shorter than the shortest clip still completes, with all of its speech as one clip', async () => {
+  const requests: ClipRenderRequest[] = [];
+  const renderer: ClipRenderer = { render: async (request) => { requests.push(request); await writeFile(request.outputPath, 'rendered clip'); return { durationSeconds: request.endSeconds - request.startSeconds, sizeBytes: 13 }; } };
+  const transcriber: TranscriptionEngine = { transcribe: async () => [{ segmentIndex: 0, startSeconds: 0.5, endSeconds: 3.5, text: 'A short video with a few words.' }] };
+  const ctx = await setup({ transcriber, renderer, highlights: { minDurationSeconds: 20, maxDurationSeconds: 60 } });
+  try {
+    await addJob(ctx, 'j-short');
+    await ctx.pipeline.run('j-short');
+    assert.equal((await ctx.db.getJob('j-short'))?.status, 'completed');
+    const clips = await ctx.db.listClips('j-short');
+    assert.equal(clips.length, 1);
+    assert.equal(clips[0].status, 'completed');
+    assert.deepEqual([requests[0].startSeconds, requests[0].endSeconds], [0.25, 3.9], 'all of the speech, with the usual room around it');
+    assert.ok(clips[0].reasons.some((reason) => /shorter than the shortest clip length/.test(reason)), 'the clip says why it is shorter than asked for');
   } finally { await ctx.cleanup(); }
 });

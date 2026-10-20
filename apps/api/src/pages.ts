@@ -38,7 +38,10 @@ const STYLE = `
   .stage{font-weight:700;margin:0 0 10px}
   .row{display:flex;justify-content:space-between;gap:12px;align-items:baseline;margin:8px 0 0}
   video{display:block;width:100%;max-height:70vh;border-radius:10px;background:#000;margin:0 0 10px}
-  .clip h2{font-size:1.05rem;margin:0 0 10px}
+  .clip h2{font-size:1.05rem;margin:0 0 4px;word-break:break-word}
+  .clip .meta{color:var(--muted);font-size:.9rem;margin:0 0 10px}
+  .clip details{margin:12px 0 0}
+  .clip ul{margin:6px 0 0;padding-left:20px;color:var(--muted);font-size:.9rem}
   .clip .btn{margin-top:10px}
   table{width:100%;border-collapse:collapse;font-size:.9rem}
   td{padding:4px 0;border-top:1px solid var(--line)} td:last-child{text-align:right;color:var(--muted)}
@@ -114,6 +117,14 @@ export function renderMessagePage(title: string, message: string, link: { href: 
   return shell(title, `<h1>${escapeHtml(title)}</h1><div class="card error">${escapeHtml(message)}</div><p><a href="${escapeHtml(link.href)}">${escapeHtml(link.text)}</a></p>`);
 }
 
+/** Why a moment was picked, in the words of the rules that picked it. Nothing for a clip made before the reasons were stored. */
+function whyThisMoment(clip: GeneratedClip): string {
+  if (clip.score === null && !clip.reasons.length) return '';
+  const reasons = clip.reasons.map((reason) => `<li>${escapeHtml(reason)}</li>`).join('');
+  return `<details><summary>Why this moment${clip.score === null ? '' : ` · score ${Math.round(clip.score)} / 100`}</summary>
+    <div class="hint">Chosen by plain rules over the transcript (words, pauses, length), not by an AI model.</div>${reasons ? `<ul>${reasons}</ul>` : ''}</details>`;
+}
+
 const STAGE_ORDER = ['preparing_source', 'saving_source', 'restoring_source', 'probing_video', 'extracting_audio', 'transcribing', 'detecting_highlights', 'extracting_clips'];
 
 export function renderJobPage(job: VideoJob, clips: GeneratedClip[], now: number = Date.now()): string {
@@ -141,9 +152,11 @@ export function renderJobPage(job: VideoJob, clips: GeneratedClip[], now: number
   const clipSection = finished
     ? readyClips.map((clip, index) => `
 <section class="card clip">
-  <h2>Clip ${index + 1}${length(clip) ? ` · ${length(clip)}` : ''}</h2>
+  <h2>${clip.title ? escapeHtml(clip.title) : `Clip ${index + 1}`}</h2>
+  <div class="meta">Clip ${index + 1}${length(clip) ? ` · ${length(clip)}` : ''}</div>
   <video controls playsinline preload="metadata" src="${clipUrl(clip)}#t=0.1"></video>
   <a class="btn" href="${clipUrl(clip)}?download=1">Download clip (${length(clip)})</a>
+  ${whyThisMoment(clip)}
 </section>`).join('')
     : readyClips.map((clip) => `<a class="btn" style="margin:0 0 12px" href="${clipUrl(clip)}?download=1">Download clip (${length(clip)})</a>`).join('');
 

@@ -43,7 +43,14 @@ export type NewVideoJob = Omit<VideoJob, 'sourceStorageKey' | 'attempts' | 'opti
 
 export const clipStatuses = ['queued', 'processing', 'completed', 'failed'] as const;
 export type ClipStatus = (typeof clipStatuses)[number];
-export interface GeneratedClip { id: string; jobId: string; candidateId: string; startSeconds: number; endSeconds: number; durationSeconds: number; outputPath: string; outputFilename: string; status: ClipStatus; errorMessage: string | null; captionPath: string | null; createdAt: string; updatedAt: string; }
+export interface GeneratedClip {
+  id: string; jobId: string; candidateId: string; startSeconds: number; endSeconds: number; durationSeconds: number; outputPath: string; outputFilename: string; status: ClipStatus; errorMessage: string | null; captionPath: string | null; createdAt: string; updatedAt: string;
+  /** A suggested title taken from the words of the clip (a rule, not a model); null for a clip made before titles existed. */
+  title: string | null;
+  /** The rule-based score (0-100) of the passage the clip was cut from, and the rules it satisfied; null / empty for older clips. */
+  score: number | null;
+  reasons: string[];
+}
 /** One spoken word with the moment it starts and ends, in seconds from the start of the video. */
 export interface TranscriptWord { text: string; startSeconds: number; endSeconds: number; }
 export interface TranscriptSegment {
@@ -52,4 +59,4 @@ export interface TranscriptSegment {
   words?: TranscriptWord[];
 }
 export type HighlightSignals = Record<string, { value: number; weight: number; contribution: number }>;
-export interface HighlightCandidate { id: string; jobId: string; candidateIndex: number; startSeconds: number; endSeconds: number; score: number; quality: 'low' | 'medium' | 'high'; reasons: string[]; signals: HighlightSignals; sourceSegmentIndexes: number[]; createdAt: string; }
+export interface HighlightCandidate { id: string; jobId: string; candidateIndex: number; startSeconds: number; endSeconds: number; score: number; quality: 'low' | 'medium' | 'high'; reasons: string[]; signals: HighlightSignals; sourceSegmentIndexes: number[]; createdAt: string; /** A suggested title taken from the words of the passage; null when there is nothing to base one on. */ title: string | null; }

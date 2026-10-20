@@ -9,6 +9,7 @@ import type { HighlightDetector, HighlightOptions } from './highlights.js';
 import type { ClipRenderer } from './clips.js';
 import type { GeneratedClip, VideoJob } from './domain.js';
 import { writeAssCaptions, writeSrtCaptions } from './captions.js';
+import { paddedRange } from './ranges.js';
 import { highlightOptionsFor } from './options.js';
 import { StageClock, stageProgress, totalMilliseconds } from './progress.js';
 import { sourceKeyFor, StoredObjectMissingError, type DurableStorage } from './storage.js';
@@ -388,10 +389,11 @@ export class VideoPipeline {
       await this.db.replaceTranscript(jobId, segments);
       await this.enterStage(jobId, 'detecting_highlights');
       const options = job.options;
-      const highlights = this.highlightDetector.detect({ segments: await this.db.listTranscript(jobId), durationSeconds: metadata.durationSeconds, metadata: { width: metadata.width, height: metadata.height }, options: highlightOptionsFor(this.highlightOptions, options) });
+      const transcript = await this.db.listTranscript(jobId);
+      const highlights = this.highlightDetector.detect({ segments: transcript, durationSeconds: metadata.durationSeconds, metadata: { width: metadata.width, height: metadata.height }, options: highlightOptionsFor(this.highlightOptions, options) });
       await this.db.replaceHighlights(jobId, highlights);
       const candidates = (await this.db.listHighlights(jobId)).slice(0, options.clipCount ?? this.maxClipCandidates);
-      if (!candidates.length) throw new Error('Highlight detection produced no valid candidate ranges for clip extraction.');
+      if (!candidates.length) throw new Error(transcript.length ? 'No stretch of the speech was long enough to make a clip from.' : 'No speech was recognised in this video, so there is nothing to base clips on. Try a video in which someone is talking.');
       await this.enterStage(jobId, 'extracting_clips');
       await mkdir(jobOutputDir, { recursive: true });
       let completedCount = 0;
@@ -402,18 +404,19 @@ export class VideoPipeline {
         const captionPath = join(jobOutputDir, `${clipId}.srt`);
         const styledCaptionPath = join(jobOutputDir, `${clipId}.ass`);
         const now = new Date().toISOString();
-        const clip: GeneratedClip = { id: clipId, jobId, candidateId: candidate.id, startSeconds: candidate.startSeconds, endSeconds: candidate.endSeconds, durationSeconds: candidate.endSeconds - candidate.startSeconds, outputPath: join(jobId, outputFilename), outputFilename, status: 'queued', errorMessage: null, captionPath: null, createdAt: now, updatedAt: now };
+        // The passage is cut with a little room before its first word and after its last, never into the words next to it.
+        const range = paddedRange(candidate.startSeconds, candidate.endSeconds, transcript, metadata.durationSeconds);
+        const clip: GeneratedClip = { id: clipId, jobId, candidateId: candidate.id, startSeconds: range.startSeconds, endSeconds: range.endSeconds, durationSeconds: range.endSeconds - range.startSeconds, outputPath: join(jobId, outputFilename), outputFilename, status: 'queued', errorMessage: null, captionPath: null, createdAt: now, updatedAt: now, title: candidate.title, score: candidate.score, reasons: candidate.reasons };
         await this.db.createClip(clip); await this.db.updateClip(clipId, { status: 'processing' });
         try {
-          const transcriptSegments = await this.db.listTranscript(jobId);
           // The .srt (short phrases) is kept with the clip; the .ass is the styled version that is burned into the picture, then thrown away.
           const captionStyle = options.captionStyle;
           let captionCount = 0; let styledCount = 0;
           if (captionStyle !== 'none') {
-            captionCount = await writeSrtCaptions(captionPath, transcriptSegments, candidate.startSeconds, candidate.endSeconds);
-            styledCount = await writeAssCaptions(styledCaptionPath, transcriptSegments, candidate.startSeconds, candidate.endSeconds, captionStyle);
+            captionCount = await writeSrtCaptions(captionPath, transcript, range.startSeconds, range.endSeconds);
+            styledCount = await writeAssCaptions(styledCaptionPath, transcript, range.startSeconds, range.endSeconds, captionStyle);
           }
-          const rendered = await this.clipRenderer.render({ sourcePath, startSeconds: candidate.startSeconds, endSeconds: candidate.endSeconds, outputPath, captionPath: styledCount ? styledCaptionPath : null, quality: options.quality });
+          const rendered = await this.clipRenderer.render({ sourcePath, startSeconds: range.startSeconds, endSeconds: range.endSeconds, outputPath, captionPath: styledCount ? styledCaptionPath : null, quality: options.quality });
           await rm(styledCaptionPath, { force: true });
           await this.storage.upload(outputPath, clip.outputPath, 'video/mp4');
           if (captionCount) await this.storage.upload(captionPath, `${jobId}/${clipId}.srt`, 'application/x-subrip');

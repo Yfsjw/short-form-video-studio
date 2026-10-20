@@ -451,7 +451,7 @@ test('the job page shows a progress bar while a job runs and the clips as player
     await server.studio.db.updateJob(working, { progress: 40 });
     await server.studio.db.createJob({ ...base, id: done, status: 'completed', stage: 'clip_extraction_complete' });
     await server.studio.db.updateJob(done, { progress: 100, stageTimings: { transcribing: 61_000, extracting_clips: 125_000 } });
-    await server.studio.db.createClip({ id: clipId, jobId: done, candidateId: 'c', startSeconds: 0, endSeconds: 12, durationSeconds: 12, outputPath: `${done}/${clipId}.mp4`, outputFilename: `${clipId}.mp4`, status: 'completed', errorMessage: null, captionPath: null, createdAt: now, updatedAt: now });
+    await server.studio.db.createClip({ id: clipId, jobId: done, candidateId: 'c', startSeconds: 0, endSeconds: 12, durationSeconds: 12, outputPath: `${done}/${clipId}.mp4`, outputFilename: `${clipId}.mp4`, status: 'completed', errorMessage: null, captionPath: null, createdAt: now, updatedAt: now, title: null, score: null, reasons: [] });
 
     const workingPage = await (await fetch(`${server.base}/jobs/${working}`)).text();
     assert.match(workingPage, /<progress value="40" max="100">/);

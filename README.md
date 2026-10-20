@@ -180,8 +180,8 @@ All configuration comes from environment variables; see [`.env.example`](.env.ex
 | `CLIP_VERTICAL_WIDTH`, `CLIP_VERTICAL_HEIGHT` | Output size; must be 9:16 (default 1080×1920). |
 | `CLIP_VIDEO_CODEC`, `CLIP_AUDIO_CODEC`, `CLIP_CRF`, `CLIP_PRESET` | FFmpeg encoding (defaults `libx264`, `aac`, 23, `veryfast`). |
 | `HIGHLIGHT_MIN_DURATION_SECONDS`, `HIGHLIGHT_MAX_DURATION_SECONDS` | Candidate window bounds (20 and 60 s). |
-| `HIGHLIGHT_MAX_CANDIDATES`, `HIGHLIGHT_OVERLAP_THRESHOLD` | Ranked candidates kept and overlap suppression threshold. |
-| `HIGHLIGHT_WEIGHT_*` | Non-negative scoring weights (density, emphasis, question, number, contrast, hook, completeness). |
+| `HIGHLIGHT_MAX_CANDIDATES`, `HIGHLIGHT_OVERLAP_THRESHOLD` | Ranked candidates kept and overlap suppression threshold (default 0.3: two clips may share at most 30 % of the shorter one, so the clips are different moments). |
+| `HIGHLIGHT_WEIGHT_*` | Non-negative scoring weights (density, emphasis, question, number, contrast, hook, completeness, standalone, continuity, length). |
 | `COBALT_API_URL`, `COBALT_API_KEY`, `YOUTUBE_DOWNLOAD_TIMEOUT_MS` | Optional YouTube ingestion through a separately hosted [Cobalt](https://github.com/imputnet/cobalt) instance. |
 | `CORS_ORIGIN` | Allowed web-client origin. |
 
@@ -221,22 +221,33 @@ cannot be created, leaves nothing behind on the disk.
 
 ### Deterministic highlight ranking
 
-The detector makes no semantic, LLM or "AI understanding" claim. It enumerates contiguous timestamped transcript windows within
-the configured duration bounds, preferring windows that end at sentence punctuation. It clamps each window to the probed video
-duration, rejects invalid ranges, scores every window, then suppresses a lower-ranked candidate if it overlaps an accepted one
-by at least the configured fraction of the shorter candidate.
+The detector makes no semantic, LLM or "AI understanding" claim: every signal is a plain rule over the words and their timing. It
+enumerates contiguous timestamped transcript windows within the configured duration bounds and clamps each to the probed video
+duration. Windows that end at sentence punctuation (or at the end of the recording) come first. When there are fewer of those than
+clips asked for (speech with little punctuation, or a short video) the missing ones are filled in with windows that may start or
+end in the middle of a sentence, and each of those says so in its reasons. A video shorter than the shortest clip allowed gets one
+clip made of all its speech, and speech with no usable length at all gives a clear error instead of an empty result. A lower-ranked
+candidate is dropped if it overlaps an accepted one by at least `HIGHLIGHT_OVERLAP_THRESHOLD` of the shorter of the two, so the
+clips are different moments.
 
-The score is a 0–100 weighted average of inspectable signals: transcript word density (normalised at 3 words/second),
-emphatic-word count, question punctuation, numeric detail, contrast/turning-point terms, opening-hook phrases, and
-start/end sentence-boundary completeness. Every candidate stores its signal values, weights, contributions, human-readable
-reasons and source transcript indexes. A later ML/LLM ranker can implement the same `HighlightDetector` interface without
-changing the API or the rendering stage.
+The score is a 0–100 weighted average of inspectable signals: transcript word density (normalised at 3 words/second), emphatic
+words, question marks, numeric detail, contrast/turning-point words, an opening hook ("Here's why…", "What if…", "3 ways…") in the
+first words, sentence-boundary completeness, whether the passage starts cleanly (not with "and so…" or "um"), continuity (pauses
+longer than 0.6 s count against it) and a length that suits short video (a little past the middle of the allowed range). Every
+candidate stores its signal values, weights, contributions, human-readable reasons and source transcript indexes, and a suggested
+**title** that is one of the clip's own sentences (the one that reads most like a headline: a question, a hook, a number, strong
+wording), cleaned of spoken filler and shortened; it never invents words. The job page shows each clip's title, score and reasons,
+labelled as rule-based. A later ML/LLM ranker can implement the same `HighlightDetector` interface without changing the API or the
+rendering stage.
 
 ### Clip rendering
 
-For each highest-ranked candidate (up to `CLIP_MAX_CANDIDATES`) FFmpeg cuts the exact requested range (a frame-accurate seek
-placed before the input, so the range does not depend on source keyframes, the clip's own timeline starts at zero, which is
-what the captions are counted from, and a clip deep inside a long video does not require decoding everything before it),
+For each highest-ranked candidate (up to `CLIP_MAX_CANDIDATES`) FFmpeg cuts the passage with a little room around its speech: 0.25 s
+before the first word and 0.4 s after the last, never into the neighbouring words, so neither end is clipped and no sliver of the
+word before or after is heard (it uses the timing of every word when the transcript has it, and of the segments when not). The seek
+is frame-accurate and placed before the input, so the range does not depend on source keyframes, the clip's own timeline starts at
+zero (which is what the captions are counted from), and a clip deep inside a long video does not require decoding everything
+before it. FFmpeg then
 **scales the picture to fill 9:16 and crops the centre**, burns in the
 captions for the words spoken inside the range (see below), and encodes H.264/AAC with `+faststart`. The crop is fixed to the
 centre of the frame: nothing follows faces or speakers. A candidate that fails keeps a failed clip record with its error and
