@@ -60,3 +60,28 @@ test('the upload limit can be raised or lowered from the environment', () => {
   assert.equal(loadConfig({ MAX_UPLOAD_BYTES: '104857600' }).MAX_UPLOAD_BYTES, 104_857_600);
   assert.equal(loadConfig({}).MAX_UPLOAD_BYTES, 2_147_483_648);
 });
+
+test('speech recognition stays on this machine unless a hosted service is asked for, and a hosted one cannot be half-configured', () => {
+  const defaults = loadConfig({});
+  assert.equal(defaults.TRANSCRIPTION_ENGINE, 'whisper_cpp');
+  assert.equal(defaults.TRANSCRIPTION_API_URL, undefined);
+  assert.equal(defaults.TRANSCRIPTION_API_MODEL, 'whisper-1');
+  assert.equal(defaults.TRANSCRIPTION_CHUNK_SECONDS, 600);
+  assert.equal(defaults.TRANSCRIPTION_API_CONCURRENCY, 3);
+
+  const secret = 'not-a-real-key-for-this-test';
+  assert.throws(() => loadConfig({ TRANSCRIPTION_ENGINE: 'openai_compatible' }), /TRANSCRIPTION_API_URL and TRANSCRIPTION_API_KEY/);
+  assert.throws(() => loadConfig({ TRANSCRIPTION_ENGINE: 'openai_compatible', TRANSCRIPTION_API_URL: 'https://speech.example/v1' }), /TRANSCRIPTION_API_KEY/);
+  assert.throws(() => loadConfig({ TRANSCRIPTION_ENGINE: 'openai_compatible', TRANSCRIPTION_API_KEY: secret }), (error: Error) => /TRANSCRIPTION_API_URL/.test(error.message) && !error.message.includes(secret));
+  assert.throws(() => loadConfig({ TRANSCRIPTION_ENGINE: 'openai_compatible', TRANSCRIPTION_API_URL: 'https://speech.example/v1', TRANSCRIPTION_API_KEY: '   ' }), /TRANSCRIPTION_API_KEY/);
+  const hosted = loadConfig({ TRANSCRIPTION_ENGINE: 'openai_compatible', TRANSCRIPTION_API_URL: 'https://speech.example/v1', TRANSCRIPTION_API_KEY: secret, TRANSCRIPTION_API_MODEL: 'whisper-large-v3-turbo', TRANSCRIPTION_CHUNK_SECONDS: '300', TRANSCRIPTION_API_CONCURRENCY: '2' });
+  assert.deepEqual([hosted.TRANSCRIPTION_ENGINE, hosted.TRANSCRIPTION_API_MODEL, hosted.TRANSCRIPTION_CHUNK_SECONDS, hosted.TRANSCRIPTION_API_CONCURRENCY], ['openai_compatible', 'whisper-large-v3-turbo', 300, 2]);
+});
+
+test('hosted speech recognition settings that make no sense are refused at startup', () => {
+  assert.throws(() => loadConfig({ TRANSCRIPTION_ENGINE: 'some_other_engine' }));
+  assert.throws(() => loadConfig({ TRANSCRIPTION_API_URL: 'not an address' }));
+  for (const bad of ['0', '59', '3601']) assert.throws(() => loadConfig({ TRANSCRIPTION_CHUNK_SECONDS: bad }), Error, `${bad} s per piece`);
+  for (const bad of ['0', '9']) assert.throws(() => loadConfig({ TRANSCRIPTION_API_CONCURRENCY: bad }), Error, `${bad} requests at once`);
+  assert.throws(() => loadConfig({ TRANSCRIPTION_API_TIMEOUT_MS: '1000' }));
+});

@@ -176,6 +176,9 @@ All configuration comes from environment variables; see [`.env.example`](.env.ex
 | `MAX_UPLOAD_BYTES` | Largest accepted upload (default 2 GiB). The upload page states the limit. |
 | `FFMPEG_PATH`, `FFPROBE_PATH` | Binary locations when not on `PATH`. |
 | `WHISPER_CPP_PATH`, `WHISPER_MODEL_PATH`, `TRANSCRIPTION_LANGUAGE`, `TRANSCRIPTION_TIMEOUT_MS` | whisper.cpp command, model, language code (default `en`) and time limit. |
+| `TRANSCRIPTION_ENGINE` | `whisper_cpp` (default, runs on this machine) or `openai_compatible` (a hosted service, see [Faster speech recognition](#faster-speech-recognition-with-a-hosted-service-optional)). |
+| `TRANSCRIPTION_API_URL`, `TRANSCRIPTION_API_KEY`, `TRANSCRIPTION_API_MODEL` | Only for `openai_compatible`: the service's base address (ending in `/v1`), its key (never logged, never shown in a message) and the model (default `whisper-1`). The address and key are required when that engine is chosen. |
+| `TRANSCRIPTION_CHUNK_SECONDS`, `TRANSCRIPTION_API_CONCURRENCY`, `TRANSCRIPTION_API_TIMEOUT_MS` | Only for `openai_compatible`: about how many seconds of audio go in one request (default 600), how many requests run at once (default 3) and the time limit of one request (default 300000 ms). |
 | `CLIP_MAX_CANDIDATES` | Highest-ranked candidates rendered per job (default 3). |
 | `CLIP_VERTICAL_WIDTH`, `CLIP_VERTICAL_HEIGHT` | Output size; must be 9:16 (default 1080×1920). |
 | `CLIP_VIDEO_CODEC`, `CLIP_AUDIO_CODEC`, `CLIP_CRF`, `CLIP_PRESET` | FFmpeg encoding (defaults `libx264`, `aac`, 23, `veryfast`). |
@@ -278,11 +281,43 @@ happens to have. A test renders a clip with such an empty font configuration and
 Greek and Cyrillic; other scripts (Arabic, CJK, Devanagari, Thai) need their own font files added to the same directory and are not
 supported yet.
 
+### Faster speech recognition with a hosted service (optional)
+
+whisper.cpp on the free instance needs about 14 times the length of the video (measured once, above). A hosted service that speaks
+the OpenAI `audio/transcriptions` protocol (OpenAI, Groq and others that copy it) does the same work in seconds to minutes. It is
+off by default; set `TRANSCRIPTION_ENGINE=openai_compatible` together with `TRANSCRIPTION_API_URL`, `TRANSCRIPTION_API_KEY` and
+`TRANSCRIPTION_API_MODEL` (for example `whisper-1`, or `whisper-large-v3-turbo` at Groq) to use it. Put the key in the host's
+environment settings, never in the repository. `TRANSCRIPTION_LANGUAGE=auto` lets the service detect the language, any other
+value is passed as the language code, which is also how languages other than English become possible (whisper.cpp with the
+English-only model cannot do them).
+
+What the engine does: the audio is cut into pieces of about `TRANSCRIPTION_CHUNK_SECONDS`, each cut in the middle of the longest
+pause close to where the piece should end (so no word is cut in half); each piece is compressed to mono AAC at 48 kbit/s (about
+21 MB per hour, far below the 25 MB that services accept per request); up to `TRANSCRIPTION_API_CONCURRENCY` pieces are sent at a
+time with `response_format=verbose_json` and word timestamps; the answers are joined on the clock of the whole recording into the
+same transcript whisper.cpp produces, word timing included (the service gives words without punctuation, so each is matched with
+the text of its segment to get its punctuation back, which the captions need). Segments the service marks as not speech (the
+thresholds Whisper itself uses: more than 0.6 chance of no speech and a mean log-probability below -1) are dropped, because
+silence and music make Whisper write phrases nobody said. A busy or unreachable service (HTTP 408, 425, 429, 5xx, a timeout, a
+network error) is waited for and asked again up to four times, following `Retry-After`; a rejected key, a refused audio file or an
+answer that is not `verbose_json` fails the job at once with a plain message that never contains the key or anything that echoes it.
+When one piece fails the others are stopped.
+
+What it costs and what it means: **the audio of every video is sent to that service**, which has its own terms, prices and limits
+(check the provider's current ones), and a service with a key that costs money is only as safe as the access to this upload page,
+which at the moment is open to anyone who can reach it (see below).
+
+Evidence: the engine is tested against a stand-in service that reads the real multipart request (request shape, key header,
+options, ordering of answers, retries, failures, no key in any message) with real FFmpeg for the pauses and the pieces. It has not
+been run against a real service yet: whether OpenAI's or Groq's actual answers read the same way, their rate limits, and the speed
+and quality for real recordings are not proven.
+
 ## Not implemented
 
 Face or speaker tracking (reframing is a fixed centre crop), semantic or LLM highlight selection, languages other than English
-out of the box (that needs a multilingual model instead of the English-only `ggml-base.en` that `setup:whisper` downloads, and
-`TRANSCRIPTION_LANGUAGE` set to the language code; neither has been tried), user accounts and authentication (**anyone who can reach the service can upload**), per-user quotas,
+out of the box (whisper.cpp needs a multilingual model instead of the English-only `ggml-base.en` that `setup:whisper` downloads and
+`TRANSCRIPTION_LANGUAGE` set to the language code; the hosted engine above can take other languages but has not been tried with one; and the
+caption font only covers Latin, Greek and Cyrillic), user accounts and authentication (**anyone who can reach the service can upload**), per-user quotas,
 malware scanning, a separate worker tier, and retention rules for generated clips. YouTube ingestion depends on a third-party Cobalt
 service whose availability and terms of use are outside this repository. Operators are responsible for having the right to
 process the videos users upload.

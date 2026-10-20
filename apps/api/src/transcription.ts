@@ -132,9 +132,3 @@ export class WhisperCppTranscriber implements TranscriptionEngine {
     }
   }
 }
-
-export function createTranscriptionEngine(config: { TRANSCRIPTION_ENGINE: 'whisper_cpp'; WHISPER_CPP_PATH: string; WHISPER_MODEL_PATH: string; TRANSCRIPTION_LANGUAGE: string; TRANSCRIPTION_TIMEOUT_MS: number }): TranscriptionEngine {
-  switch (config.TRANSCRIPTION_ENGINE) {
-    case 'whisper_cpp': return new WhisperCppTranscriber(config.WHISPER_CPP_PATH, config.WHISPER_MODEL_PATH, config.TRANSCRIPTION_LANGUAGE, config.TRANSCRIPTION_TIMEOUT_MS);
-  }
-}

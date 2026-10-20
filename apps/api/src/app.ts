@@ -13,7 +13,8 @@ import { createStorage, missingR2Settings, type DurableStorage } from './storage
 import type { NewVideoJob, VideoJob } from './domain.js';
 import { FfmpegAdapter } from './ffmpeg.js';
 import { VideoPipeline } from './pipeline.js';
-import { createTranscriptionEngine, type TranscriptionEngine } from './transcription.js';
+import { createTranscriptionEngine } from './engines.js';
+import type { TranscriptionEngine } from './transcription.js';
 import { DeterministicHighlightDetector, type HighlightOptions } from './highlights.js';
 import { FfmpegClipRenderer, isSafeClipIdentifier, resolveClipOutputPath } from './clips.js';
 import { downloadYouTubeVideo } from './youtube.js';
