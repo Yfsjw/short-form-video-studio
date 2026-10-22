@@ -108,13 +108,14 @@ export function renderUploadPage(info: UploadPageInfo): string {
         <option value="highlight">Phrases, the spoken word lit</option>
         <option value="pop">Big words that pop in</option>
         <option value="none">No captions</option>
-      </select></label>${info.faceFraming ? `
+      </select></label>
     <label class="field"><span class="label">Framing</span>
       <select name="framing">
-        <option value="center">Middle of the picture</option>
-        <option value="face">Follow a face (beta)</option>
+        <option value="center">Middle of the picture</option>${info.faceFraming ? `
+        <option value="face">Follow a face (beta)</option>` : ''}
+        <option value="fit">Whole picture, blurred background</option>
       </select></label>
-    <div class="hint">A clip is much narrower than most videos, so only about a third of the picture fits. "Follow a face" moves the picture to keep a face in view: the most visible one, not necessarily whoever is talking. It takes a little longer.</div>` : ''}
+    <div class="hint">A clip is much narrower than most videos, so "Middle of the picture" keeps only about a third of the width. "Whole picture" keeps everything in view (good for slides, screens and sport) and fills the empty space with a blurred copy of the picture.${info.faceFraming ? ' "Follow a face" moves the picture to keep a face in view: the most visible one, not necessarily whoever is talking. It takes a little longer.' : ''}</div>
   </details>
   <button type="submit">Upload video</button>
 </form>

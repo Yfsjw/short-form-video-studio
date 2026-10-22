@@ -50,8 +50,11 @@ test('the upload page offers "follow a face" only when the server can do it, say
   assert.match(on, /not necessarily whoever is talking/, 'the page is honest about what it follows');
   assert.match(on, /takes a little longer/, 'and about the cost');
   const off = renderUploadPage({ ...uploadInfo, faceFraming: false });
-  assert.doesNotMatch(off, /name="framing"|Follow a face|whoever is talking/);
+  assert.doesNotMatch(off, /<option value="face">|Follow a face|whoever is talking/);
+  assert.match(off, /<select name="framing">\s*<option value="center">Middle of the picture<\/option>\s*<option value="fit">/, 'what the server can still do is offered');
   assert.match(off, /name="captionStyle"/, 'the other choices are untouched');
+  assert.match(on, /<option value="face">Follow a face \(beta\)<\/option>\s*<option value="fit">Whole picture, blurred background<\/option>/, 'the whole picture is a choice too');
+  assert.match(on, /good for slides, screens and sport/);
 });
 
 test('a clip says how it was framed when it was asked to follow a face, in words that are escaped, and says nothing when nothing was asked', () => {

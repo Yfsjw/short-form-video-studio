@@ -16,8 +16,8 @@ test('reads what the upload form sends (everything arrives as text)', () => {
   assert.deepEqual(parseJobOptions({ clipCount: '3', clipLength: 'long', quality: 'hd', captionStyle: 'pop', framing: 'face' }), { ok: true, options: { clipCount: 3, clipLength: 'long', quality: 'hd', captionStyle: 'pop', framing: 'face' } });
 });
 
-test('framing: the middle of the picture unless a face is asked for, and each choice survives being stored and read back', () => {
-  assert.deepEqual([...framingChoices], ['center', 'face']);
+test('framing: the middle of the picture unless something else is asked for, and each choice survives being stored and read back', () => {
+  assert.deepEqual([...framingChoices], ['center', 'face', 'fit']);
   assert.equal(defaultJobOptions.framing, 'center', 'following a face is opt-in, never the default');
   for (const framing of framingChoices) {
     const parsed = parseJobOptions({ framing });

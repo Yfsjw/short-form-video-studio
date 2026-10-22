@@ -411,7 +411,7 @@ test('the options from the upload form are read, kept, and shown as choices on t
   try {
     const page = await (await fetch(`${server.base}/test-upload`)).text();
     for (const name of ['clipCount', 'clipLength', 'quality', 'captionStyle', 'framing']) assert.ok(page.includes(`name="${name}"`), `the form has no ${name} choice`);
-    for (const framing of ['center', 'face']) assert.ok(page.includes(`<option value="${framing}">`), `the form does not offer the ${framing} framing`);
+    for (const framing of ['center', 'face', 'fit']) assert.ok(page.includes(`<option value="${framing}">`), `the form does not offer the ${framing} framing`);
     for (const style of ['classic', 'highlight', 'pop', 'none']) assert.ok(page.includes(`<option value="${style}">`), `the form does not offer the ${style} captions`);
     assert.match(page, /Automatic \(up to 1\)/, 'the automatic choice says what it means on this server');
     assert.match(page, /Automatic \(2–6 s\)/);
@@ -478,12 +478,36 @@ test('following a face, end to end: the choice is kept with the job, the clip is
   } finally { await server.stop(); await dropSchema(schema); }
 });
 
+test('the whole picture over a blurred copy, end to end: chosen on the form, kept with the job, and the real FFmpeg makes a normal vertical clip with no empty bands', needsFfmpeg, async () => {
+  const schema = schemaName('fit'); const server = await start({ schema, framer: null });
+  try {
+    const response = await uploadWith(server.base, '/test-upload', await readFile(sampleVideo), { clipCount: '1', captionStyle: 'none', framing: 'fit' });
+    assert.equal(response.status, 200);
+    const id = response.url.match(/\/jobs\/([0-9a-f-]{36})$/)![1];
+    const finished = await waitForJob(server.base, id) as JobView & { job: { options: { framing: string } }; clips: Array<{ id: string; outputPath: string; framing: string | null }> };
+    assert.equal(finished.job.status, 'completed', finished.job.errorMessage ?? '');
+    assert.equal(finished.job.options.framing, 'fit');
+    assert.equal(finished.clips[0].framing, null, 'nothing to explain: the whole picture is shown');
+    await untilSettled(server);
+
+    const clipFile = join(workspace, `${finished.clips[0].id}-fit.mp4`);
+    await writeFile(clipFile, (server.storage as MemoryStorage).objects.get(finished.clips[0].outputPath)!);
+    const facts = await inspect(clipFile);
+    assert.deepEqual({ width: facts.width, height: facts.height, codec: facts.codec }, { width: 360, height: 640, codec: 'h264' });
+    // The sample video is 320 x 240, so its picture takes the middle 270 rows of 640 and the first rows are the blurred copy: they must not be black.
+    const { stdout } = await run('ffmpeg', ['-nostdin', '-v', 'error', '-i', clipFile, '-frames:v', '1', '-vf', 'crop=360:60:0:0,format=gray', '-f', 'rawvideo', 'pipe:1'], { encoding: 'buffer' });
+    const average = stdout.reduce((total, value) => total + value, 0) / stdout.length;
+    assert.ok(stdout.length === 360 * 60 && average > 25, `the top of the clip is a copy of the picture, not black (average brightness ${average.toFixed(0)})`);
+  } finally { await server.stop(); await dropSchema(schema); }
+});
+
 test('the choice to follow a face is only offered when this server can do it, and asking anyway still gives the clips, from the middle, with a note', needsFfmpeg, async () => {
   for (const setting of [{ label: 'no framer', framer: null as null }, { label: 'switched off by FACE_FRAMING_ENABLED', env: { FACE_FRAMING_ENABLED: 'false' } }]) {
     const schema = schemaName('noface'); const server = await start({ schema, framer: setting.framer, env: setting.env });
     try {
       const page = await (await fetch(`${server.base}/test-upload`)).text();
-      assert.ok(!page.includes('name="framing"') && !page.includes('Follow a face'), `${setting.label}: the page must not offer what the server cannot do`);
+      assert.ok(!page.includes('<option value="face">') && !page.includes('Follow a face'), `${setting.label}: the page must not offer what the server cannot do`);
+      assert.ok(page.includes('<option value="fit">'), `${setting.label}: what it can do is still offered`);
       assert.ok(page.includes('name="captionStyle"'), `${setting.label}: the other choices are still there`);
 
       const response = await uploadWith(server.base, '/api/jobs', await readFile(sampleVideo), { clipCount: '1', captionStyle: 'none', framing: 'face' });

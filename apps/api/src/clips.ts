@@ -21,6 +21,8 @@ export interface ClipRenderRequest {
   quality?: QualityChoice;
   /** Where the picture of the clip is cut from when the video is wider than the clip: a path over the clip's own time (see framing.ts). Without it, from the middle. */
   framing?: FramingPlan | null;
+  /** `fill` (the default) cuts the clip out of the picture; `fit` shows the whole picture over a blurred copy of itself and cuts nothing off (a framing plan is then not used). */
+  layout?: 'fill' | 'fit';
 }
 export interface RenderedClip { durationSeconds: number; sizeBytes: number; }
 export interface ClipRenderer { render(request: ClipRenderRequest): Promise<RenderedClip>; }
@@ -44,7 +46,7 @@ export class FfmpegClipRenderer implements ClipRenderer {
     const durationSeconds = request.endSeconds - request.startSeconds;
     if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) throw new Error('Clip range must have a positive duration.');
     const size = outputSizeFor({ width: this.verticalWidth, height: this.verticalHeight }, request.quality ?? 'hd');
-    const videoFilter = this.buildVideoFilter(request.captionPath, size, request.framing);
+    const videoFilter = this.buildVideoFilter(request.captionPath, size, request.framing, request.layout);
     const args = [
       // `-ss` goes BEFORE `-i` on purpose. Placed after it, FFmpeg decodes everything from the start of the file and cuts at the very end
       // of the filter chain, so the caption filter would see the ORIGINAL timeline (a clip that starts 40 s into the video would look for
@@ -71,17 +73,33 @@ export class FfmpegClipRenderer implements ClipRenderer {
     }
   }
 
-  private buildVideoFilter(captionPath: string | null | undefined, size: { width: number; height: number }, framing?: FramingPlan | null) {
-    // The picture is enlarged until it covers the clip, and the clip is cut out of it: from the middle, unless a plan says where the window
+  private buildVideoFilter(captionPath: string | null | undefined, size: { width: number; height: number }, framing?: FramingPlan | null, layout: 'fill' | 'fit' = 'fill') {
+    // `fill`: the picture is enlarged until it covers the clip, and the clip is cut out of it: from the middle, unless a plan says where the window
     // goes at every moment (its `x` is an expression FFmpeg works out for every frame from `t`, the time counted from the start of the clip).
+    // `fit`: the whole picture, as large as the width allows, in the middle of a blurred copy of itself.
     const window = framing ? `crop=${size.width}:${size.height}:x='${cropXExpression(framing.keyframes)}':y='(in_h-out_h)/2'` : `crop=${size.width}:${size.height}`;
-    const crop = `scale=${size.width}:${size.height}:force_original_aspect_ratio=increase,${window}`;
+    const crop = layout === 'fit' ? wholePictureFilter(size) : `scale=${size.width}:${size.height}:force_original_aspect_ratio=increase,${window}`;
     if (!captionPath) return crop;
     const escapedPath = escapeFilterPath(captionPath);
     // A styled caption file (.ass) brings its own look and is drawn with the bundled font; a plain .srt gets the fixed look below.
     if (captionPath.toLowerCase().endsWith('.ass')) return `${crop},ass='${escapedPath}':fontsdir='${escapeFilterPath(this.fontsDirectory)}'`;
     return `${crop},subtitles='${escapedPath}':force_style='FontName=Arial,FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=3,Shadow=0,Alignment=2,MarginV=110'`;
   }
+}
+
+/**
+ * The whole picture over a blurred copy of itself. The copy is made small first (an eighth of the size) and only then blurred and enlarged, which is
+ * what keeps this cheap on a small server: blurring a full-size picture would cost more than the rest of the clip. Both parts are measured by FFmpeg
+ * itself from the picture it is given, so a phone video that is stored sideways (and turned when played) is handled like any other.
+ */
+export function wholePictureFilter(size: { width: number; height: number }): string {
+  const small = { width: Math.max(2, Math.round(size.width / 8)), height: Math.max(2, Math.round(size.height / 8)) };
+  return [
+    'split=2[back][front]',
+    `[back]scale=${small.width}:${small.height}:force_original_aspect_ratio=increase,crop=${small.width}:${small.height},boxblur=3:2,scale=${size.width}:${size.height}[blurred]`,
+    `[front]scale=${size.width}:${size.height}:force_original_aspect_ratio=decrease[picture]`,
+    '[blurred][picture]overlay=(W-w)/2:(H-h)/2',
+  ].join(';');
 }
 
 function escapeFilterPath(path: string) {

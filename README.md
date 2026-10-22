@@ -213,7 +213,7 @@ is resumed after a restart is finished the way it was started.
 | `clipCount` | `1`–`5` | At most this many clips (default: `CLIP_MAX_CANDIDATES`). |
 | `clipLength` | `auto`, `short` (15–30 s), `medium` (30–60 s), `long` (60–90 s) | Length of each clip (`auto` uses `HIGHLIGHT_MIN/MAX_DURATION_SECONDS`). |
 | `quality` | `hd`, `standard` | `hd` is the configured clip size (1080×1920 by default); `standard` is two thirds of it (720×1280), which renders noticeably faster on a small server. |
-| `framing` | `center`, `face` | Where the 9:16 window sits in the picture. `center` (default): the middle. `face`: the window follows a face (beta, see [Following a face](#following-a-face-beta-opt-in)); costs extra processing time. |
+| `framing` | `center`, `face`, `fit` | How the picture is placed in the 9:16 clip. `center` (default): the middle of the picture is cut out. `face`: the window follows a face (beta, see [Following a face](#following-a-face-beta-opt-in)); costs extra processing time. `fit`: nothing is cut off: the whole picture is shown across the width of the clip, over a blurred copy of itself (good for slides, screens and sport). |
 | `captionStyle` | `classic`, `highlight`, `pop`, `none` | `classic`: short phrases in white. `highlight`: the same phrases with the word being spoken lit in gold. `pop`: a few big upper-case words at a time, the spoken word lit, popping in. `none`: leave the picture clean. See [Captions](#captions). |
 
 ### Progress and timings
@@ -258,7 +258,10 @@ zero (which is what the captions are counted from), and a clip deep inside a lon
 before it. FFmpeg then
 **scales the picture to fill 9:16 and crops it** (from the centre, or along the path of a face when the person chose `framing: face`),
 burns in the captions for the words spoken inside the range (see below), and encodes H.264/AAC with `+faststart`. Without that
-choice the crop is fixed to the centre of the frame. A candidate that fails keeps a failed clip record with its error and
+choice the crop is fixed to the centre of the frame. With `framing: fit` nothing is cropped: the whole picture is scaled to the
+width of the clip and laid over a blurred copy of the same picture that fills the rest of the frame. The copy is made at an eighth
+of the size before it is blurred and enlarged, so it costs little, and FFmpeg measures the picture it is given (after turning a phone
+video that is stored sideways), so any shape of video, from ultra-wide to taller than the clip, fits. A candidate that fails keeps a failed clip record with its error and
 processing continues; the job completes only if at least one clip was made.
 
 ### Following a face (beta, opt-in)
@@ -292,8 +295,13 @@ so a clip of a minute can add minutes there (this is why it is a choice).
 Verified so far: the detector against OpenCV's result for one photograph; the path rules with unit tests (static, walking, leaving
 and returning, two faces, cuts); and the whole chain with the real FFmpeg on synthetic videos made from that photograph (the face
 stays in the middle of the rendered clip where a centred clip loses it), plus the options, storage, pipeline and page around it.
-Not yet verified: real recordings of people talking, interviews and other multi-person footage, and the speed on the production
-instance.
+It was also tried by hand on four real recordings (public sample videos, not part of this repository). On a recording of a man
+turning, tilting and bowing his head a face was found in 77 % of the pictures (the rest are the head turned to the side, bowed or
+strongly tilted, which this detector does not see) and none of 18 randomly chosen detections was wrong; on a recording of a woman
+moving her head it also found one in 77 % and followed it; in a corridor where people only now and then walk by, too little was
+seen and the clip was left in the middle, as designed. A minute of video took about 4 seconds to check on a development machine.
+Not yet verified: recordings of people actually talking (those samples have no speech), interviews and other footage of several
+people sitting still, and the speed on the production instance.
 
 ### Captions
 

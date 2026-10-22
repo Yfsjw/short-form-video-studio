@@ -15,10 +15,11 @@ export const captionStyles = ['classic', 'highlight', 'pop', 'none'] as const;
 export type CaptionStyle = (typeof captionStyles)[number];
 
 /**
- * Where the picture of a clip is cut from when the video is wider than the clip. `center`: the middle of the picture. `face`: the window follows
- * a face (see framing.ts); where no face is found, or none can be followed, the middle is used.
+ * How the picture of a clip is placed in the vertical frame when the video is wider than the clip. `center`: the middle of the picture is cut out.
+ * `face`: the window follows a face (see framing.ts); where no face is found, or none can be followed, the middle is used. `fit`: nothing is cut
+ * off: the whole picture is shown across the width of the frame, over a blurred copy of itself that fills the rest.
  */
-export const framingChoices = ['center', 'face'] as const;
+export const framingChoices = ['center', 'face', 'fit'] as const;
 export type FramingChoice = (typeof framingChoices)[number];
 
 /** What the person asked for when uploading. Stored with the job so a resumed job is finished the way it was started. */

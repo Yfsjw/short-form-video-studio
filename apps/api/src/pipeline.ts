@@ -435,7 +435,7 @@ export class VideoPipeline {
             captionCount = await writeSrtCaptions(captionPath, transcript, range.startSeconds, range.endSeconds);
             styledCount = await writeAssCaptions(styledCaptionPath, transcript, range.startSeconds, range.endSeconds, captionStyle);
           }
-          const rendered = await this.clipRenderer.render({ sourcePath, startSeconds: range.startSeconds, endSeconds: range.endSeconds, outputPath, captionPath: styledCount ? styledCaptionPath : null, quality: options.quality, framing: framing?.followed ? framing.plan : null });
+          const rendered = await this.clipRenderer.render({ sourcePath, startSeconds: range.startSeconds, endSeconds: range.endSeconds, outputPath, captionPath: styledCount ? styledCaptionPath : null, quality: options.quality, framing: framing?.followed ? framing.plan : null, layout: options.framing === 'fit' ? 'fit' : 'fill' });
           await rm(styledCaptionPath, { force: true });
           await this.storage.upload(outputPath, clip.outputPath, 'video/mp4');
           if (captionCount) await this.storage.upload(captionPath, `${jobId}/${clipId}.srt`, 'application/x-subrip');

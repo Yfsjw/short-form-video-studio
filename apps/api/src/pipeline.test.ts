@@ -876,3 +876,25 @@ test('on a server where following a face is switched off, asking for it still gi
     assert.deepEqual(ctx.errors, [], 'switched off is not an error');
   } finally { await ctx.cleanup(); }
 });
+
+test('the whole picture over a blurred copy: every clip is rendered that way, nothing looks for a face, and the other choices keep cutting from the middle', async () => {
+  const requests: ClipRenderRequest[] = []; let asked = 0;
+  const framer: ClipFramer = { frame: async () => { asked += 1; throw new Error('must not be called'); } };
+  const ctx = await setup({ transcriber: { transcribe: async () => threeMinutes }, renderer: recordingRenderer(requests), framer, media: threeMinuteVideo });
+  try {
+    await addJob(ctx, 'j-fit', { options: { ...faceOptions, framing: 'fit' } });
+    await ctx.pipeline.run('j-fit');
+    assert.equal((await ctx.db.getJob('j-fit'))?.status, 'completed');
+    assert.equal(requests.length, 2);
+    for (const request of requests) { assert.equal(request.layout, 'fit'); assert.equal(request.framing, null, 'no path to follow'); }
+    assert.equal(asked, 0, 'a framer that is there is not used for this choice');
+    assert.deepEqual((await ctx.db.listClips('j-fit')).map((clip) => clip.framing), [null, null], 'nothing needs explaining');
+
+    requests.length = 0;
+    await addJob(ctx, 'j-middle-layout', { options: { ...faceOptions, framing: 'center' } });
+    await ctx.pipeline.run('j-middle-layout');
+    assert.equal(requests.length, 2);
+    for (const request of requests) assert.equal(request.layout, 'fill', 'the middle of the picture is cut out, as before');
+    assert.deepEqual(ctx.errors, []);
+  } finally { await ctx.cleanup(); }
+});

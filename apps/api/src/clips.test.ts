@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { FfmpegClipRenderer, isSafeClipIdentifier, resolveClipOutputPath } from './clips.js';
+import { FfmpegClipRenderer, isSafeClipIdentifier, resolveClipOutputPath, wholePictureFilter } from './clips.js';
 import { cropXExpression } from './framing.js';
 import { StudioDatabase } from './database.js';
 import type { GeneratedClip, NewVideoJob } from './domain.js';
@@ -59,5 +59,41 @@ test('FFmpeg renderer cuts from the middle of the picture unless it is given a p
     assert.ok(filterOf(calls[3]).startsWith(framed + ',ass='), 'the caption filter comes after the moving crop');
     await renderer.render({ sourcePath: source, startSeconds: 20, endSeconds: 30, outputPath, quality: 'standard', framing: { keyframes } });
     assert.match(filterOf(calls[4]), /^scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280:x='/, 'the faster quality moves the window at its own size');
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('FFmpeg renderer lays the whole picture over a blurred copy when asked, whatever plan it is given, and at the size of the chosen quality', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'studio-renderer-fit-')); const outputPath = join(root, 'clip.mp4'); const calls: string[][] = [];
+  try {
+    const renderer = new FfmpegClipRenderer('ffmpeg', 'libx264', 'aac', 23, 'veryfast', 1080, 1920, async (_binary, args) => { calls.push(args); await writeFile(outputPath, 'mock mp4 bytes'); });
+    const filterOf = (args: string[]) => args[args.indexOf('-vf') + 1];
+    const source = join(root, 'source.mp4');
+    const plan = { keyframes: [{ seconds: 0, position: 0.2 }, { seconds: 2, position: 0.8 }] };
+
+    await renderer.render({ sourcePath: source, startSeconds: 0, endSeconds: 10, outputPath, layout: 'fit' });
+    assert.equal(filterOf(calls[0]), wholePictureFilter({ width: 1080, height: 1920 }));
+    assert.equal(filterOf(calls[0]), [
+      'split=2[back][front]',
+      '[back]scale=135:240:force_original_aspect_ratio=increase,crop=135:240,boxblur=3:2,scale=1080:1920[blurred]',
+      '[front]scale=1080:1920:force_original_aspect_ratio=decrease[picture]',
+      '[blurred][picture]overlay=(W-w)/2:(H-h)/2',
+    ].join(';'), 'the copy is made small first, so blurring it is cheap');
+
+    await renderer.render({ sourcePath: source, startSeconds: 0, endSeconds: 10, outputPath, layout: 'fit', framing: plan });
+    assert.equal(filterOf(calls[1]), filterOf(calls[0]), 'nothing is cut off, so a plan for where to cut has no meaning here');
+    assert.doesNotMatch(filterOf(calls[1]), /crop=1080|in_w/);
+
+    await renderer.render({ sourcePath: source, startSeconds: 0, endSeconds: 10, outputPath, layout: 'fit', captionPath: join(root, 'clip.ass') });
+    assert.ok(filterOf(calls[2]).startsWith(`${wholePictureFilter({ width: 1080, height: 1920 })},ass=`), 'the captions are drawn on the finished picture');
+
+    await renderer.render({ sourcePath: source, startSeconds: 0, endSeconds: 10, outputPath, layout: 'fit', quality: 'standard' });
+    assert.equal(filterOf(calls[3]), wholePictureFilter({ width: 720, height: 1280 }));
+    assert.match(filterOf(calls[3]), /scale=90:160:force_original_aspect_ratio=increase,crop=90:160/);
+
+    await renderer.render({ sourcePath: source, startSeconds: 0, endSeconds: 10, outputPath, layout: 'fill' });
+    await renderer.render({ sourcePath: source, startSeconds: 0, endSeconds: 10, outputPath });
+    assert.equal(filterOf(calls[4]), 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920', 'fill is the plain cut from the middle, as it always was');
+    assert.equal(filterOf(calls[5]), filterOf(calls[4]), 'and is what happens when no layout is named');
+    assert.deepEqual(calls[0].slice(0, 8), ['-nostdin', '-y', '-ss', '0.000', '-i', source, '-t', '10.000'], 'the cut of time is the same in every layout');
   } finally { await rm(root, { recursive: true, force: true }); }
 });
