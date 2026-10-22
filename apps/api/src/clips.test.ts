@@ -5,6 +5,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { FfmpegClipRenderer, isSafeClipIdentifier, resolveClipOutputPath } from './clips.js';
+import { cropXExpression } from './framing.js';
 import { StudioDatabase } from './database.js';
 import type { GeneratedClip, NewVideoJob } from './domain.js';
 
@@ -14,7 +15,7 @@ test('persists candidate-to-clip mapping and lifecycle fields', async () => {
   const db = await StudioDatabase.connect(TEST_DATABASE_URL, `test_clips_${randomUUID().replaceAll('-', '_')}`);
   try {
     const now = new Date().toISOString(); const job: NewVideoJob = { id: 'job', originalFilename: 'source.mp4', storedFilename: 'source.mp4', mimeType: 'video/mp4', sizeBytes: 1, status: 'processing', stage: 'extracting_clips', errorMessage: null, durationSeconds: 20, width: 1, height: 1, createdAt: now, updatedAt: now }; await db.createJob(job);
-    const clip: GeneratedClip = { id: 'clip', jobId: job.id, candidateId: 'candidate', startSeconds: 2, endSeconds: 8, durationSeconds: 6, outputPath: 'job/clip.mp4', outputFilename: 'clip.mp4', status: 'queued', errorMessage: null, captionPath: null, createdAt: now, updatedAt: now, title: null, score: null, reasons: [] }; await db.createClip(clip); await db.updateClip(clip.id, { status: 'processing' }); await db.updateClip(clip.id, { status: 'completed', captionPath: 'job/clip.srt' });
+    const clip: GeneratedClip = { id: 'clip', jobId: job.id, candidateId: 'candidate', startSeconds: 2, endSeconds: 8, durationSeconds: 6, outputPath: 'job/clip.mp4', outputFilename: 'clip.mp4', status: 'queued', errorMessage: null, captionPath: null, createdAt: now, updatedAt: now, title: null, score: null, reasons: [], framing: null }; await db.createClip(clip); await db.updateClip(clip.id, { status: 'processing' }); await db.updateClip(clip.id, { status: 'completed', captionPath: 'job/clip.srt' });
     const stored = await db.getClip(job.id, clip.id); assert.equal(stored?.candidateId, 'candidate'); assert.equal(stored?.status, 'completed'); assert.equal(stored?.durationSeconds, 6); assert.equal(stored?.captionPath, 'job/clip.srt');
   } finally { await db.close({ dropSchema: true }); }
 });
@@ -31,5 +32,32 @@ test('FFmpeg renderer builds a 9:16 timestamped MP4 command with a mocked proces
     const renderer = new FfmpegClipRenderer('ffmpeg', 'libx264', 'aac', 23, 'veryfast', 1080, 1920, async (_binary, args) => { arguments_ = args; await writeFile(outputPath, 'mock mp4 bytes'); });
     const rendered = await renderer.render({ sourcePath: join(root, 'source.mp4'), startSeconds: 12.5, endSeconds: 18.25, outputPath });
     assert.equal(rendered.durationSeconds, 5.75); assert.ok(rendered.sizeBytes > 0); assert.deepEqual(arguments_.slice(0, 8), ['-nostdin', '-y', '-ss', '12.500', '-i', join(root, 'source.mp4'), '-t', '5.750']); assert.ok(arguments_.includes('-movflags')); assert.ok(arguments_.includes('-vf')); assert.ok(arguments_.some((arg) => arg.includes('scale=1080:1920')));
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('FFmpeg renderer cuts from the middle of the picture unless it is given a plan, and then follows the plan frame by frame', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'studio-renderer-framing-')); const outputPath = join(root, 'clip.mp4'); const calls: string[][] = [];
+  try {
+    const renderer = new FfmpegClipRenderer('ffmpeg', 'libx264', 'aac', 23, 'veryfast', 1080, 1920, async (_binary, args) => { calls.push(args); await writeFile(outputPath, 'mock mp4 bytes'); });
+    const filterOf = (args: string[]) => args[args.indexOf('-vf') + 1];
+    const source = join(root, 'source.mp4');
+
+    await renderer.render({ sourcePath: source, startSeconds: 0, endSeconds: 10, outputPath });
+    assert.equal(filterOf(calls[0]), 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920', 'no plan: the middle, exactly as before');
+    await renderer.render({ sourcePath: source, startSeconds: 0, endSeconds: 10, outputPath, framing: null });
+    assert.equal(filterOf(calls[1]), filterOf(calls[0]), 'a plan of null means the same as no plan');
+
+    const keyframes = [{ seconds: 0, position: 0.2 }, { seconds: 4, position: 0.2 }, { seconds: 4.5, position: 0.7 }];
+    await renderer.render({ sourcePath: source, startSeconds: 20, endSeconds: 30, outputPath, framing: { keyframes } });
+    const framed = filterOf(calls[2]);
+    assert.equal(framed, `scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920:x='${cropXExpression(keyframes)}':y='(in_h-out_h)/2'`);
+    assert.match(framed, /clip\(\(t-4\)\/0\.5,0,1\)/, 'the move starts at 4 s and takes half a second, counted from the start of the clip');
+    assert.deepEqual(calls[2].slice(0, 8), ['-nostdin', '-y', '-ss', '20.000', '-i', source, '-t', '10.000'], 'the seek and the length do not depend on the plan');
+
+    // Captions are drawn after the cut, so they stay where they are whatever the window does.
+    await renderer.render({ sourcePath: source, startSeconds: 20, endSeconds: 30, outputPath, captionPath: join(root, 'clip.ass'), framing: { keyframes } });
+    assert.ok(filterOf(calls[3]).startsWith(framed + ',ass='), 'the caption filter comes after the moving crop');
+    await renderer.render({ sourcePath: source, startSeconds: 20, endSeconds: 30, outputPath, quality: 'standard', framing: { keyframes } });
+    assert.match(filterOf(calls[4]), /^scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280:x='/, 'the faster quality moves the window at its own size');
   } finally { await rm(root, { recursive: true, force: true }); }
 });

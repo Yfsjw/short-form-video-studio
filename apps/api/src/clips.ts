@@ -4,6 +4,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import type { QualityChoice } from './domain.js';
+import { cropXExpression, type FramingPlan } from './framing.js';
 import { outputSizeFor } from './options.js';
 
 const execFileAsync = promisify(execFile);
@@ -14,7 +15,13 @@ const execFileAsync = promisify(execFile);
  * source files (src/) and the compiled ones (dist/).
  */
 export const BUNDLED_FONTS_DIRECTORY = fileURLToPath(new URL('../assets/fonts', import.meta.url));
-export interface ClipRenderRequest { sourcePath: string; startSeconds: number; endSeconds: number; outputPath: string; captionPath?: string | null; /** `standard` renders at two thirds of the configured size; the default is the configured size. */ quality?: QualityChoice; }
+export interface ClipRenderRequest {
+  sourcePath: string; startSeconds: number; endSeconds: number; outputPath: string; captionPath?: string | null;
+  /** `standard` renders at two thirds of the configured size; the default is the configured size. */
+  quality?: QualityChoice;
+  /** Where the picture of the clip is cut from when the video is wider than the clip: a path over the clip's own time (see framing.ts). Without it, from the middle. */
+  framing?: FramingPlan | null;
+}
 export interface RenderedClip { durationSeconds: number; sizeBytes: number; }
 export interface ClipRenderer { render(request: ClipRenderRequest): Promise<RenderedClip>; }
 export type FfmpegRunner = (binary: string, arguments_: string[], options: { maxBuffer: number; timeout: number; cwd: string }) => Promise<void>;
@@ -37,7 +44,7 @@ export class FfmpegClipRenderer implements ClipRenderer {
     const durationSeconds = request.endSeconds - request.startSeconds;
     if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) throw new Error('Clip range must have a positive duration.');
     const size = outputSizeFor({ width: this.verticalWidth, height: this.verticalHeight }, request.quality ?? 'hd');
-    const videoFilter = this.buildVideoFilter(request.captionPath, size);
+    const videoFilter = this.buildVideoFilter(request.captionPath, size, request.framing);
     const args = [
       // `-ss` goes BEFORE `-i` on purpose. Placed after it, FFmpeg decodes everything from the start of the file and cuts at the very end
       // of the filter chain, so the caption filter would see the ORIGINAL timeline (a clip that starts 40 s into the video would look for
@@ -64,8 +71,11 @@ export class FfmpegClipRenderer implements ClipRenderer {
     }
   }
 
-  private buildVideoFilter(captionPath: string | null | undefined, size: { width: number; height: number }) {
-    const crop = `scale=${size.width}:${size.height}:force_original_aspect_ratio=increase,crop=${size.width}:${size.height}`;
+  private buildVideoFilter(captionPath: string | null | undefined, size: { width: number; height: number }, framing?: FramingPlan | null) {
+    // The picture is enlarged until it covers the clip, and the clip is cut out of it: from the middle, unless a plan says where the window
+    // goes at every moment (its `x` is an expression FFmpeg works out for every frame from `t`, the time counted from the start of the clip).
+    const window = framing ? `crop=${size.width}:${size.height}:x='${cropXExpression(framing.keyframes)}':y='(in_h-out_h)/2'` : `crop=${size.width}:${size.height}`;
+    const crop = `scale=${size.width}:${size.height}:force_original_aspect_ratio=increase,${window}`;
     if (!captionPath) return crop;
     const escapedPath = escapeFilterPath(captionPath);
     // A styled caption file (.ass) brings its own look and is drawn with the bundled font; a plain .srt gets the fixed look below.

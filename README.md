@@ -11,7 +11,7 @@ real FFmpeg render of a real time range of the uploaded video. If a stage cannot
 
 ```
 upload ─► job row (Postgres) ─► video copied to Cloudflare R2 ─► ffprobe ─► audio extraction ─► whisper.cpp transcript
-      ─► highlight ranking ─► FFmpeg render (9:16 centre crop + burned-in captions) ─► clips uploaded to R2 ─► download link
+      ─► highlight ranking ─► (optional: look for a face to follow) ─► FFmpeg render (9:16 crop + burned-in captions) ─► clips uploaded to R2 ─► download link
 ```
 
 | Piece | What it is |
@@ -154,8 +154,11 @@ upload arrives and not otherwise; a server that still opens, and still resumes o
 start-up; the real AWS SDK giving up on a server that accepts a connection and never answers (with the short limits the tests
 use and with the 6 s-and-over route production uses); the database cutting a connection in the middle of a transaction.
 CI runs the whole suite on every push and pull request.
+The face-following tests run the real detector and the real FFmpeg on videos made from one test photograph
+(`apps/api/test-assets`, with where it comes from).
 What the tests do **not** cover: the real R2 service (checked by the startup self-test instead), real whisper.cpp output,
-large (hundreds of MB) videos on a 512 MB instance, and whether Render really counts the keep-awake request as traffic.
+large (hundreds of MB) videos on a 512 MB instance, whether Render really counts the keep-awake request as traffic, and face
+following on recordings of real people.
 
 ## Configuration
 
@@ -182,6 +185,7 @@ All configuration comes from environment variables; see [`.env.example`](.env.ex
 | `CLIP_MAX_CANDIDATES` | Highest-ranked candidates rendered per job (default 3). |
 | `CLIP_VERTICAL_WIDTH`, `CLIP_VERTICAL_HEIGHT` | Output size; must be 9:16 (default 1080×1920). |
 | `CLIP_VIDEO_CODEC`, `CLIP_AUDIO_CODEC`, `CLIP_CRF`, `CLIP_PRESET` | FFmpeg encoding (defaults `libx264`, `aac`, 23, `veryfast`). |
+| `FACE_FRAMING_ENABLED` | `false` removes the "Follow a face" choice from the upload page and makes every clip be cut from the middle (default `true`; a person still has to choose it per video). Anything other than a clear yes/no is rejected. See [Following a face](#following-a-face-beta-opt-in). |
 | `HIGHLIGHT_MIN_DURATION_SECONDS`, `HIGHLIGHT_MAX_DURATION_SECONDS` | Candidate window bounds (20 and 60 s). |
 | `HIGHLIGHT_MAX_CANDIDATES`, `HIGHLIGHT_OVERLAP_THRESHOLD` | Ranked candidates kept and overlap suppression threshold (default 0.3: two clips may share at most 30 % of the shorter one, so the clips are different moments). |
 | `HIGHLIGHT_WEIGHT_*` | Non-negative scoring weights (density, emphasis, question, number, contrast, hook, completeness, standalone, continuity, length). |
@@ -209,6 +213,7 @@ is resumed after a restart is finished the way it was started.
 | `clipCount` | `1`–`5` | At most this many clips (default: `CLIP_MAX_CANDIDATES`). |
 | `clipLength` | `auto`, `short` (15–30 s), `medium` (30–60 s), `long` (60–90 s) | Length of each clip (`auto` uses `HIGHLIGHT_MIN/MAX_DURATION_SECONDS`). |
 | `quality` | `hd`, `standard` | `hd` is the configured clip size (1080×1920 by default); `standard` is two thirds of it (720×1280), which renders noticeably faster on a small server. |
+| `framing` | `center`, `face` | Where the 9:16 window sits in the picture. `center` (default): the middle. `face`: the window follows a face (beta, see [Following a face](#following-a-face-beta-opt-in)); costs extra processing time. |
 | `captionStyle` | `classic`, `highlight`, `pop`, `none` | `classic`: short phrases in white. `highlight`: the same phrases with the word being spoken lit in gold. `pop`: a few big upper-case words at a time, the spoken word lit, popping in. `none`: leave the picture clean. See [Captions](#captions). |
 
 ### Progress and timings
@@ -251,10 +256,44 @@ word before or after is heard (it uses the timing of every word when the transcr
 is frame-accurate and placed before the input, so the range does not depend on source keyframes, the clip's own timeline starts at
 zero (which is what the captions are counted from), and a clip deep inside a long video does not require decoding everything
 before it. FFmpeg then
-**scales the picture to fill 9:16 and crops the centre**, burns in the
-captions for the words spoken inside the range (see below), and encodes H.264/AAC with `+faststart`. The crop is fixed to the
-centre of the frame: nothing follows faces or speakers. A candidate that fails keeps a failed clip record with its error and
+**scales the picture to fill 9:16 and crops it** (from the centre, or along the path of a face when the person chose `framing: face`),
+burns in the captions for the words spoken inside the range (see below), and encodes H.264/AAC with `+faststart`. Without that
+choice the crop is fixed to the centre of the frame. A candidate that fails keeps a failed clip record with its error and
 processing continues; the job completes only if at least one clip was made.
+
+### Following a face (beta, opt-in)
+
+A 9:16 clip shows only about a third of the width of a 16:9 video, so a person who stands off-centre can be cut in half. With
+`framing: face` the window is moved to keep a face in view. It is off unless the person asks for it, because it costs processing time.
+
+1. **Pictures.** For each clip FFmpeg is asked for small grey pictures of the stretch that becomes the clip: 2 per second, 480 px wide
+   (fewer per second for a very long clip, never more than 180 for one clip).
+2. **Faces.** A frontal-face detector looks at each picture. It is the classic Viola–Jones method with OpenCV's
+   `haarcascade_frontalface_alt2` cascade (`apps/api/assets/cascades`, with its licence notice), written in TypeScript: no native
+   library, no hosted service, nothing about the video leaves the server. It is a detector built from fixed rules and trained
+   numbers, **not an AI model that understands the scene**, and the page says "beta". A test checks that it finds the same faces as
+   OpenCV itself does in the same picture.
+3. **The path.** Plain rules turn what was seen into a path for the window (`apps/api/src/framing.ts`): sightings in successive pictures
+   are linked into tracks, the most visible track is followed, the window does not move while the face stays within a small dead zone,
+   it moves at a limited speed, it waits 1.5 s when the face is lost for a moment, and it jumps at a cut in the video (found by
+   comparing consecutive pictures). The path is handed to FFmpeg as a formula of time for its `crop` filter, so the clip is still
+   encoded once.
+4. **Fallback.** If no face is seen often enough, or the video cannot be checked, or the server has the feature switched off
+   (`FACE_FRAMING_ENABLED=false`), the clip is cut from the middle exactly as before, and the clip card says so ("Centred: …" or
+   "Followed a face, …"). A problem with framing never costs the person the clip.
+
+What it does **not** do: it follows the most visible face, **not the person who is speaking** (sound plays no part), so in an
+interview it can stay on the listener; it finds faces that look at the camera or nearly so, not profiles, heads turned away or
+very small faces (under about a fifteenth of the width of the picture); it does not follow bodies, animals or objects, does not
+zoom, and cannot keep two faces that are far apart in the window at once. Looking for faces is CPU work done before the clip is
+encoded: it took tens of milliseconds per picture on a development machine, and a free instance has a small fraction of that CPU,
+so a clip of a minute can add minutes there (this is why it is a choice).
+
+Verified so far: the detector against OpenCV's result for one photograph; the path rules with unit tests (static, walking, leaving
+and returning, two faces, cuts); and the whole chain with the real FFmpeg on synthetic videos made from that photograph (the face
+stays in the middle of the rendered clip where a centred clip loses it), plus the options, storage, pipeline and page around it.
+Not yet verified: real recordings of people talking, interviews and other multi-person footage, and the speed on the production
+instance.
 
 ### Captions
 
@@ -314,7 +353,7 @@ and quality for real recordings are not proven.
 
 ## Not implemented
 
-Face or speaker tracking (reframing is a fixed centre crop), semantic or LLM highlight selection, languages other than English
+Speaker tracking (the optional face following follows the most visible face, not whoever is talking), semantic or LLM highlight selection, languages other than English
 out of the box (whisper.cpp needs a multilingual model instead of the English-only `ggml-base.en` that `setup:whisper` downloads and
 `TRANSCRIPTION_LANGUAGE` set to the language code; the hosted engine above can take other languages but has not been tried with one; and the
 caption font only covers Latin, Greek and Cyrillic), user accounts and authentication (**anyone who can reach the service can upload**), per-user quotas,

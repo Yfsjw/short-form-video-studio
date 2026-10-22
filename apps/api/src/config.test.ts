@@ -50,6 +50,14 @@ test('the keep-awake switch is on by default, can be switched off, and rejects t
   assert.throws(() => loadConfig({ KEEP_AWAKE_WHILE_PROCESSING: 'flase' }));
 });
 
+test('following a face is on by default (a person still has to ask for it per video), can be switched off, and rejects typos like the other flags', () => {
+  assert.equal(loadConfig({}).FACE_FRAMING_ENABLED, true);
+  assert.equal(loadConfig({ FACE_FRAMING_ENABLED: '' }).FACE_FRAMING_ENABLED, true);
+  for (const off of ['false', 'FALSE', '0', 'no', 'off']) assert.equal(loadConfig({ FACE_FRAMING_ENABLED: off }).FACE_FRAMING_ENABLED, false, `"${off}" should switch it off`);
+  for (const on of ['true', '1', 'yes', 'on']) assert.equal(loadConfig({ FACE_FRAMING_ENABLED: on }).FACE_FRAMING_ENABLED, true);
+  assert.throws(() => loadConfig({ FACE_FRAMING_ENABLED: 'flase' }));
+});
+
 test('the public address Render provides is used when valid, and a bad one never stops the server from starting', () => {
   assert.equal(loadConfig({}).RENDER_EXTERNAL_URL, undefined);
   assert.equal(loadConfig({ RENDER_EXTERNAL_URL: 'https://studio.onrender.com' }).RENDER_EXTERNAL_URL, 'https://studio.onrender.com');

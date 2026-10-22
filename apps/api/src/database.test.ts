@@ -11,7 +11,7 @@ const schemaName = (label: string) => `test_${label}_${randomUUID().replaceAll('
 const minutesAgo = (minutes: number) => new Date(Date.now() - minutes * 60_000).toISOString();
 
 const makeJob = (id: string, status: NewVideoJob['status'], updatedAt = new Date().toISOString()): NewVideoJob => ({ id, originalFilename: 'v.mp4', storedFilename: 'v.mp4', mimeType: 'video/mp4', sizeBytes: 1, status, stage: status, errorMessage: null, durationSeconds: null, width: null, height: null, createdAt: updatedAt, updatedAt });
-const makeClip = (id: string, jobId: string): GeneratedClip => { const now = new Date().toISOString(); return { id, jobId, candidateId: 'c', startSeconds: 0, endSeconds: 5, durationSeconds: 5, outputPath: `${jobId}/${id}.mp4`, outputFilename: `${id}.mp4`, status: 'completed', errorMessage: null, captionPath: null, createdAt: now, updatedAt: now, title: null, score: null, reasons: [] }; };
+const makeClip = (id: string, jobId: string): GeneratedClip => { const now = new Date().toISOString(); return { id, jobId, candidateId: 'c', startSeconds: 0, endSeconds: 5, durationSeconds: 5, outputPath: `${jobId}/${id}.mp4`, outputFilename: `${id}.mp4`, status: 'completed', errorMessage: null, captionPath: null, createdAt: now, updatedAt: now, title: null, score: null, reasons: [], framing: null }; };
 
 async function withDatabase(label: string, work: (db: StudioDatabase) => Promise<void>) {
   const db = await StudioDatabase.connect(TEST_DATABASE_URL, schemaName(label));
@@ -36,7 +36,7 @@ test('a job keeps the options it was created with, and its progress and stage ti
   await db.createJob({ ...makeJob('plain', 'queued') });
   assert.deepEqual((await db.getJob('plain'))?.options, defaultJobOptions, 'no options chosen means the defaults');
 
-  const chosen = { clipCount: 2, clipLength: 'short', quality: 'standard', captionStyle: 'none' } as const;
+  const chosen = { clipCount: 2, clipLength: 'short', quality: 'standard', captionStyle: 'none', framing: 'face' } as const;
   await db.createJob({ ...makeJob('chosen', 'queued'), options: chosen });
   assert.deepEqual((await db.getJob('chosen'))?.options, chosen);
 
@@ -108,6 +108,7 @@ test('upgrades a database created before durable sources existed, keeping its jo
         const [oldClip] = await db.listClips('old');
         assert.equal(oldClip.id, 'oldclip');
         assert.deepEqual([oldClip.title, oldClip.score, oldClip.reasons], [null, null, []], 'a clip from before titles and reasons existed has none, rather than made-up ones');
+        assert.equal(oldClip.framing, null, 'a clip from before face framing existed says nothing about framing');
         const [oldCandidate] = await db.listHighlights('old');
         assert.deepEqual([oldCandidate.title, oldCandidate.score, oldCandidate.reasons], [null, 55, ['question phrasing']], 'a stored candidate keeps what it had');
         const transcript = await db.listTranscript('old');
@@ -121,6 +122,9 @@ test('upgrades a database created before durable sources existed, keeping its jo
         }
         await db.createJob(makeJob(`new-${boot}`, 'queued'));
         assert.equal((await db.getJob(`new-${boot}`))?.attempts, 0);
+        // The column for the framing note was added by the upgrade, so a new clip can keep its note.
+        await db.createClip({ ...makeClip(`after-${boot}`, 'old'), framing: 'Followed a face, seen in 80% of the moments checked.' });
+        assert.equal((await db.listClips('old')).find((clip) => clip.id === `after-${boot}`)?.framing, 'Followed a face, seen in 80% of the moments checked.');
       } finally { await db.close(); }
     }
   } finally {
@@ -145,11 +149,23 @@ test('a clip is stored with the title, score and reasons of its passage, and a c
   await db.replaceHighlights('j-meta', [{ startSeconds: 0, endSeconds: 20, score: 71.5, quality: 'high', reasons: ['question phrasing', 'a length that suits short video'], signals: {}, sourceSegmentIndexes: [0], title: 'Why do most channels stop growing?' }, { startSeconds: 30, endSeconds: 50, score: 40, quality: 'low', reasons: [], signals: {}, sourceSegmentIndexes: [1], title: null }]);
   assert.deepEqual((await db.listHighlights('j-meta')).map((candidate) => candidate.title), ['Why do most channels stop growing?', null]);
   await db.createClip({ ...makeClip('c-meta', 'j-meta'), title: 'Why do most channels stop growing?', score: 71.5, reasons: ['question phrasing', 'a length that suits short video'] });
-  await db.createClip({ ...makeClip('c-plain', 'j-meta'), title: null, score: 0, reasons: [] });
+  await db.createClip({ ...makeClip('c-plain', 'j-meta'), title: null, score: 0, reasons: [], framing: null });
   const clips = await db.listClips('j-meta');
   const byId = (id: string) => clips.find((clip) => clip.id === id);
   assert.deepEqual([byId('c-meta')?.title, byId('c-meta')?.score, byId('c-meta')?.reasons], ['Why do most channels stop growing?', 71.5, ['question phrasing', 'a length that suits short video']]);
   assert.deepEqual([byId('c-plain')?.title, byId('c-plain')?.score, byId('c-plain')?.reasons], [null, 0, []], 'a score of zero is a score, not a missing one');
+}));
+
+test('a clip keeps the note about how it was framed, and a clip with no note reads back as null', () => withDatabase('clip_framing', async (db) => {
+  await db.createJob(makeJob('j-framing', 'processing'));
+  await db.createClip({ ...makeClip('c-followed', 'j-framing'), framing: 'Followed a face, seen in 80% of the moments checked.' });
+  await db.createClip({ ...makeClip('c-centred', 'j-framing'), framing: 'Centred: no face was found in the video.' });
+  await db.createClip({ ...makeClip('c-plain', 'j-framing'), framing: null });
+  const byId = new Map((await db.listClips('j-framing')).map((clip) => [clip.id, clip.framing]));
+  assert.equal(byId.get('c-followed'), 'Followed a face, seen in 80% of the moments checked.');
+  assert.equal(byId.get('c-centred'), 'Centred: no face was found in the video.');
+  assert.equal(byId.get('c-plain'), null, 'no note is null, never an empty string or the word undefined');
+  assert.equal((await db.getClip('j-framing', 'c-followed'))?.framing, 'Followed a face, seen in 80% of the moments checked.', 'a single clip is read back with its note too');
 }));
 
 test('lists only unfinished jobs, oldest first', () => withDatabase('unfinished', async (db) => {

@@ -12,6 +12,7 @@ import { Pool } from 'pg';
 import { createApp } from './app.js';
 import { loadConfig } from './config.js';
 import { StudioDatabase } from './database.js';
+import type { ClipFramer } from './face-track.js';
 import { NullStorage, type DurableStorage } from './storage.js';
 import { MemoryStorage, eventually, sleep } from './test-support.js';
 import type { TranscriptionEngine } from './transcription.js';
@@ -56,7 +57,7 @@ type Studio = Awaited<ReturnType<typeof createApp>>;
 interface RunningServer { base: string; root: string; dirs: { UPLOAD_DIR: string; TEMP_DIR: string; OUTPUT_DIR: string }; studio: Studio; storage: DurableStorage; stop: () => Promise<void> }
 
 /** Boots the real app on a free port, with its own empty upload/temp/output folders (like a freshly started container). */
-async function start(options: { schema: string; storage?: DurableStorage; transcriber?: TranscriptionEngine; env?: Record<string, string>; keepAwakeIntervalMs?: number; bootRecoveryWaitMs?: number }): Promise<RunningServer> {
+async function start(options: { schema: string; storage?: DurableStorage; transcriber?: TranscriptionEngine; env?: Record<string, string>; keepAwakeIntervalMs?: number; bootRecoveryWaitMs?: number; framer?: ClipFramer | null }): Promise<RunningServer> {
   const root = await mkdtemp(join(workspace, 'server-'));
   const dirs = { UPLOAD_DIR: join(root, 'uploads'), TEMP_DIR: join(root, 'tmp'), OUTPUT_DIR: join(root, 'outputs') };
   const config = loadConfig({
@@ -67,7 +68,7 @@ async function start(options: { schema: string; storage?: DurableStorage; transc
     ...options.env,
   });
   const storage = options.storage ?? new MemoryStorage();
-  const studio = await createApp(config, { storage, transcriber: options.transcriber ?? talk, databaseSchema: options.schema, keepAwakeIntervalMs: options.keepAwakeIntervalMs, bootRecoveryWaitMs: options.bootRecoveryWaitMs });
+  const studio = await createApp(config, { storage, transcriber: options.transcriber ?? talk, databaseSchema: options.schema, keepAwakeIntervalMs: options.keepAwakeIntervalMs, bootRecoveryWaitMs: options.bootRecoveryWaitMs, framer: options.framer });
   const server = createServer(studio.app).listen(0, '127.0.0.1');
   await new Promise<void>((resolve) => server.once('listening', resolve));
   let stopped = false;
@@ -381,13 +382,13 @@ test('options chosen at upload are kept with the job and shape the clip, and the
     const response = await uploadWith(server.base, '/api/jobs', await readFile(sampleVideo), { clipCount: '1', quality: 'standard', captionStyle: 'none' });
     assert.equal(response.status, 202);
     const { job } = await response.json() as { job: { id: string; options: unknown } };
-    assert.deepEqual(job.options, { clipCount: 1, clipLength: 'auto', quality: 'standard', captionStyle: 'none' });
+    assert.deepEqual(job.options, { clipCount: 1, clipLength: 'auto', quality: 'standard', captionStyle: 'none', framing: 'center' });
 
     const finished = await waitForJob(server.base, job.id) as JobView & { job: { progress: number; stageTimings: Record<string, number>; options: unknown } };
     assert.equal(finished.job.status, 'completed', finished.job.errorMessage ?? '');
     assert.equal(finished.job.progress, 100);
     assert.ok(Object.keys(finished.job.stageTimings).includes('transcribing') && Object.keys(finished.job.stageTimings).includes('extracting_clips'), 'the stages must be timed');
-    assert.deepEqual(finished.job.options, { clipCount: 1, clipLength: 'auto', quality: 'standard', captionStyle: 'none' });
+    assert.deepEqual(finished.job.options, { clipCount: 1, clipLength: 'auto', quality: 'standard', captionStyle: 'none', framing: 'center' });
     await untilSettled(server);
 
     const clip = finished.clips[0];
@@ -409,7 +410,8 @@ test('the options from the upload form are read, kept, and shown as choices on t
   const schema = schemaName('form'); const server = await start({ schema });
   try {
     const page = await (await fetch(`${server.base}/test-upload`)).text();
-    for (const name of ['clipCount', 'clipLength', 'quality', 'captionStyle']) assert.ok(page.includes(`name="${name}"`), `the form has no ${name} choice`);
+    for (const name of ['clipCount', 'clipLength', 'quality', 'captionStyle', 'framing']) assert.ok(page.includes(`name="${name}"`), `the form has no ${name} choice`);
+    for (const framing of ['center', 'face']) assert.ok(page.includes(`<option value="${framing}">`), `the form does not offer the ${framing} framing`);
     for (const style of ['classic', 'highlight', 'pop', 'none']) assert.ok(page.includes(`<option value="${style}">`), `the form does not offer the ${style} captions`);
     assert.match(page, /Automatic \(up to 1\)/, 'the automatic choice says what it means on this server');
     assert.match(page, /Automatic \(2–6 s\)/);
@@ -418,7 +420,7 @@ test('the options from the upload form are read, kept, and shown as choices on t
     assert.equal(response.status, 200);
     const id = response.url.match(/\/jobs\/([0-9a-f-]{36})$/)![1];
     const finished = await waitForJob(server.base, id) as JobView & { job: { options: unknown } };
-    assert.deepEqual(finished.job.options, { clipCount: 1, clipLength: 'auto', quality: 'hd', captionStyle: 'classic' }, 'a blank choice means automatic');
+    assert.deepEqual(finished.job.options, { clipCount: 1, clipLength: 'auto', quality: 'hd', captionStyle: 'classic', framing: 'center' }, 'a blank choice means automatic');
     assert.equal(finished.job.status, 'completed', finished.job.errorMessage ?? '');
   } finally { await server.stop(); await dropSchema(schema); }
 });
@@ -436,9 +438,63 @@ test('an option that is not allowed is refused with a plain message and leaves n
     assert.equal(form.status, 400);
     assert.match(await form.text(), /“quality” is not valid/);
 
+    const framing = await uploadWith(server.base, '/api/jobs', Buffer.alloc(64 * 1024, 3), { framing: 'sideways' });
+    assert.equal(framing.status, 400);
+    assert.match(((await framing.json()) as { error: { message: string } }).error.message, /framing/);
+
     assert.deepEqual(await readdir(server.dirs.UPLOAD_DIR), [], 'the refused videos must not stay on the disk');
     assert.equal((await server.studio.db.listUnfinishedJobs()).length, 0);
   } finally { await server.stop(); await dropSchema(schema); }
+});
+
+test('following a face, end to end: the choice is kept with the job, the clip is cut along the plan by the real FFmpeg, and the clip says what was done', needsFfmpeg, async () => {
+  const schema = schemaName('face'); const asked: Array<{ startSeconds: number; endSeconds: number }> = [];
+  const framer: ClipFramer = { frame: async ({ startSeconds, endSeconds }) => { asked.push({ startSeconds, endSeconds }); return { followed: true, plan: { keyframes: [{ seconds: 0, position: 0 }, { seconds: 1, position: 0 }, { seconds: 1.5, position: 1 }] }, seenShare: 0.9, tracksFollowed: 1, note: 'Followed a face, seen in 90% of the moments checked.' }; } };
+  const server = await start({ schema, framer });
+  try {
+    const response = await uploadWith(server.base, '/api/jobs', await readFile(sampleVideo), { clipCount: '1', captionStyle: 'none', framing: 'face' });
+    assert.equal(response.status, 202);
+    const { job } = await response.json() as { job: { id: string; options: { framing: string } } };
+    assert.equal(job.options.framing, 'face');
+
+    const finished = await waitForJob(server.base, job.id) as JobView & { job: { options: { framing: string } }; clips: Array<{ id: string; status: string; outputPath: string; framing: string | null }> };
+    assert.equal(finished.job.status, 'completed', finished.job.errorMessage ?? '');
+    assert.equal(finished.job.options.framing, 'face', 'the choice is kept with the job');
+    await untilSettled(server);
+    assert.equal(asked.length, 1, 'one look for a face for the one clip');
+    assert.ok(asked[0].startSeconds >= 0 && asked[0].endSeconds <= 8.001 && asked[0].endSeconds > asked[0].startSeconds, 'looked for in a stretch of the video');
+
+    const [clip] = finished.clips;
+    assert.equal(clip.status, 'completed');
+    assert.equal(clip.framing, 'Followed a face, seen in 90% of the moments checked.', 'the API tells what was done');
+    const clipFile = join(workspace, `${clip.id}-face.mp4`);
+    await writeFile(clipFile, (server.storage as MemoryStorage).objects.get(clip.outputPath)!);
+    const facts = await inspect(clipFile);
+    assert.deepEqual({ width: facts.width, height: facts.height, codec: facts.codec }, { width: 360, height: 640, codec: 'h264' }, 'FFmpeg accepted the moving window and made a normal vertical clip');
+    assert.ok(facts.kinds.includes('video') && facts.kinds.includes('audio'), 'the sound is kept');
+
+    const page = await (await fetch(`${server.base}/jobs/${job.id}`)).text();
+    assert.match(page, /Followed a face, seen in 90% of the moments checked\./, 'the job page says what was done too');
+  } finally { await server.stop(); await dropSchema(schema); }
+});
+
+test('the choice to follow a face is only offered when this server can do it, and asking anyway still gives the clips, from the middle, with a note', needsFfmpeg, async () => {
+  for (const setting of [{ label: 'no framer', framer: null as null }, { label: 'switched off by FACE_FRAMING_ENABLED', env: { FACE_FRAMING_ENABLED: 'false' } }]) {
+    const schema = schemaName('noface'); const server = await start({ schema, framer: setting.framer, env: setting.env });
+    try {
+      const page = await (await fetch(`${server.base}/test-upload`)).text();
+      assert.ok(!page.includes('name="framing"') && !page.includes('Follow a face'), `${setting.label}: the page must not offer what the server cannot do`);
+      assert.ok(page.includes('name="captionStyle"'), `${setting.label}: the other choices are still there`);
+
+      const response = await uploadWith(server.base, '/api/jobs', await readFile(sampleVideo), { clipCount: '1', captionStyle: 'none', framing: 'face' });
+      assert.equal(response.status, 202, `${setting.label}: a request that names the option is not refused`);
+      const { job } = await response.json() as { job: { id: string } };
+      const finished = await waitForJob(server.base, job.id) as JobView & { clips: Array<{ framing: string | null }> };
+      assert.equal(finished.job.status, 'completed', finished.job.errorMessage ?? '');
+      assert.equal(finished.clips[0].framing, 'Centred: following a face is switched off on this server.', setting.label);
+      await untilSettled(server);
+    } finally { await server.stop(); await dropSchema(schema); }
+  }
 });
 
 test('the job page shows a progress bar while a job runs and the clips as players when it is done', async () => {
@@ -451,7 +507,7 @@ test('the job page shows a progress bar while a job runs and the clips as player
     await server.studio.db.updateJob(working, { progress: 40 });
     await server.studio.db.createJob({ ...base, id: done, status: 'completed', stage: 'clip_extraction_complete' });
     await server.studio.db.updateJob(done, { progress: 100, stageTimings: { transcribing: 61_000, extracting_clips: 125_000 } });
-    await server.studio.db.createClip({ id: clipId, jobId: done, candidateId: 'c', startSeconds: 0, endSeconds: 12, durationSeconds: 12, outputPath: `${done}/${clipId}.mp4`, outputFilename: `${clipId}.mp4`, status: 'completed', errorMessage: null, captionPath: null, createdAt: now, updatedAt: now, title: null, score: null, reasons: [] });
+    await server.studio.db.createClip({ id: clipId, jobId: done, candidateId: 'c', startSeconds: 0, endSeconds: 12, durationSeconds: 12, outputPath: `${done}/${clipId}.mp4`, outputFilename: `${clipId}.mp4`, status: 'completed', errorMessage: null, captionPath: null, createdAt: now, updatedAt: now, title: null, score: null, reasons: [], framing: null });
 
     const workingPage = await (await fetch(`${server.base}/jobs/${working}`)).text();
     assert.match(workingPage, /<progress value="40" max="100">/);

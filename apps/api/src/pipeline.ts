@@ -7,6 +7,8 @@ import type { FfmpegAdapter } from './ffmpeg.js';
 import type { TranscriptionEngine } from './transcription.js';
 import type { HighlightDetector, HighlightOptions } from './highlights.js';
 import type { ClipRenderer } from './clips.js';
+import type { ClipFramer } from './face-track.js';
+import type { FramingResult } from './framing.js';
 import type { GeneratedClip, VideoJob } from './domain.js';
 import { writeAssCaptions, writeSrtCaptions } from './captions.js';
 import { paddedRange } from './ranges.js';
@@ -89,7 +91,7 @@ export class VideoPipeline {
   private recheckTimer: NodeJS.Timeout | undefined;
   private closed = false;
 
-  constructor(private readonly db: PipelineStore, private readonly ffmpeg: MediaProcessor, private readonly transcriber: TranscriptionEngine, private readonly highlightDetector: HighlightDetector, private readonly highlightOptions: HighlightOptions, private readonly clipRenderer: ClipRenderer, private readonly maxClipCandidates: number, private readonly uploadDir: string, private readonly tempDir: string, private readonly outputDir: string, private readonly logger: Pick<Logger, 'info' | 'error'>, private readonly storage: DurableStorage, private readonly options: PipelineRuntimeOptions = defaultRuntimeOptions) {
+  constructor(private readonly db: PipelineStore, private readonly ffmpeg: MediaProcessor, private readonly transcriber: TranscriptionEngine, private readonly highlightDetector: HighlightDetector, private readonly highlightOptions: HighlightOptions, private readonly clipRenderer: ClipRenderer, private readonly maxClipCandidates: number, private readonly uploadDir: string, private readonly tempDir: string, private readonly outputDir: string, private readonly logger: Pick<Logger, 'info' | 'error'>, private readonly storage: DurableStorage, private readonly options: PipelineRuntimeOptions = defaultRuntimeOptions, private readonly framer?: ClipFramer) {
     this.slots = new Semaphore(options.concurrency);
   }
 
@@ -375,6 +377,20 @@ export class VideoPipeline {
     } catch { /* freeing disk space is best effort */ }
   }
 
+  /**
+   * Plans where the picture of a clip is cut from when the person asked for a face to be followed. Never fails the clip: whatever goes wrong
+   * (no face, too little of one, a video that cannot be sampled, a server where this is switched off) the clip is cut from the middle, and says so.
+   */
+  private async frameClip(jobId: string, sourcePath: string, range: { startSeconds: number; endSeconds: number }): Promise<FramingResult> {
+    if (!this.framer) return { followed: false, note: 'Centred: following a face is switched off on this server.' };
+    try {
+      return await this.framer.frame({ sourcePath, startSeconds: range.startSeconds, endSeconds: range.endSeconds });
+    } catch (error) {
+      this.logger.error({ err: error, jobId }, 'Looking for a face to follow failed; the clip is cut from the middle instead');
+      return { followed: false, note: 'Centred: the video could not be checked for a face.' };
+    }
+  }
+
   private async renderClips(job: VideoJob, sourcePath: string, jobOutputDir: string) {
     const jobId = job.id;
     await this.discardPreviousClips(jobId, jobOutputDir);
@@ -396,7 +412,7 @@ export class VideoPipeline {
       if (!candidates.length) throw new Error(transcript.length ? 'No stretch of the speech was long enough to make a clip from.' : 'No speech was recognised in this video, so there is nothing to base clips on. Try a video in which someone is talking.');
       await this.enterStage(jobId, 'extracting_clips');
       await mkdir(jobOutputDir, { recursive: true });
-      let completedCount = 0;
+      let completedCount = 0; let framingMs = 0;
       for (const [candidateNumber, candidate] of candidates.entries()) {
         const clipId = randomUUID();
         const outputFilename = `${clipId}.mp4`;
@@ -406,7 +422,10 @@ export class VideoPipeline {
         const now = new Date().toISOString();
         // The passage is cut with a little room before its first word and after its last, never into the words next to it.
         const range = paddedRange(candidate.startSeconds, candidate.endSeconds, transcript, metadata.durationSeconds);
-        const clip: GeneratedClip = { id: clipId, jobId, candidateId: candidate.id, startSeconds: range.startSeconds, endSeconds: range.endSeconds, durationSeconds: range.endSeconds - range.startSeconds, outputPath: join(jobId, outputFilename), outputFilename, status: 'queued', errorMessage: null, captionPath: null, createdAt: now, updatedAt: now, title: candidate.title, score: candidate.score, reasons: candidate.reasons };
+        // Only when asked for: a few small pictures per second of the clip are checked for a face (which takes CPU time).
+        let framing: FramingResult | undefined;
+        if (options.framing === 'face') { const framingStarted = Date.now(); framing = await this.frameClip(jobId, sourcePath, range); framingMs += Date.now() - framingStarted; }
+        const clip: GeneratedClip = { id: clipId, jobId, candidateId: candidate.id, startSeconds: range.startSeconds, endSeconds: range.endSeconds, durationSeconds: range.endSeconds - range.startSeconds, outputPath: join(jobId, outputFilename), outputFilename, status: 'queued', errorMessage: null, captionPath: null, createdAt: now, updatedAt: now, title: candidate.title, score: candidate.score, reasons: candidate.reasons, framing: framing?.note ?? null };
         await this.db.createClip(clip); await this.db.updateClip(clipId, { status: 'processing' });
         try {
           // The .srt (short phrases) is kept with the clip; the .ass is the styled version that is burned into the picture, then thrown away.
@@ -416,7 +435,7 @@ export class VideoPipeline {
             captionCount = await writeSrtCaptions(captionPath, transcript, range.startSeconds, range.endSeconds);
             styledCount = await writeAssCaptions(styledCaptionPath, transcript, range.startSeconds, range.endSeconds, captionStyle);
           }
-          const rendered = await this.clipRenderer.render({ sourcePath, startSeconds: range.startSeconds, endSeconds: range.endSeconds, outputPath, captionPath: styledCount ? styledCaptionPath : null, quality: options.quality });
+          const rendered = await this.clipRenderer.render({ sourcePath, startSeconds: range.startSeconds, endSeconds: range.endSeconds, outputPath, captionPath: styledCount ? styledCaptionPath : null, quality: options.quality, framing: framing?.followed ? framing.plan : null });
           await rm(styledCaptionPath, { force: true });
           await this.storage.upload(outputPath, clip.outputPath, 'video/mp4');
           if (captionCount) await this.storage.upload(captionPath, `${jobId}/${clipId}.srt`, 'application/x-subrip');
@@ -431,7 +450,7 @@ export class VideoPipeline {
       await this.progressWrites.get(jobId)?.catch(() => undefined);
       const stageTimings = this.clocks.get(jobId)?.finish() ?? {};
       await this.db.updateJob(jobId, { status: 'completed', stage: 'clip_extraction_complete', progress: 100, stageTimings });
-      this.logger.info({ jobId, metadata, options, stageTimingsMs: stageTimings, totalMs: totalMilliseconds(stageTimings), transcriptSegmentCount: segments.length, highlightCandidateCount: highlights.length, completedClipCount: completedCount }, 'Video processing, vertical rendering, and caption burn-in completed');
+      this.logger.info({ jobId, metadata, options, stageTimingsMs: stageTimings, totalMs: totalMilliseconds(stageTimings), transcriptSegmentCount: segments.length, highlightCandidateCount: highlights.length, completedClipCount: completedCount, ...(options.framing === 'face' ? { framingMs } : {}) }, 'Video processing, vertical rendering, and caption burn-in completed');
     } finally {
       await rm(workDir, { recursive: true, force: true });
     }

@@ -41,6 +41,9 @@ const schema = z.object({
   // A missing or malformed value is treated as "not set": a nicety like this must never stop the server from starting.
   RENDER_EXTERNAL_URL: z.string().url().optional().catch(undefined),
   KEEP_AWAKE_WHILE_PROCESSING: envFlag(true),
+  // Whether clips may follow a face (the "Follow a face" choice on the upload page). It looks at a few small pictures per second of each
+  // clip, which costs some CPU time; switch it off here if a small server cannot afford that. Off: the choice is not offered and clips are cut from the middle.
+  FACE_FRAMING_ENABLED: envFlag(true),
   CLIP_MAX_CANDIDATES: z.coerce.number().int().positive().default(3),
   CLIP_VIDEO_CODEC: z.string().default('libx264'),
   CLIP_AUDIO_CODEC: z.string().default('aac'),

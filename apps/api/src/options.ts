@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { captionStyles, clipLengthChoices, defaultJobOptions, qualityChoices, type ClipLengthChoice, type JobOptions, type QualityChoice } from './domain.js';
+import { captionStyles, clipLengthChoices, defaultJobOptions, framingChoices, qualityChoices, type ClipLengthChoice, type JobOptions, type QualityChoice } from './domain.js';
 import type { HighlightOptions } from './highlights.js';
 
 export const MAX_CLIP_COUNT = 5;
@@ -18,6 +18,7 @@ const fields = {
   clipLength: z.preprocess(blankIsMissing, z.enum(clipLengthChoices).optional()),
   quality: z.preprocess(blankIsMissing, z.enum(qualityChoices).optional()),
   captionStyle: z.preprocess(blankIsMissing, z.enum(captionStyles).optional()),
+  framing: z.preprocess(blankIsMissing, z.enum(framingChoices).optional()),
 };
 const requestSchema = z.object(fields);
 
@@ -32,7 +33,7 @@ export function parseJobOptions(input: unknown): ParsedOptions {
     const name = issue?.path[0] !== undefined ? String(issue.path[0]) : 'option';
     return { ok: false, message: `The option “${name}” is not valid${name === 'clipCount' ? ` (choose a whole number from 1 to ${MAX_CLIP_COUNT})` : ''}.` };
   }
-  return { ok: true, options: { ...defaultJobOptions, clipCount: result.data.clipCount ?? null, clipLength: result.data.clipLength ?? defaultJobOptions.clipLength, quality: result.data.quality ?? defaultJobOptions.quality, captionStyle: result.data.captionStyle ?? defaultJobOptions.captionStyle } };
+  return { ok: true, options: { ...defaultJobOptions, clipCount: result.data.clipCount ?? null, clipLength: result.data.clipLength ?? defaultJobOptions.clipLength, quality: result.data.quality ?? defaultJobOptions.quality, captionStyle: result.data.captionStyle ?? defaultJobOptions.captionStyle, framing: result.data.framing ?? defaultJobOptions.framing } };
 }
 
 /** Reads options back from the database. A value that is no longer allowed (a release that dropped a choice) falls back to its default; the others are kept. */
@@ -46,6 +47,7 @@ export function readStoredOptions(json: string | null | undefined): JobOptions {
     clipLength: oneOf(clipLengthChoices, stored.clipLength, defaultJobOptions.clipLength),
     quality: oneOf(qualityChoices, stored.quality, defaultJobOptions.quality),
     captionStyle: oneOf(captionStyles, stored.captionStyle, defaultJobOptions.captionStyle),
+    framing: oneOf(framingChoices, stored.framing, defaultJobOptions.framing),
   };
 }
 

@@ -14,6 +14,13 @@ export type QualityChoice = (typeof qualityChoices)[number];
 export const captionStyles = ['classic', 'highlight', 'pop', 'none'] as const;
 export type CaptionStyle = (typeof captionStyles)[number];
 
+/**
+ * Where the picture of a clip is cut from when the video is wider than the clip. `center`: the middle of the picture. `face`: the window follows
+ * a face (see framing.ts); where no face is found, or none can be followed, the middle is used.
+ */
+export const framingChoices = ['center', 'face'] as const;
+export type FramingChoice = (typeof framingChoices)[number];
+
 /** What the person asked for when uploading. Stored with the job so a resumed job is finished the way it was started. */
 export interface JobOptions {
   /** At most this many clips; null leaves it to the server's default (CLIP_MAX_CANDIDATES). */
@@ -21,8 +28,9 @@ export interface JobOptions {
   clipLength: ClipLengthChoice;
   quality: QualityChoice;
   captionStyle: CaptionStyle;
+  framing: FramingChoice;
 }
-export const defaultJobOptions: JobOptions = { clipCount: null, clipLength: 'auto', quality: 'hd', captionStyle: 'classic' };
+export const defaultJobOptions: JobOptions = { clipCount: null, clipLength: 'auto', quality: 'hd', captionStyle: 'classic', framing: 'center' };
 
 export interface VideoJob {
   id: string; originalFilename: string; storedFilename: string; mimeType: string; sizeBytes: number;
@@ -50,6 +58,8 @@ export interface GeneratedClip {
   /** The rule-based score (0-100) of the passage the clip was cut from, and the rules it satisfied; null / empty for older clips. */
   score: number | null;
   reasons: string[];
+  /** One line on how the picture of the clip was cut ("Followed a face, seen in 90% of the moments checked." / "Centred: no face was found..."); null when the person did not ask for face following, and for older clips. */
+  framing: string | null;
 }
 /** One spoken word with the moment it starts and ends, in seconds from the start of the video. */
 export interface TranscriptWord { text: string; startSeconds: number; endSeconds: number; }

@@ -14,6 +14,7 @@ import type { NewVideoJob, VideoJob } from './domain.js';
 import { FfmpegAdapter } from './ffmpeg.js';
 import { VideoPipeline } from './pipeline.js';
 import { createTranscriptionEngine } from './engines.js';
+import { FaceClipFramer, type ClipFramer } from './face-track.js';
 import type { TranscriptionEngine } from './transcription.js';
 import { DeterministicHighlightDetector, type HighlightOptions } from './highlights.js';
 import { FfmpegClipRenderer, isSafeClipIdentifier, resolveClipOutputPath } from './clips.js';
@@ -42,6 +43,8 @@ export interface StorageStatus {
 export interface AppOverrides {
   storage?: DurableStorage;
   transcriber?: TranscriptionEngine;
+  /** What finds a face to follow in a clip: a stand-in for tests, or `null` to switch following off. Production passes nothing and gets the real one (unless FACE_FRAMING_ENABLED says no). */
+  framer?: ClipFramer | null;
   /** Isolates the database tables in their own Postgres schema (used by tests). */
   databaseSchema?: string;
   /** How often the keep-awake check runs (default 4 minutes; tests make it fast). */
@@ -64,6 +67,9 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
   const db = await StudioDatabase.connect(config.DATABASE_URL, overrides.databaseSchema, logger);
   const transcriber = overrides.transcriber ?? createTranscriptionEngine(config);
   const highlightOptions: HighlightOptions = { minDurationSeconds: config.HIGHLIGHT_MIN_DURATION_SECONDS, maxDurationSeconds: config.HIGHLIGHT_MAX_DURATION_SECONDS, maxCandidates: config.HIGHLIGHT_MAX_CANDIDATES, overlapThreshold: config.HIGHLIGHT_OVERLAP_THRESHOLD, weights: { density: config.HIGHLIGHT_WEIGHT_DENSITY, emphasis: config.HIGHLIGHT_WEIGHT_EMPHASIS, question: config.HIGHLIGHT_WEIGHT_QUESTION, number: config.HIGHLIGHT_WEIGHT_NUMBER, contrast: config.HIGHLIGHT_WEIGHT_CONTRAST, hook: config.HIGHLIGHT_WEIGHT_HOOK, completeness: config.HIGHLIGHT_WEIGHT_COMPLETENESS, standalone: config.HIGHLIGHT_WEIGHT_STANDALONE, continuity: config.HIGHLIGHT_WEIGHT_CONTINUITY, length: config.HIGHLIGHT_WEIGHT_LENGTH } };
+  const framer: ClipFramer | undefined = overrides.framer === undefined
+    ? (config.FACE_FRAMING_ENABLED ? new FaceClipFramer({ ffmpegPath: config.FFMPEG_PATH, outputAspect: config.CLIP_VERTICAL_WIDTH / config.CLIP_VERTICAL_HEIGHT }) : undefined)
+    : overrides.framer ?? undefined;
   const renderer = new FfmpegClipRenderer(config.FFMPEG_PATH, config.CLIP_VIDEO_CODEC, config.CLIP_AUDIO_CODEC, config.CLIP_CRF, config.CLIP_PRESET, config.CLIP_VERTICAL_WIDTH, config.CLIP_VERTICAL_HEIGHT);
   const pipeline = new VideoPipeline(db, new FfmpegAdapter(config.FFPROBE_PATH, config.FFMPEG_PATH), transcriber, new DeterministicHighlightDetector(), highlightOptions, renderer, config.CLIP_MAX_CANDIDATES, config.UPLOAD_DIR, config.TEMP_DIR, config.OUTPUT_DIR, logger, durableStorage, {
     concurrency: config.JOB_CONCURRENCY,
@@ -72,7 +78,7 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
     heartbeatMs: config.JOB_HEARTBEAT_SECONDS * 1000,
     recheckMs: Math.max(1000, config.JOB_STALE_AFTER_SECONDS * 500),
     watchdogMs: Math.max(5000, config.JOB_STALE_AFTER_SECONDS * 3000),
-  });
+  }, framer);
 
   // Prove at startup (and leave a clear line in the logs) whether durable storage really works,
   // instead of finding out when the first customer's upload fails.
@@ -134,7 +140,7 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
   app.get('/', (_req, res) => res.redirect(302, '/test-upload'));
 
   app.get('/test-upload', (_req, res) => {
-    res.type('html').send(renderUploadPage({ maxUploadMb, defaultClipCount: config.CLIP_MAX_CANDIDATES, defaultClipSeconds: { min: config.HIGHLIGHT_MIN_DURATION_SECONDS, max: config.HIGHLIGHT_MAX_DURATION_SECONDS }, clipSize: { width: config.CLIP_VERTICAL_WIDTH, height: config.CLIP_VERTICAL_HEIGHT } }));
+    res.type('html').send(renderUploadPage({ maxUploadMb, defaultClipCount: config.CLIP_MAX_CANDIDATES, defaultClipSeconds: { min: config.HIGHLIGHT_MIN_DURATION_SECONDS, max: config.HIGHLIGHT_MAX_DURATION_SECONDS }, clipSize: { width: config.CLIP_VERTICAL_WIDTH, height: config.CLIP_VERTICAL_HEIGHT }, faceFraming: framer !== undefined }));
   });
 
   app.post('/test-upload', (req, res, next) => {

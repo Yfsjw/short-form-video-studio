@@ -42,6 +42,7 @@ const COLUMNS_ADDED_LATER: Array<{ table: string; name: string; definition: stri
   { table: 'generated_clips', name: 'title', definition: 'TEXT' },
   { table: 'generated_clips', name: 'score', definition: 'DOUBLE PRECISION' },
   { table: 'generated_clips', name: 'reasons_json', definition: 'TEXT' },
+  { table: 'generated_clips', name: 'framing', definition: 'TEXT' },
 ];
 
 type SqlRunner = (sql: string) => Promise<{ rows: any[] }>;
@@ -156,8 +157,8 @@ export class StudioDatabase {
 
   async createClip(clip: GeneratedClip) {
     await this.pool.query(
-      'INSERT INTO generated_clips (id, job_id, candidate_id, start_seconds, end_seconds, duration_seconds, output_path, output_filename, status, error_message, caption_path, created_at, updated_at, title, score, reasons_json) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)',
-      [clip.id, clip.jobId, clip.candidateId, clip.startSeconds, clip.endSeconds, clip.durationSeconds, clip.outputPath, clip.outputFilename, clip.status, clip.errorMessage, clip.captionPath, clip.createdAt, clip.updatedAt, clip.title, clip.score, JSON.stringify(clip.reasons)]
+      'INSERT INTO generated_clips (id, job_id, candidate_id, start_seconds, end_seconds, duration_seconds, output_path, output_filename, status, error_message, caption_path, created_at, updated_at, title, score, reasons_json, framing) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)',
+      [clip.id, clip.jobId, clip.candidateId, clip.startSeconds, clip.endSeconds, clip.durationSeconds, clip.outputPath, clip.outputFilename, clip.status, clip.errorMessage, clip.captionPath, clip.createdAt, clip.updatedAt, clip.title, clip.score, JSON.stringify(clip.reasons), clip.framing]
     );
   }
 
@@ -304,7 +305,7 @@ export class StudioDatabase {
   }
 
   private mapJob(row: any): VideoJob | undefined { if (!row) return undefined; return { id: row.id, originalFilename: row.original_filename, storedFilename: row.stored_filename, mimeType: row.mime_type, sizeBytes: Number(row.size_bytes), status: row.status as JobStatus, stage: row.stage, errorMessage: row.error_message, durationSeconds: row.duration_seconds, width: row.width, height: row.height, createdAt: row.created_at, updatedAt: row.updated_at, sourceStorageKey: row.source_storage_key ?? null, attempts: Number(row.attempts ?? 0), options: readStoredOptions(row.options_json), stageTimings: parseTimings(row.stage_timings_json), progress: Number(row.progress ?? 0) }; }
-  private mapClip(row: any): GeneratedClip | undefined { if (!row) return undefined; return { id: row.id, jobId: row.job_id, candidateId: row.candidate_id, startSeconds: row.start_seconds, endSeconds: row.end_seconds, durationSeconds: row.duration_seconds, outputPath: row.output_path, outputFilename: row.output_filename, status: row.status, errorMessage: row.error_message, captionPath: row.caption_path, createdAt: row.created_at, updatedAt: row.updated_at, title: row.title ?? null, score: typeof row.score === 'number' ? row.score : null, reasons: parseStringList(row.reasons_json) }; }
+  private mapClip(row: any): GeneratedClip | undefined { if (!row) return undefined; return { id: row.id, jobId: row.job_id, candidateId: row.candidate_id, startSeconds: row.start_seconds, endSeconds: row.end_seconds, durationSeconds: row.duration_seconds, outputPath: row.output_path, outputFilename: row.output_filename, status: row.status, errorMessage: row.error_message, captionPath: row.caption_path, createdAt: row.created_at, updatedAt: row.updated_at, title: row.title ?? null, score: typeof row.score === 'number' ? row.score : null, reasons: parseStringList(row.reasons_json), framing: row.framing ?? null }; }
   private mapTranscript(row: any): TranscriptSegment {
     const words = parseStoredWords(row.words_json);
     return { id: row.id, jobId: row.job_id, segmentIndex: row.segment_index, startSeconds: row.start_seconds, endSeconds: row.end_seconds, text: row.text, createdAt: row.created_at, ...(words ? { words } : {}) };

@@ -14,6 +14,8 @@ import { MemoryStorage, eventually, sleep } from './test-support.js';
 import type { TranscriptionEngine } from './transcription.js';
 import { DeterministicHighlightDetector } from './highlights.js';
 import type { ClipRenderer, ClipRenderRequest } from './clips.js';
+import type { ClipFramer } from './face-track.js';
+import type { FramingPlan } from './framing.js';
 
 const TEST_DATABASE_URL = process.env.DATABASE_URL ?? 'postgresql://postgres:localtest@localhost:5432/studio_local_test';
 const VIDEO = 'pretend these are the bytes of an uploaded video';
@@ -35,7 +37,7 @@ function unreachableWhile(isDown: () => boolean, db: StudioDatabase): StudioData
   } });
 }
 
-async function setup(options: { highlights?: Partial<typeof highlightOptions>; storage?: DurableStorage; transcriber?: TranscriptionEngine; renderer?: ClipRenderer; runtime?: Partial<PipelineRuntimeOptions>; database?: (db: StudioDatabase) => StudioDatabase; media?: typeof fakeMedia } = {}) {
+async function setup(options: { highlights?: Partial<typeof highlightOptions>; storage?: DurableStorage; transcriber?: TranscriptionEngine; renderer?: ClipRenderer; framer?: ClipFramer; runtime?: Partial<PipelineRuntimeOptions>; database?: (db: StudioDatabase) => StudioDatabase; media?: typeof fakeMedia } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'studio-pipeline-'));
   const uploadDir = join(root, 'uploads'); const tempDir = join(root, 'tmp'); const outputDir = join(root, 'outputs');
   await Promise.all([mkdir(uploadDir), mkdir(tempDir), mkdir(outputDir)]);
@@ -47,7 +49,7 @@ async function setup(options: { highlights?: Partial<typeof highlightOptions>; s
   const logger = { info: () => undefined, error: (_fields: unknown, message?: string) => { errors.push(String(message)); } };
   const pipelines: VideoPipeline[] = [];
   const makePipeline = () => {
-    const pipeline = new VideoPipeline(options.database ? options.database(db) : db, options.media ?? fakeMedia, options.transcriber ?? speech, new DeterministicHighlightDetector(), { ...highlightOptions, ...options.highlights }, options.renderer ?? writingRenderer, 1, uploadDir, tempDir, outputDir, logger, storage, { ...fastRuntime, ...options.runtime });
+    const pipeline = new VideoPipeline(options.database ? options.database(db) : db, options.media ?? fakeMedia, options.transcriber ?? speech, new DeterministicHighlightDetector(), { ...highlightOptions, ...options.highlights }, options.renderer ?? writingRenderer, 1, uploadDir, tempDir, outputDir, logger, storage, { ...fastRuntime, ...options.runtime }, options.framer);
     pipelines.push(pipeline);
     return pipeline;
   };
@@ -154,7 +156,7 @@ test('after a restart the job resumes from the durable copy even though the disk
   try {
     await addJob(ctx, 'j2', { status: 'processing', local: false, durable: true, attempts: 1 });
     const now = new Date().toISOString();
-    await ctx.db.createClip({ id: 'old-clip', jobId: 'j2', candidateId: 'c', startSeconds: 0, endSeconds: 2, durationSeconds: 2, outputPath: 'j2/old-clip.mp4', outputFilename: 'old-clip.mp4', status: 'processing', errorMessage: null, captionPath: null, createdAt: now, updatedAt: now, title: null, score: null, reasons: [] });
+    await ctx.db.createClip({ id: 'old-clip', jobId: 'j2', candidateId: 'c', startSeconds: 0, endSeconds: 2, durationSeconds: 2, outputPath: 'j2/old-clip.mp4', outputFilename: 'old-clip.mp4', status: 'processing', errorMessage: null, captionPath: null, createdAt: now, updatedAt: now, title: null, score: null, reasons: [], framing: null });
     const storage = ctx.storage as MemoryStorage;
     storage.objects.set('j2/old-clip.mp4', Buffer.from('half-made'));
     storage.objects.set('j2/old-clip.srt', Buffer.from('half-made captions'));
@@ -657,7 +659,7 @@ test('makes the clips the way the person asked: how many, how long, with or with
   const talk = Array.from({ length: 36 }, (_, index) => ({ segmentIndex: index, startSeconds: index * 5, endSeconds: index * 5 + 5, text: index % 3 === 2 ? 'Is this the best part of all?' : `Sentence number ${index} makes a point.` }));
   const ctx = await setup({ transcriber: { transcribe: async () => talk }, renderer, media: { ...fakeMedia, probe: async () => ({ durationSeconds: 180, width: 1920, height: 1080 }) } });
   try {
-    await addJob(ctx, 'j-chosen', { options: { clipCount: 2, clipLength: 'short', quality: 'standard', captionStyle: 'none' } });
+    await addJob(ctx, 'j-chosen', { options: { clipCount: 2, clipLength: 'short', quality: 'standard', captionStyle: 'none', framing: 'center' } });
     await ctx.pipeline.run('j-chosen');
     assert.equal((await ctx.db.getJob('j-chosen'))?.status, 'completed');
     assert.equal(requests.length, 2, 'two clips were asked for');
@@ -785,5 +787,92 @@ test('a video shorter than the shortest clip still completes, with all of its sp
     assert.equal(clips[0].status, 'completed');
     assert.deepEqual([requests[0].startSeconds, requests[0].endSeconds], [0.25, 3.9], 'all of the speech, with the usual room around it');
     assert.ok(clips[0].reasons.some((reason) => /shorter than the shortest clip length/.test(reason)), 'the clip says why it is shorter than asked for');
+  } finally { await ctx.cleanup(); }
+});
+
+/** Three minutes of talk in sentences of five seconds, so there are plenty of places to cut. */
+const threeMinutes = Array.from({ length: 36 }, (_, index) => ({ segmentIndex: index, startSeconds: index * 5, endSeconds: index * 5 + 5, text: index % 3 === 2 ? 'Is this the best part of all?' : `Sentence number ${index} makes a point.` }));
+const threeMinuteVideo = { ...fakeMedia, probe: async () => ({ durationSeconds: 180, width: 1920, height: 1080 }) };
+const faceOptions: JobOptions = { ...defaultJobOptions, clipCount: 2, clipLength: 'short', captionStyle: 'none', framing: 'face' };
+const recordingRenderer = (requests: ClipRenderRequest[]): ClipRenderer => ({ render: async (request) => { requests.push(request); await writeFile(request.outputPath, 'rendered clip'); return { durationSeconds: request.endSeconds - request.startSeconds, sizeBytes: 13 }; } });
+
+test('following a face: only when asked for, each clip is checked on its own stretch of the video, the plan goes to the renderer, and the clip says what was done', async () => {
+  const requests: ClipRenderRequest[] = []; const asked: Array<{ sourcePath: string; startSeconds: number; endSeconds: number }> = [];
+  const plan: FramingPlan = { keyframes: [{ seconds: 0, position: 0.2 }, { seconds: 2, position: 0.6 }] };
+  const framer: ClipFramer = { frame: async (request) => { asked.push(request); return { followed: true, plan, seenShare: 0.8, tracksFollowed: 1, note: 'Followed a face, seen in 80% of the moments checked.' }; } };
+  const ctx = await setup({ transcriber: { transcribe: async () => threeMinutes }, renderer: recordingRenderer(requests), framer, media: threeMinuteVideo });
+  try {
+    await addJob(ctx, 'j-face', { options: faceOptions });
+    await ctx.pipeline.run('j-face');
+    assert.equal((await ctx.db.getJob('j-face'))?.status, 'completed');
+    assert.equal(requests.length, 2); assert.equal(asked.length, 2, 'one look for a face per clip');
+    for (const [index, request] of requests.entries()) {
+      assert.deepEqual(asked[index], { sourcePath: request.sourcePath, startSeconds: request.startSeconds, endSeconds: request.endSeconds }, 'the face is looked for in exactly the stretch that becomes the clip');
+      assert.deepEqual(request.framing, plan, 'the renderer is given the plan');
+    }
+    const clips = await ctx.db.listClips('j-face');
+    assert.deepEqual(clips.map((clip) => clip.framing), ['Followed a face, seen in 80% of the moments checked.', 'Followed a face, seen in 80% of the moments checked.']);
+    assert.deepEqual(ctx.errors, [], 'nothing went wrong');
+  } finally { await ctx.cleanup(); }
+});
+
+test('the middle of the picture, the default, never asks for a face and stores no note', async () => {
+  const requests: ClipRenderRequest[] = []; let asked = 0;
+  const framer: ClipFramer = { frame: async () => { asked += 1; throw new Error('must not be called'); } };
+  const ctx = await setup({ transcriber: { transcribe: async () => threeMinutes }, renderer: recordingRenderer(requests), framer, media: threeMinuteVideo });
+  try {
+    await addJob(ctx, 'j-middle', { options: { ...faceOptions, framing: 'center' } });
+    await ctx.pipeline.run('j-middle');
+    await addJob(ctx, 'j-default');
+    await ctx.pipeline.run('j-default');
+    assert.equal(asked, 0, 'a framer that is there is not used unless the person chose to follow a face');
+    assert.equal(requests.length, 3);
+    for (const request of requests) assert.equal(request.framing, null);
+    for (const id of ['j-middle', 'j-default']) for (const clip of await ctx.db.listClips(id)) assert.equal(clip.framing, null);
+    assert.deepEqual(ctx.errors, []);
+  } finally { await ctx.cleanup(); }
+});
+
+test('when no face can be followed the clip is cut from the middle, and the clip says why', async () => {
+  const requests: ClipRenderRequest[] = [];
+  const framer: ClipFramer = { frame: async () => ({ followed: false, note: 'Centred: no face was found in the video.' }) };
+  const ctx = await setup({ transcriber: { transcribe: async () => threeMinutes }, renderer: recordingRenderer(requests), framer, media: threeMinuteVideo });
+  try {
+    await addJob(ctx, 'j-noface', { options: faceOptions });
+    await ctx.pipeline.run('j-noface');
+    assert.equal((await ctx.db.getJob('j-noface'))?.status, 'completed');
+    assert.equal(requests.length, 2);
+    for (const request of requests) assert.equal(request.framing, null, 'no plan, so the plain centred cut');
+    assert.deepEqual((await ctx.db.listClips('j-noface')).map((clip) => clip.framing), ['Centred: no face was found in the video.', 'Centred: no face was found in the video.']);
+  } finally { await ctx.cleanup(); }
+});
+
+test('if looking for a face fails, the clip is still made from the middle, the failure is logged, and the person is told in plain words', async () => {
+  const requests: ClipRenderRequest[] = [];
+  const framer: ClipFramer = { frame: async () => { throw new Error('FFmpeg could not take pictures from the video (exit code 1).'); } };
+  const ctx = await setup({ transcriber: { transcribe: async () => threeMinutes }, renderer: recordingRenderer(requests), framer, media: threeMinuteVideo });
+  try {
+    await addJob(ctx, 'j-broken-framer', { options: faceOptions });
+    await ctx.pipeline.run('j-broken-framer');
+    const job = await ctx.db.getJob('j-broken-framer');
+    assert.equal(job?.status, 'completed', job?.errorMessage ?? '');
+    assert.equal(requests.length, 2); for (const request of requests) assert.equal(request.framing, null);
+    const clips = await ctx.db.listClips('j-broken-framer');
+    assert.ok(clips.every((clip) => clip.status === 'completed'), 'a problem with framing never costs the person the clip');
+    assert.deepEqual(clips.map((clip) => clip.framing), ['Centred: the video could not be checked for a face.', 'Centred: the video could not be checked for a face.']);
+    assert.deepEqual(ctx.errors, ['Looking for a face to follow failed; the clip is cut from the middle instead', 'Looking for a face to follow failed; the clip is cut from the middle instead']);
+  } finally { await ctx.cleanup(); }
+});
+
+test('on a server where following a face is switched off, asking for it still gives the clips, from the middle, with a note saying so', async () => {
+  const requests: ClipRenderRequest[] = [];
+  const ctx = await setup({ transcriber: { transcribe: async () => threeMinutes }, renderer: recordingRenderer(requests), media: threeMinuteVideo });
+  try {
+    await addJob(ctx, 'j-off', { options: faceOptions });
+    await ctx.pipeline.run('j-off');
+    assert.equal((await ctx.db.getJob('j-off'))?.status, 'completed');
+    for (const request of requests) assert.equal(request.framing, null);
+    assert.deepEqual((await ctx.db.listClips('j-off')).map((clip) => clip.framing), ['Centred: following a face is switched off on this server.', 'Centred: following a face is switched off on this server.']);
+    assert.deepEqual(ctx.errors, [], 'switched off is not an error');
   } finally { await ctx.cleanup(); }
 });

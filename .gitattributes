@@ -1,0 +1,2 @@
+# Test pictures are raw bytes: never let git treat them as text (line-ending conversion would change the pixels).
+apps/api/test-assets/*.pgm binary

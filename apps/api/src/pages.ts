@@ -75,6 +75,8 @@ export interface UploadPageInfo {
   defaultClipSeconds: { min: number; max: number };
   /** The configured clip size; the "fast" choice is derived from it. */
   clipSize: { width: number; height: number };
+  /** Whether this server can follow a face (FACE_FRAMING_ENABLED); the choice is only offered when it can. */
+  faceFraming: boolean;
 }
 
 export function renderUploadPage(info: UploadPageInfo): string {
@@ -106,7 +108,13 @@ export function renderUploadPage(info: UploadPageInfo): string {
         <option value="highlight">Phrases, the spoken word lit</option>
         <option value="pop">Big words that pop in</option>
         <option value="none">No captions</option>
+      </select></label>${info.faceFraming ? `
+    <label class="field"><span class="label">Framing</span>
+      <select name="framing">
+        <option value="center">Middle of the picture</option>
+        <option value="face">Follow a face (beta)</option>
       </select></label>
+    <div class="hint">A clip is much narrower than most videos, so only about a third of the picture fits. "Follow a face" moves the picture to keep a face in view: the most visible one, not necessarily whoever is talking. It takes a little longer.</div>` : ''}
   </details>
   <button type="submit">Upload video</button>
 </form>
@@ -153,7 +161,8 @@ export function renderJobPage(job: VideoJob, clips: GeneratedClip[], now: number
     ? readyClips.map((clip, index) => `
 <section class="card clip">
   <h2>${clip.title ? escapeHtml(clip.title) : `Clip ${index + 1}`}</h2>
-  <div class="meta">Clip ${index + 1}${length(clip) ? ` · ${length(clip)}` : ''}</div>
+  <div class="meta">Clip ${index + 1}${length(clip) ? ` · ${length(clip)}` : ''}</div>${clip.framing ? `
+  <div class="meta">${escapeHtml(clip.framing)}</div>` : ''}
   <video controls playsinline preload="metadata" src="${clipUrl(clip)}#t=0.1"></video>
   <a class="btn" href="${clipUrl(clip)}?download=1">Download clip (${length(clip)})</a>
   ${whyThisMoment(clip)}

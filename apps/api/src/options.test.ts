@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { captionStyles, defaultJobOptions } from './domain.js';
+import { captionStyles, defaultJobOptions, framingChoices } from './domain.js';
 import { highlightOptionsFor, MAX_CLIP_COUNT, outputSizeFor, parseJobOptions, readStoredOptions } from './options.js';
 
 const base = { minDurationSeconds: 20, maxDurationSeconds: 60, maxCandidates: 5, overlapThreshold: 0.65, weights: { density: 1 } };
@@ -8,11 +8,24 @@ const base = { minDurationSeconds: 20, maxDurationSeconds: 60, maxCandidates: 5,
 test('no options at all, or an untouched form, mean the defaults', () => {
   assert.deepEqual(parseJobOptions({}), { ok: true, options: defaultJobOptions });
   assert.deepEqual(parseJobOptions(undefined), { ok: true, options: defaultJobOptions });
-  assert.deepEqual(parseJobOptions({ clipCount: '', clipLength: '', quality: '', captionStyle: '' }), { ok: true, options: defaultJobOptions });
+  assert.deepEqual(parseJobOptions({ clipCount: '', clipLength: '', quality: '', captionStyle: '', framing: '' }), { ok: true, options: defaultJobOptions });
 });
 
 test('reads what the upload form sends (everything arrives as text)', () => {
-  assert.deepEqual(parseJobOptions({ clipCount: '2', clipLength: 'short', quality: 'standard', captionStyle: 'none' }), { ok: true, options: { clipCount: 2, clipLength: 'short', quality: 'standard', captionStyle: 'none' } });
+  assert.deepEqual(parseJobOptions({ clipCount: '2', clipLength: 'short', quality: 'standard', captionStyle: 'none' }), { ok: true, options: { clipCount: 2, clipLength: 'short', quality: 'standard', captionStyle: 'none', framing: 'center' } });
+  assert.deepEqual(parseJobOptions({ clipCount: '3', clipLength: 'long', quality: 'hd', captionStyle: 'pop', framing: 'face' }), { ok: true, options: { clipCount: 3, clipLength: 'long', quality: 'hd', captionStyle: 'pop', framing: 'face' } });
+});
+
+test('framing: the middle of the picture unless a face is asked for, and each choice survives being stored and read back', () => {
+  assert.deepEqual([...framingChoices], ['center', 'face']);
+  assert.equal(defaultJobOptions.framing, 'center', 'following a face is opt-in, never the default');
+  for (const framing of framingChoices) {
+    const parsed = parseJobOptions({ framing });
+    assert.deepEqual(parsed, { ok: true, options: { ...defaultJobOptions, framing } });
+    assert.equal(readStoredOptions(JSON.stringify((parsed as { options: unknown }).options)).framing, framing);
+  }
+  const face = parseJobOptions({ framing: 'face' });
+  assert.ok(face.ok && face.options.clipCount === defaultJobOptions.clipCount && face.options.captionStyle === defaultJobOptions.captionStyle, 'choosing a face leaves the other choices alone');
 });
 
 test('every caption style on offer is accepted, and each one survives being stored and read back', () => {
@@ -26,7 +39,7 @@ test('every caption style on offer is accepted, and each one survives being stor
 
 test('ignores fields it does not know, and refuses values that are not allowed with a plain message', () => {
   assert.deepEqual(parseJobOptions({ video: 'x', somethingElse: 1 }), { ok: true, options: defaultJobOptions });
-  for (const bad of [{ clipCount: '0' }, { clipCount: String(MAX_CLIP_COUNT + 1) }, { clipCount: '2.5' }, { clipCount: 'many' }, { clipLength: 'huge' }, { quality: '4k' }, { captionStyle: 'rainbow' }]) {
+  for (const bad of [{ clipCount: '0' }, { clipCount: String(MAX_CLIP_COUNT + 1) }, { clipCount: '2.5' }, { clipCount: 'many' }, { clipLength: 'huge' }, { quality: '4k' }, { captionStyle: 'rainbow' }, { framing: 'sideways' }, { framing: 'FACE' }]) {
     const result = parseJobOptions(bad);
     assert.equal(result.ok, false, JSON.stringify(bad));
     if (!result.ok) assert.match(result.message, /is not valid/);
@@ -39,8 +52,16 @@ test('options read back from the database: a value that is no longer allowed fal
   assert.deepEqual(readStoredOptions(null), defaultJobOptions);
   assert.deepEqual(readStoredOptions('not json'), defaultJobOptions);
   assert.deepEqual(readStoredOptions('[1,2]'), defaultJobOptions);
-  assert.deepEqual(readStoredOptions(JSON.stringify({ clipCount: 4, clipLength: 'gone', quality: 'standard', captionStyle: 'none' })), { clipCount: 4, clipLength: 'auto', quality: 'standard', captionStyle: 'none' });
+  assert.deepEqual(readStoredOptions(JSON.stringify({ clipCount: 4, clipLength: 'gone', quality: 'standard', captionStyle: 'none' })), { clipCount: 4, clipLength: 'auto', quality: 'standard', captionStyle: 'none', framing: 'center' });
   assert.deepEqual(readStoredOptions(JSON.stringify({ clipCount: 99 })), defaultJobOptions);
+});
+
+test('jobs stored before face framing existed, or with a framing that is no longer offered, are read as the middle of the picture', () => {
+  const before = JSON.stringify({ clipCount: 2, clipLength: 'short', quality: 'hd', captionStyle: 'highlight' });
+  assert.deepEqual(readStoredOptions(before), { clipCount: 2, clipLength: 'short', quality: 'hd', captionStyle: 'highlight', framing: 'center' });
+  assert.equal(readStoredOptions(JSON.stringify({ framing: 'gone' })).framing, 'center');
+  assert.equal(readStoredOptions(JSON.stringify({ framing: 7 })).framing, 'center');
+  assert.equal(readStoredOptions(JSON.stringify({ framing: 'face', clipCount: 99 })).framing, 'face', 'one value that is no longer allowed must not undo the others');
 });
 
 test('the chosen clip length replaces the server defaults, and enough candidates are asked for', () => {
