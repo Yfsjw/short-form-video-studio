@@ -44,6 +44,8 @@ const schema = z.object({
   // Whether clips may follow a face (the "Follow a face" choice on the upload page). It looks at a few small pictures per second of each
   // clip, which costs some CPU time; switch it off here if a small server cannot afford that. Off: the choice is not offered and clips are cut from the middle.
   FACE_FRAMING_ENABLED: envFlag(true),
+  /** One shared code that everybody must give to use the service. Unset (or blank) means the service is open. Never shown or logged. */
+  ACCESS_CODE: z.string().optional().transform((value) => value?.trim() || undefined).refine((value) => value === undefined || value.length >= 8, { message: 'must be at least 8 characters long' }),
   CLIP_MAX_CANDIDATES: z.coerce.number().int().positive().default(3),
   CLIP_VIDEO_CODEC: z.string().default('libx264'),
   CLIP_AUDIO_CODEC: z.string().default('aac'),

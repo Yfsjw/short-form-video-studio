@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { Pool } from 'pg';
-import { createApp } from './app.js';
+import { createApp, type AppOverrides } from './app.js';
 import { loadConfig } from './config.js';
 import { StudioDatabase } from './database.js';
 import type { ClipFramer } from './face-track.js';
@@ -57,7 +57,7 @@ type Studio = Awaited<ReturnType<typeof createApp>>;
 interface RunningServer { base: string; root: string; dirs: { UPLOAD_DIR: string; TEMP_DIR: string; OUTPUT_DIR: string }; studio: Studio; storage: DurableStorage; stop: () => Promise<void> }
 
 /** Boots the real app on a free port, with its own empty upload/temp/output folders (like a freshly started container). */
-async function start(options: { schema: string; storage?: DurableStorage; transcriber?: TranscriptionEngine; env?: Record<string, string>; keepAwakeIntervalMs?: number; bootRecoveryWaitMs?: number; framer?: ClipFramer | null }): Promise<RunningServer> {
+async function start(options: { schema: string; storage?: DurableStorage; transcriber?: TranscriptionEngine; env?: Record<string, string>; keepAwakeIntervalMs?: number; bootRecoveryWaitMs?: number; framer?: ClipFramer | null; extra?: AppOverrides }): Promise<RunningServer> {
   const root = await mkdtemp(join(workspace, 'server-'));
   const dirs = { UPLOAD_DIR: join(root, 'uploads'), TEMP_DIR: join(root, 'tmp'), OUTPUT_DIR: join(root, 'outputs') };
   const config = loadConfig({
@@ -68,7 +68,7 @@ async function start(options: { schema: string; storage?: DurableStorage; transc
     ...options.env,
   });
   const storage = options.storage ?? new MemoryStorage();
-  const studio = await createApp(config, { storage, transcriber: options.transcriber ?? talk, databaseSchema: options.schema, keepAwakeIntervalMs: options.keepAwakeIntervalMs, bootRecoveryWaitMs: options.bootRecoveryWaitMs, framer: options.framer });
+  const studio = await createApp(config, { storage, transcriber: options.transcriber ?? talk, databaseSchema: options.schema, keepAwakeIntervalMs: options.keepAwakeIntervalMs, bootRecoveryWaitMs: options.bootRecoveryWaitMs, framer: options.framer, ...options.extra });
   const server = createServer(studio.app).listen(0, '127.0.0.1');
   await new Promise<void>((resolve) => server.once('listening', resolve));
   let stopped = false;
@@ -621,4 +621,187 @@ test('with KEEP_AWAKE_WHILE_PROCESSING switched off the instance never requests 
     socket.destroy();
     assert.equal(door.knocks.length, 0);
   } finally { await server.stop(); await door.close(); await dropSchema(schema); }
+});
+
+// ---- The access code (ACCESS_CODE) -------------------------------------------------------------------------------------------------
+
+const ACCESS_CODE = 'blue-river-7421';
+const gated = { ACCESS_CODE };
+const noDelay = { accessFailureDelayMs: 0 };
+const manual = (headers: Record<string, string> = {}) => ({ redirect: 'manual' as const, headers });
+const login = (base: string, fields: Record<string, string>, headers: Record<string, string> = {}) => fetch(`${base}/login`, { method: 'POST', redirect: 'manual', headers: { 'content-type': 'application/x-www-form-urlencoded', ...headers }, body: new URLSearchParams(fields) });
+const cookieOf = (response: Response) => (response.headers.get('set-cookie') ?? '').split(';')[0];
+
+test('with an access code set, only the health check and the way in are open, and nothing is stored for someone without the code', async () => {
+  const schema = schemaName('gate'); const server = await start({ schema, env: gated, extra: noDelay });
+  try {
+    const health = await fetch(`${server.base}/api/health`);
+    assert.equal(health.status, 200);
+    assert.equal(((await health.json()) as { access: { codeRequired: boolean } }).access.codeRequired, true, 'the health check says whether a code is needed, and nothing more');
+
+    for (const path of ['/', '/test-upload', `/jobs/${randomUUID()}`, '/anything-else']) {
+      const response = await fetch(`${server.base}${path}`, manual());
+      assert.equal(response.status, 302, path);
+      assert.equal(response.headers.get('location'), `/login?next=${encodeURIComponent(path)}`, path);
+    }
+    for (const path of ['/api/jobs/x', '/api/jobs/x/transcript', '/api/jobs/x/highlights', `/api/jobs/${randomUUID()}/clips/${randomUUID()}`, '/api/nothing-here']) {
+      const response = await fetch(`${server.base}${path}`);
+      assert.equal(response.status, 401, path);
+      assert.equal(((await response.json()) as { error: { code: string } }).error.code, 'ACCESS_CODE_REQUIRED', path);
+      assert.match(response.headers.get('www-authenticate') ?? '', /^Bearer /);
+    }
+
+    const api = await uploadWith(server.base, '/api/jobs', Buffer.alloc(64 * 1024, 3), {});
+    assert.equal(api.status, 401);
+    const form = await uploadWith(server.base, '/test-upload', Buffer.alloc(64 * 1024, 3), {});
+    assert.equal(form.status, 401);
+    assert.match(await form.text(), /Access code needed/);
+    const youtube = await fetch(`${server.base}/api/youtube`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"url":"https://example.test/v"}' });
+    assert.equal(youtube.status, 401);
+    assert.deepEqual(await readdir(server.dirs.UPLOAD_DIR), [], 'nothing was written for somebody who has not given the code');
+    assert.equal((await server.studio.db.listUnfinishedJobs()).length, 0);
+  } finally { await server.stop(); await dropSchema(schema); }
+});
+
+test('typing the right code opens the door for a month, a wrong one does not, the page it leads to is a place on this server, and logging out closes it again', async () => {
+  const schema = schemaName('login'); const server = await start({ schema, env: gated, extra: noDelay });
+  try {
+    const page = await fetch(`${server.base}/login?next=${encodeURIComponent('/jobs/abc')}`);
+    assert.equal(page.status, 200);
+    const html = await page.text();
+    assert.match(html, /<input name="code" type="password"[^>]*required/);
+    assert.match(html, /<input type="hidden" name="next" value="\/jobs\/abc">/);
+    const hostile = await (await fetch(`${server.base}/login?next=${encodeURIComponent('/x"><script>alert(1)</script>')}`)).text();
+    assert.doesNotMatch(hostile, /<script>alert/);
+    assert.match(hostile, /value="\/x&quot;&gt;&lt;script&gt;alert\(1\)&lt;\/script&gt;"/, 'what comes with the address is escaped');
+    assert.match(await (await fetch(`${server.base}/login?next=${encodeURIComponent('https://evil.example')}`)).text(), /name="next" value="\/test-upload"/, 'another site is never a destination');
+
+    const wrong = await login(server.base, { code: 'not-the-code-1', next: '/jobs/abc' });
+    assert.equal(wrong.status, 401);
+    assert.equal(wrong.headers.get('set-cookie'), null);
+    assert.match(await wrong.text(), /That code is not right/);
+
+    const right = await login(server.base, { code: ACCESS_CODE, next: '/jobs/abc' });
+    assert.equal(right.status, 303);
+    assert.equal(right.headers.get('location'), '/jobs/abc');
+    const setCookie = right.headers.get('set-cookie') ?? '';
+    assert.match(setCookie, /^studio_access=v1\.[A-Za-z0-9_-]{43}; Path=\/; Max-Age=2592000; HttpOnly; SameSite=Lax$/, 'a month, not readable by scripts, not sent along with other sites\' requests; no Secure flag on plain http');
+    assert.ok(!setCookie.includes(ACCESS_CODE), 'the cookie does not hold the code');
+    const elsewhere = await login(server.base, { code: ACCESS_CODE, next: '//evil.example/x' });
+    assert.equal(elsewhere.headers.get('location'), '/test-upload');
+
+    const cookie = cookieOf(right);
+    assert.equal((await fetch(`${server.base}/test-upload`, manual({ cookie }))).status, 200);
+    assert.equal((await fetch(`${server.base}/`, manual({ cookie }))).status, 302);
+    assert.equal((await fetch(`${server.base}/`, manual({ cookie }))).headers.get('location'), '/test-upload', 'past the door the bare address leads to the upload page again');
+    const known = await fetch(`${server.base}/api/jobs/${randomUUID()}`, { headers: { cookie } });
+    assert.equal(known.status, 404, 'past the door a missing job is just missing');
+    assert.equal(((await known.json()) as { error: { code: string } }).error.code, 'JOB_NOT_FOUND');
+    assert.equal((await fetch(`${server.base}/login`, manual({ cookie }))).status, 302, 'somebody who is in already is not asked again');
+    assert.equal((await fetch(`${server.base}/test-upload`, manual({ cookie: cookie.replace(/.$/, 'x') }))).status, 302, 'a cookie that is not the right one is no cookie');
+
+    const out = await fetch(`${server.base}/logout`, manual({ cookie }));
+    assert.equal(out.status, 302);
+    assert.equal(out.headers.get('location'), '/login');
+    assert.match(out.headers.get('set-cookie') ?? '', /^studio_access=; Path=\/; Max-Age=0;/);
+  } finally { await server.stop(); await dropSchema(schema); }
+});
+
+test('programs can give the code in a header instead of a cookie, and a wrong one gets nothing', async () => {
+  const schema = schemaName('bearer'); const server = await start({ schema, env: gated, extra: noDelay });
+  try {
+    const id = randomUUID();
+    const accepted: Record<string, string>[] = [{ authorization: `Bearer ${ACCESS_CODE}` }, { authorization: `bearer ${ACCESS_CODE}` }, { 'x-access-code': ACCESS_CODE }];
+    for (const [index, headers] of accepted.entries()) {
+      const response = await fetch(`${server.base}/api/jobs/${id}`, { headers });
+      assert.equal(response.status, 404, `accepted form ${index + 1}`);
+    }
+    const refusedForms: Record<string, string>[] = [{ authorization: 'Bearer not-the-code-1' }, { authorization: ACCESS_CODE }, { 'x-access-code': 'not-the-code-1' }, { authorization: `Basic ${ACCESS_CODE}` }];
+    for (const [index, headers] of refusedForms.entries()) {
+      const response = await fetch(`${server.base}/api/jobs/${id}`, { headers });
+      assert.equal(response.status, 401, `refused form ${index + 1}`);
+    }
+    const refused = await fetch(`${server.base}/api/jobs/${id}?code=${ACCESS_CODE}`);
+    assert.equal(refused.status, 401, 'the code in an address is never accepted: addresses end up in histories and logs');
+    const upload = await uploadWith(server.base, '/api/jobs', Buffer.alloc(64 * 1024, 3), {});
+    assert.equal(upload.status, 401);
+  } finally { await server.stop(); await dropSchema(schema); }
+});
+
+test('after ten wrong codes an address has to wait, even with the right one', async () => {
+  const schema = schemaName('throttle'); const server = await start({ schema, env: gated, extra: noDelay });
+  try {
+    for (let attempt = 1; attempt <= 10; attempt += 1) assert.equal((await login(server.base, { code: `wrong-code-${attempt}` })).status, 401, `attempt ${attempt}`);
+    const blocked = await login(server.base, { code: ACCESS_CODE });
+    assert.equal(blocked.status, 429);
+    assert.ok(Number(blocked.headers.get('retry-after')) > 14 * 60 && Number(blocked.headers.get('retry-after')) <= 15 * 60);
+    assert.equal(blocked.headers.get('set-cookie'), null, 'not even the right code opens the door while it has to wait');
+    assert.match(await blocked.text(), /Too many wrong codes\. Try again in 1[45] minutes/);
+  } finally { await server.stop(); await dropSchema(schema); }
+});
+
+test('without an access code nothing changes: no login, no cookie, everything open as before', async () => {
+  const schema = schemaName('nogate'); const server = await start({ schema });
+  try {
+    assert.equal(((await (await fetch(`${server.base}/api/health`)).json()) as { access: { codeRequired: boolean } }).access.codeRequired, false);
+    assert.equal((await fetch(`${server.base}/test-upload`, manual())).status, 200);
+    const page = await fetch(`${server.base}/login?next=${encodeURIComponent('/jobs/abc')}`, manual());
+    assert.equal(page.status, 302);
+    assert.equal(page.headers.get('location'), '/jobs/abc');
+    const posted = await login(server.base, { code: 'anything-at-all', next: '/test-upload' });
+    assert.equal(posted.status, 303);
+    assert.equal(posted.headers.get('set-cookie'), null);
+    assert.equal((await fetch(`${server.base}/api/jobs/${randomUUID()}`)).status, 404);
+  } finally { await server.stop(); await dropSchema(schema); }
+});
+
+test('behind https the cookie is marked so that it is never sent over plain http', async () => {
+  const schema = schemaName('secure'); const server = await start({ schema, env: { ...gated, RENDER_EXTERNAL_URL: 'https://studio.example.test' }, extra: noDelay });
+  try {
+    const response = await login(server.base, { code: ACCESS_CODE });
+    assert.equal(response.status, 303);
+    assert.match(response.headers.get('set-cookie') ?? '', /; HttpOnly; SameSite=Lax; Secure$/);
+  } finally { await server.stop(); await dropSchema(schema); }
+});
+
+test('a person gets in, uploads, watches the job and fetches a clip, and neither the code, the cookie nor the signed download address ever reach the logs', needsFfmpeg, async () => {
+  const schema = schemaName('gatedlogs'); const lines: string[] = [];
+  const server = await start({ schema, env: gated, extra: { ...noDelay, logLevel: 'info', logDestination: { write: (line) => { lines.push(line); } } } });
+  try {
+    await fetch(`${server.base}/test-upload`, manual());
+    const wrong = await login(server.base, { code: 'definitely-wrong-9' });
+    assert.equal(wrong.status, 401);
+    const right = await login(server.base, { code: ACCESS_CODE, next: '/test-upload' });
+    const cookie = cookieOf(right);
+    assert.match(cookie, /^studio_access=v1\./);
+
+    const form = new FormData();
+    form.append('clipCount', '1'); form.append('captionStyle', 'none');
+    form.append('video', new Blob([new Uint8Array(await readFile(sampleVideo))], { type: 'video/mp4' }), 'match.mp4');
+    const posted = await fetch(`${server.base}/test-upload`, { method: 'POST', body: form, headers: { cookie } });
+    assert.equal(posted.status, 200, 'followed to the job page, with the cookie');
+    const id = posted.url.match(/\/jobs\/([0-9a-f-]{36})$/)![1];
+    const finished = await (async () => {
+      const deadline = Date.now() + 60_000;
+      for (;;) {
+        const view = await (await fetch(`${server.base}/api/jobs/${id}`, { headers: { authorization: `Bearer ${ACCESS_CODE}` } })).json() as JobView;
+        if (view.job.status === 'completed' || view.job.status === 'failed') return view;
+        if (Date.now() > deadline) throw new Error('the job did not finish');
+        await sleep(100);
+      }
+    })();
+    assert.equal(finished.job.status, 'completed', finished.job.errorMessage ?? '');
+    await untilSettled(server);
+    const page = await (await fetch(`${server.base}/jobs/${id}`, { headers: { cookie } })).text();
+    assert.match(page, /<video controls/, 'the finished job page is shown to somebody with the cookie');
+    const clip = await fetch(`${server.base}/api/jobs/${id}/clips/${finished.clips[0].id}?download=1`, { redirect: 'manual', headers: { cookie } });
+    assert.equal(clip.status, 302);
+    assert.match(clip.headers.get('location') ?? '', /^https:\/\/storage\.test\//, 'the clip is sent on to its storage address, as before');
+
+    const everything = lines.join('');
+    assert.match(everything, /"url":"\/api\/jobs\//, 'requests are still logged');
+    assert.ok(everything.includes('[hidden]'), 'and what must not be there is replaced');
+    for (const secret of [ACCESS_CODE, 'definitely-wrong-9', cookie.split('=')[1], 'storage.test']) assert.ok(!everything.includes(secret), `a secret reached the logs: ${secret.slice(0, 12)}…`);
+    assert.match(everything, /A wrong access code was given/, 'a wrong guess is noted, without saying what was typed');
+  } finally { await server.stop(); await dropSchema(schema); }
 });

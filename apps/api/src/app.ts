@@ -20,6 +20,8 @@ import { DeterministicHighlightDetector, type HighlightOptions } from './highlig
 import { FfmpegClipRenderer, isSafeClipIdentifier, resolveClipOutputPath } from './clips.js';
 import { downloadYouTubeVideo } from './youtube.js';
 import { KeepAwake } from './keepawake.js';
+import { FailedAttemptLimiter, createAccessGate } from './access.js';
+import { installAccessGate } from './access-http.js';
 import { parseJobOptions } from './options.js';
 import { escapeHtml, renderJobPage, renderMessagePage, renderUploadPage } from './pages.js';
 
@@ -49,6 +51,11 @@ export interface AppOverrides {
   databaseSchema?: string;
   /** How often the keep-awake check runs (default 4 minutes; tests make it fast). */
   keepAwakeIntervalMs?: number;
+  /** Where the log lines go (default: the console) and how much is logged (default: LOG_LEVEL, else "info"). Tests read what is logged. */
+  logDestination?: { write(line: string): void };
+  logLevel?: string;
+  /** How long a wrong access code waits before it is answered (default 400 ms; tests make it zero). */
+  accessFailureDelayMs?: number;
   /** The longest start-up waits for the look at interrupted jobs before the server opens anyway (default 30 seconds; tests make it short). */
   bootRecoveryWaitMs?: number;
 }
@@ -63,7 +70,12 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
   mkdirSync(config.UPLOAD_DIR, { recursive: true });
   mkdirSync(config.TEMP_DIR, { recursive: true });
   mkdirSync(config.OUTPUT_DIR, { recursive: true });
-  const logger = pino({ level: process.env.LOG_LEVEL ?? 'info' });
+  // Whatever a request carries that proves who it is (the access cookie, the code in a header) or that opens a door (the signed address a clip
+  // download is sent on to) stays out of the logs: the request line of every request is logged with its headers.
+  const logger = pino({ level: overrides.logLevel ?? process.env.LOG_LEVEL ?? 'info', redact: { paths: ['req.headers.cookie', 'req.headers.authorization', 'req.headers["x-access-code"]', 'res.headers["set-cookie"]', 'res.headers.location'], censor: '[hidden]' } }, overrides.logDestination);
+  const accessGate = createAccessGate(config.ACCESS_CODE);
+  if (accessGate.enabled) logger.info('An access code is required for every page and every call except /api/health');
+  else logger.warn('No ACCESS_CODE is set: anyone who can reach this address can upload videos and see every job. Set ACCESS_CODE (at least 8 characters) before sharing the address.');
   const db = await StudioDatabase.connect(config.DATABASE_URL, overrides.databaseSchema, logger);
   const transcriber = overrides.transcriber ?? createTranscriptionEngine(config);
   const highlightOptions: HighlightOptions = { minDurationSeconds: config.HIGHLIGHT_MIN_DURATION_SECONDS, maxDurationSeconds: config.HIGHLIGHT_MAX_DURATION_SECONDS, maxCandidates: config.HIGHLIGHT_MAX_CANDIDATES, overlapThreshold: config.HIGHLIGHT_OVERLAP_THRESHOLD, weights: { density: config.HIGHLIGHT_WEIGHT_DENSITY, emphasis: config.HIGHLIGHT_WEIGHT_EMPHASIS, question: config.HIGHLIGHT_WEIGHT_QUESTION, number: config.HIGHLIGHT_WEIGHT_NUMBER, contrast: config.HIGHLIGHT_WEIGHT_CONTRAST, hook: config.HIGHLIGHT_WEIGHT_HOOK, completeness: config.HIGHLIGHT_WEIGHT_COMPLETENESS, standalone: config.HIGHLIGHT_WEIGHT_STANDALONE, continuity: config.HIGHLIGHT_WEIGHT_CONTINUITY, length: config.HIGHLIGHT_WEIGHT_LENGTH } };
@@ -125,6 +137,8 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
   // out, so neither Render's own nor the keep-awake request below can make the server look busy all by itself.
   let requestsInFlight = 0;
   const app = express();
+  // On Render the first proxy in front of the server is Render's own: believe it about the visitor's address and about https.
+  if (config.RENDER_EXTERNAL_URL) app.set('trust proxy', 1);
   app.use(cors({ origin: config.CORS_ORIGIN }));
   app.use(pinoHttp({ logger }));
   app.use((req, res, next) => {
@@ -133,6 +147,14 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
     // 'close' fires when the response is complete and also when the client goes away halfway.
     res.once('close', () => { requestsInFlight -= 1; });
     next();
+  });
+  // The access code (when one is set) comes before everything else, so that nothing is read or stored for someone who has not given it.
+  installAccessGate(app, {
+    gate: accessGate,
+    limiter: new FailedAttemptLimiter({ maxFailures: 10, windowMs: 15 * 60_000 }),
+    secureCookie: (req) => req.secure || (config.RENDER_EXTERNAL_URL?.startsWith('https://') ?? false),
+    failureDelayMs: overrides.accessFailureDelayMs ?? 400,
+    logger,
   });
   app.use(express.json({ limit: '32kb' }));
 
@@ -168,7 +190,7 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
     });
   });
 
-  app.get('/api/health', (_req, res) => res.json({ status: 'ok', service: 'short-form-video-studio', storage: storageStatus }));
+  app.get('/api/health', (_req, res) => res.json({ status: 'ok', service: 'short-form-video-studio', storage: storageStatus, access: { codeRequired: accessGate.enabled } }));
   app.post('/api/youtube', async (req, res, next) => {
     try {
       if (!config.COBALT_API_URL) return res.status(503).json({ error: { code: 'YOUTUBE_INGESTION_NOT_CONFIGURED', message: 'YouTube ingestion is not configured on this deployment.' } });

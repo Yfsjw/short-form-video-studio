@@ -24,7 +24,7 @@ const STYLE = `
   label.field{display:block;margin:0 0 14px}
   .label{display:block;font-weight:600;margin:0 0 4px}
   .hint,.muted{color:var(--muted);font-size:.9rem}
-  input[type=file],select{width:100%;padding:10px;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--text);font:inherit}
+  input[type=file],input[type=password],select{width:100%;padding:10px;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--text);font:inherit}
   details{margin:4px 0 16px}
   summary{cursor:pointer;font-weight:600;padding:6px 0}
   details[open] summary{margin-bottom:10px}
@@ -178,4 +178,19 @@ ${clipSection}
 ${timings && finished ? `<details class="card"><summary>Where the time went</summary><table>${timings}</table></details>` : ''}
 <p><a href="/test-upload">Upload another video</a></p>
 <p class="id">Job ${escapeHtml(job.id)}</p>`, { refreshSeconds: stillWorking ? 5 : undefined });
+}
+
+/** The page where the access code is typed (see access.ts). `next` is where the person goes afterwards; it has been checked by safeNextPath. */
+export function renderLoginPage(info: { next: string; problem?: 'wrong' | { waitSeconds: number } }): string {
+  const problem = info.problem === undefined ? '' : info.problem === 'wrong'
+    ? '<div class="card error">That code is not right.</div>'
+    : `<div class="card error">Too many wrong codes. Try again in ${Math.max(1, Math.ceil(info.problem.waitSeconds / 60))} minute${info.problem.waitSeconds > 60 ? 's' : ''}.</div>`;
+  return shell('Access code', `
+<h1>Access code</h1>
+<p class="lead">This service is private. Type the access code you were given.</p>${problem}
+<form class="card" action="/login" method="post">
+  <label class="field"><span class="label">Access code</span><input name="code" type="password" autocomplete="current-password" autocapitalize="off" autocorrect="off" spellcheck="false" required autofocus></label>
+  <input type="hidden" name="next" value="${escapeHtml(info.next)}">
+  <button type="submit">Open</button>
+</form>`);
 }

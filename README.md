@@ -191,6 +191,7 @@ All configuration comes from environment variables; see [`.env.example`](.env.ex
 | `HIGHLIGHT_WEIGHT_*` | Non-negative scoring weights (density, emphasis, question, number, contrast, hook, completeness, standalone, continuity, length). |
 | `COBALT_API_URL`, `COBALT_API_KEY`, `YOUTUBE_DOWNLOAD_TIMEOUT_MS` | Optional YouTube ingestion through a separately hosted [Cobalt](https://github.com/imputnet/cobalt) instance. |
 | `CORS_ORIGIN` | Allowed web-client origin. |
+| `ACCESS_CODE` | Optional shared access code (at least 8 characters; a shorter one stops the server from starting). When set, everything except `/api/health` asks for it: people type it once on `/login` and get a 30-day cookie, programs send it as `Authorization: Bearer <code>`. Unset or blank means open to anyone, as before. See [The access code](#the-access-code-optional). |
 
 ## API
 
@@ -200,7 +201,8 @@ All configuration comes from environment variables; see [`.env.example`](.env.ex
 - `GET /api/jobs/:id/transcript` — timestamped transcript segments.
 - `GET /api/jobs/:id/highlights` — ranked highlight candidates with their scoring signals.
 - `GET /api/jobs/:jobId/clips/:clipId` — redirects to a short-lived signed R2 link (add `?download=1` to force a download). In local-only mode the file is streamed from disk.
-- `GET /api/health` — `{ status, service, storage: { backend: "r2" | "local-only", selfTest, checkedAt } }`.
+- `GET /api/health` — `{ status, service, storage: { backend: "r2" | "local-only", selfTest, checkedAt }, access: { codeRequired } }`. Always open, even when an access code is set.
+- `GET /login`, `POST /login` (form field `code`, optional `next`), `GET /logout` — the way in when `ACCESS_CODE` is set; without it `/login` just sends the person on. With a code set, every other route answers `401` `ACCESS_CODE_REQUIRED` (under `/api/`) or sends the browser to `/login` until the code is given.
 - `GET /test-upload`, `POST /test-upload`, `GET /jobs/:id` — the built-in phone-friendly pages. `GET /` redirects to `/test-upload`.
 
 ### Job options
@@ -352,19 +354,56 @@ When one piece fails the others are stopped.
 
 What it costs and what it means: **the audio of every video is sent to that service**, which has its own terms, prices and limits
 (check the provider's current ones), and a service with a key that costs money is only as safe as the access to this upload page,
-which at the moment is open to anyone who can reach it (see below).
+which is open to anyone who can reach it unless an access code is set (see [The access code](#the-access-code-optional)).
 
 Evidence: the engine is tested against a stand-in service that reads the real multipart request (request shape, key header,
 options, ordering of answers, retries, failures, no key in any message) with real FFmpeg for the pauses and the pieces. It has not
 been run against a real service yet: whether OpenAI's or Groq's actual answers read the same way, their rate limits, and the speed
 and quality for real recordings are not proven.
 
+### The access code (optional)
+
+Without a code, anybody who knows the address can upload videos (each one costs processing time, storage and, with a hosted speech
+service, money) and read any job whose address they have. Setting `ACCESS_CODE` puts one shared code in front of the whole
+service. It is not an account system: there are no names, no per-person limits, and nobody can be removed without changing the
+code for everybody.
+
+- **Setting it.** Put it in the host's environment settings, never in the repository. At least 8 characters (a shorter one stops the
+  server from starting, and the message does not repeat it); several unrelated words are better than something short with symbols,
+  because the code is the only protection. Changing it logs everybody out, and removing it opens the service again.
+- **People.** Any page asks for the code on `/login`. The right code gives a cookie (`studio_access`, 30 days, `HttpOnly`,
+  `SameSite=Lax`, `Secure` when the service is served over https) and goes on to the page the person wanted, only ever a place on
+  this server. `/logout` removes the cookie.
+- **Programs.** `Authorization: Bearer <code>` or `X-Access-Code: <code>`. A code in the address (`?code=…`) is never accepted:
+  addresses end up in histories and logs.
+- **What stays open.** `/api/health` (Render's health check and the keep-awake request need it; it only says whether a code is
+  required), `/login` and `/logout`. Everything else, uploads included, is refused before anything is stored.
+- **How it is checked.** The code is compared in constant time as SHA-256 digests. The cookie does not contain the code: it is a
+  keyed fingerprint made with scrypt, so a leaked cookie cannot be turned back into the code by trying guesses quickly. After ten
+  wrong codes from one address within 15 minutes that address must wait for the window to end, even with the right code, and each
+  wrong code is answered after a short pause. Someone who is already in (cookie or header) is never affected by other people's
+  wrong guesses.
+- **Logs.** A wrong guess is logged as "A wrong access code was given" with the client address and never with what was typed. The
+  request logs replace the cookie, the `Authorization` and `X-Access-Code` headers, `Set-Cookie` and the redirect address (which is
+  the signed clip download address) with `[hidden]`.
+
+What it does not do: a clip link already handed out by `/api/jobs/:jobId/clips/:clipId` is a signed R2 address that works for an
+hour without the code, because R2 serves it, not this service. The attempt limiter lives in memory, so a restart resets it, and it
+tells people apart by the address Express reports; behind a proxy that may be an address shared by many people, and then a flood of
+wrong codes could keep new people from logging in for a while (it cannot let anyone in, and it never affects cookies or headers).
+
+Evidence: the code, the cookie, the limiter and the redaction are covered by unit tests and by end-to-end tests over real HTTP (a
+closed gate stores nothing, login and logout, cookie attributes, header forms, the throttle, no secret in the logs during a real
+upload and clip download), and the tests were mutation-checked (fifteen deliberate breakages of the gate are all caught). Not
+proven: behaviour on the live Render service with a real code, which client address Render's proxy shows, and the `Secure` cookie
+behind Render's https.
+
 ## Not implemented
 
 Speaker tracking (the optional face following follows the most visible face, not whoever is talking), semantic or LLM highlight selection, languages other than English
 out of the box (whisper.cpp needs a multilingual model instead of the English-only `ggml-base.en` that `setup:whisper` downloads and
 `TRANSCRIPTION_LANGUAGE` set to the language code; the hosted engine above can take other languages but has not been tried with one; and the
-caption font only covers Latin, Greek and Cyrillic), user accounts and authentication (**anyone who can reach the service can upload**), per-user quotas,
+caption font only covers Latin, Greek and Cyrillic), user accounts and real authentication (the only protection is the optional shared [access code](#the-access-code-optional); **without it anyone who can reach the service can upload**), per-user quotas,
 malware scanning, a separate worker tier, and retention rules for generated clips. YouTube ingestion depends on a third-party Cobalt
 service whose availability and terms of use are outside this repository. Operators are responsible for having the right to
 process the videos users upload.
@@ -380,7 +419,7 @@ in the root `package.json` fetches one exact commit (`7e26d3b0…`, the one the 
 of whatever is newest, because the upstream project changes daily and a change to its command line or output would only show up
 when a customer's job reaches transcription. To move to a newer whisper.cpp, change that hash, build it, and run a real
 transcription before deploying. Set the four `R2_*` variables,
-`DATABASE_URL`, and `REQUIRE_DURABLE_STORAGE=true` there. On the free instance one real test took about 14 times the length of
+`DATABASE_URL`, and `REQUIRE_DURABLE_STORAGE=true` there, and `ACCESS_CODE` as soon as the address is shared with anybody. On the free instance one real test took about 14 times the length of
 the video (see "What the free instance has actually done"), so only short videos are practical there and a bigger instance is
 the fix. For anything beyond a single small instance use
 authenticated uploads with quotas, a separate worker tier fed by a durable queue, and resource limits.
