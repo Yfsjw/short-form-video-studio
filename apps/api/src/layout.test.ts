@@ -27,12 +27,13 @@ async function firstFrame(path: string) {
 }
 
 // Stores a copy of a video that players turn by 90 degrees when they show it, as phones do. FFmpeg 6 and later set this with -display_rotation
-// (counterclockwise); the FFmpeg 5.1 that Render installs does not have that option and knows the older `rotate` tag, which counts clockwise.
+// (counterclockwise); the FFmpeg 5.1 that Render installs does not have that option and knows the older `rotate` tag, which turns the same way
+// with the same number (CI on Debian 12 showed that 270 gives the opposite turn).
 async function turnedWhenPlayed(stored: string, turned: string) {
   try {
     await run('ffmpeg', ['-nostdin', '-y', '-v', 'error', '-display_rotation', '90', '-i', stored, '-c', 'copy', turned]);
   } catch {
-    await run('ffmpeg', ['-nostdin', '-y', '-v', 'error', '-i', stored, '-c', 'copy', '-metadata:s:v:0', 'rotate=270', turned]);
+    await run('ffmpeg', ['-nostdin', '-y', '-v', 'error', '-i', stored, '-c', 'copy', '-metadata:s:v:0', 'rotate=90', turned]);
   }
 }
 
