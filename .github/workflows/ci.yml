@@ -39,12 +39,19 @@ jobs:
           cache-dependency-path: package-lock.json
       # The end-to-end tests render real video with FFmpeg. They fail loudly in CI (instead of being skipped) when it is missing.
       - run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      # Says which FFmpeg this run has (the runner image changes now and then, and so does what it installs).
+      - run: echo "::notice title=FFmpeg of this run::$(ffmpeg -version | head -1)"
       # Installs exactly the versions in package-lock.json (and fails if package.json and the lockfile disagree), so what
       # is tested here is what Render builds. Update the lockfile on purpose, never by accident.
       - run: npm ci
       # Type-checks both apps.
       - run: npm run check
       # API tests: real PostgreSQL, real FFmpeg, real HTTP uploads. Cloudflare R2 and speech recognition are replaced by test doubles.
-      - run: npm test
+      # The output is kept so that failing tests can be shown as annotations on the run (its full log is not always reachable).
+      - run: |
+          set -o pipefail
+          npm test 2>&1 | tee test-output.txt
+      - if: failure()
+        run: node .github/scripts/show-failures.mjs test-output.txt
       # The compile step Render runs after building whisper.cpp; catches anything that only breaks in a production build.
       - run: npm run build --workspaces
