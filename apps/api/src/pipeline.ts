@@ -12,7 +12,7 @@ import type { FramingResult } from './framing.js';
 import type { GeneratedClip, VideoJob } from './domain.js';
 import { writeAssCaptions, writeSrtCaptions } from './captions.js';
 import { paddedRange } from './ranges.js';
-import { highlightOptionsFor } from './options.js';
+import { aspectRatios, highlightOptionsFor } from './options.js';
 import { StageClock, stageProgress, totalMilliseconds } from './progress.js';
 import { sourceKeyFor, StoredObjectMissingError, type DurableStorage } from './storage.js';
 
@@ -381,10 +381,10 @@ export class VideoPipeline {
    * Plans where the picture of a clip is cut from when the person asked for a face to be followed. Never fails the clip: whatever goes wrong
    * (no face, too little of one, a video that cannot be sampled, a server where this is switched off) the clip is cut from the middle, and says so.
    */
-  private async frameClip(jobId: string, sourcePath: string, range: { startSeconds: number; endSeconds: number }): Promise<FramingResult> {
+  private async frameClip(jobId: string, sourcePath: string, range: { startSeconds: number; endSeconds: number }, outputAspect: number): Promise<FramingResult> {
     if (!this.framer) return { followed: false, note: 'Centred: following a face is switched off on this server.' };
     try {
-      return await this.framer.frame({ sourcePath, startSeconds: range.startSeconds, endSeconds: range.endSeconds });
+      return await this.framer.frame({ sourcePath, startSeconds: range.startSeconds, endSeconds: range.endSeconds, outputAspect });
     } catch (error) {
       this.logger.error({ err: error, jobId }, 'Looking for a face to follow failed; the clip is cut from the middle instead');
       return { followed: false, note: 'Centred: the video could not be checked for a face.' };
@@ -424,7 +424,7 @@ export class VideoPipeline {
         const range = paddedRange(candidate.startSeconds, candidate.endSeconds, transcript, metadata.durationSeconds);
         // Only when asked for: a few small pictures per second of the clip are checked for a face (which takes CPU time).
         let framing: FramingResult | undefined;
-        if (options.framing === 'face') { const framingStarted = Date.now(); framing = await this.frameClip(jobId, sourcePath, range); framingMs += Date.now() - framingStarted; }
+        if (options.framing === 'face') { const framingStarted = Date.now(); framing = await this.frameClip(jobId, sourcePath, range, aspectRatios[options.aspect]); framingMs += Date.now() - framingStarted; }
         const clip: GeneratedClip = { id: clipId, jobId, candidateId: candidate.id, startSeconds: range.startSeconds, endSeconds: range.endSeconds, durationSeconds: range.endSeconds - range.startSeconds, outputPath: join(jobId, outputFilename), outputFilename, status: 'queued', errorMessage: null, captionPath: null, createdAt: now, updatedAt: now, title: candidate.title, score: candidate.score, reasons: candidate.reasons, framing: framing?.note ?? null };
         await this.db.createClip(clip); await this.db.updateClip(clipId, { status: 'processing' });
         try {
@@ -433,9 +433,9 @@ export class VideoPipeline {
           let captionCount = 0; let styledCount = 0;
           if (captionStyle !== 'none') {
             captionCount = await writeSrtCaptions(captionPath, transcript, range.startSeconds, range.endSeconds);
-            styledCount = await writeAssCaptions(styledCaptionPath, transcript, range.startSeconds, range.endSeconds, captionStyle);
+            styledCount = await writeAssCaptions(styledCaptionPath, transcript, range.startSeconds, range.endSeconds, captionStyle, options.aspect);
           }
-          const rendered = await this.clipRenderer.render({ sourcePath, startSeconds: range.startSeconds, endSeconds: range.endSeconds, outputPath, captionPath: styledCount ? styledCaptionPath : null, quality: options.quality, framing: framing?.followed ? framing.plan : null, layout: options.framing === 'fit' ? 'fit' : 'fill' });
+          const rendered = await this.clipRenderer.render({ sourcePath, startSeconds: range.startSeconds, endSeconds: range.endSeconds, outputPath, captionPath: styledCount ? styledCaptionPath : null, quality: options.quality, aspect: options.aspect, framing: framing?.followed ? framing.plan : null, layout: options.framing === 'fit' ? 'fit' : 'fill' });
           await rm(styledCaptionPath, { force: true });
           await this.storage.upload(outputPath, clip.outputPath, 'video/mp4');
           if (captionCount) await this.storage.upload(captionPath, `${jobId}/${clipId}.srt`, 'application/x-subrip');

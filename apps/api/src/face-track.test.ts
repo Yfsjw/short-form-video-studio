@@ -80,6 +80,22 @@ test('a face walking across the picture is followed across it, smoothly', async 
   assert.match(result.note, /^Followed a face, seen in \d+% of the moments checked/);
 });
 
+test('the shape of a clip can be given with the request: a landscape clip from a landscape video has nothing to follow, a square one has a wider window to move', async () => {
+  const landscape = await framer().frame({ sourcePath: video('walker.mp4'), startSeconds: 0, endSeconds: 10, outputAspect: 16 / 9 });
+  assert.equal(landscape.followed, false);
+  assert.match(landscape.note, /nothing to follow/);
+
+  const vertical = await framer().frame({ sourcePath: video('walker.mp4'), startSeconds: 0, endSeconds: 10 });
+  const square = await framer().frame({ sourcePath: video('walker.mp4'), startSeconds: 0, endSeconds: 10, outputAspect: 1 });
+  assert.ok(vertical.followed && square.followed);
+  // The face starts the walk a quarter of the way across the picture. A window a third of the picture wide can be centred on it; one more than half of the
+  // picture wide cannot (its middle cannot be nearer the edge than a quarter of its width), so it has to stand against the left edge. The walk ends nearer the
+  // right edge for the wider window as well.
+  assert.ok(positionAt(vertical.plan.keyframes, 0) > 0.03, `${positionAt(vertical.plan.keyframes, 0)}`);
+  assert.ok(positionAt(square.plan.keyframes, 0) < 0.02, `${positionAt(square.plan.keyframes, 0)}`);
+  assert.ok(positionAt(square.plan.keyframes, 10) > positionAt(vertical.plan.keyframes, 10), `${positionAt(square.plan.keyframes, 10)} against ${positionAt(vertical.plan.keyframes, 10)}`);
+});
+
 test('a picture without a face leaves the clip centred and says so', async () => {
   const result = await framer().frame({ sourcePath: video('empty.mp4'), startSeconds: 0, endSeconds: 6 });
   assert.equal(result.followed, false);

@@ -3,7 +3,7 @@ import { rm, stat } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
-import type { QualityChoice } from './domain.js';
+import type { AspectChoice, QualityChoice } from './domain.js';
 import { cropXExpression, type FramingPlan } from './framing.js';
 import { outputSizeFor } from './options.js';
 
@@ -19,6 +19,8 @@ export interface ClipRenderRequest {
   sourcePath: string; startSeconds: number; endSeconds: number; outputPath: string; captionPath?: string | null;
   /** `standard` renders at two thirds of the configured size; the default is the configured size. */
   quality?: QualityChoice;
+  /** The shape of the clip; the default is vertical (9:16), the shape the renderer is configured with. */
+  aspect?: AspectChoice;
   /** Where the picture of the clip is cut from when the video is wider than the clip: a path over the clip's own time (see framing.ts). Without it, from the middle. */
   framing?: FramingPlan | null;
   /** `fill` (the default) cuts the clip out of the picture; `fit` shows the whole picture over a blurred copy of itself and cuts nothing off (a framing plan is then not used). */
@@ -28,7 +30,7 @@ export interface RenderedClip { durationSeconds: number; sizeBytes: number; }
 export interface ClipRenderer { render(request: ClipRenderRequest): Promise<RenderedClip>; }
 export type FfmpegRunner = (binary: string, arguments_: string[], options: { maxBuffer: number; timeout: number; cwd: string }) => Promise<void>;
 
-/** FFmpeg renderer for platform-ready 9:16 MP4 clips with optional burned-in captions. */
+/** FFmpeg renderer for platform-ready MP4 clips (9:16 unless another shape is asked for) with optional burned-in captions. */
 export class FfmpegClipRenderer implements ClipRenderer {
   constructor(
     private readonly ffmpegPath: string,
@@ -45,7 +47,7 @@ export class FfmpegClipRenderer implements ClipRenderer {
   async render(request: ClipRenderRequest): Promise<RenderedClip> {
     const durationSeconds = request.endSeconds - request.startSeconds;
     if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) throw new Error('Clip range must have a positive duration.');
-    const size = outputSizeFor({ width: this.verticalWidth, height: this.verticalHeight }, request.quality ?? 'hd');
+    const size = outputSizeFor({ width: this.verticalWidth, height: this.verticalHeight }, request.quality ?? 'hd', request.aspect ?? 'vertical');
     const videoFilter = this.buildVideoFilter(request.captionPath, size, request.framing, request.layout);
     const args = [
       // `-ss` goes BEFORE `-i` on purpose. Placed after it, FFmpeg decodes everything from the start of the file and cuts at the very end

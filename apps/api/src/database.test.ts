@@ -36,7 +36,7 @@ test('a job keeps the options it was created with, and its progress and stage ti
   await db.createJob({ ...makeJob('plain', 'queued') });
   assert.deepEqual((await db.getJob('plain'))?.options, defaultJobOptions, 'no options chosen means the defaults');
 
-  const chosen = { clipCount: 2, clipLength: 'short', quality: 'standard', captionStyle: 'none', framing: 'face' } as const;
+  const chosen = { clipCount: 2, clipLength: 'short', quality: 'standard', captionStyle: 'none', framing: 'face', aspect: 'square' } as const;
   await db.createJob({ ...makeJob('chosen', 'queued'), options: chosen });
   assert.deepEqual((await db.getJob('chosen'))?.options, chosen);
 

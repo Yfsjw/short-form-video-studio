@@ -1,5 +1,5 @@
 import { writeFile } from 'node:fs/promises';
-import type { CaptionStyle, TranscriptWord } from './domain.js';
+import type { AspectChoice, CaptionStyle, TranscriptWord } from './domain.js';
 import { distributeWords } from './words.js';
 
 export interface CaptionSegmentInput {
@@ -132,14 +132,21 @@ export function formatSrtTime(seconds: number) {
 
 /** The name the font identifies itself by; the file is in assets/fonts. */
 export const CAPTION_FONT = 'Inter ExtraBold';
-/** The picture the sizes below are written for. Every clip is 9:16, and libass scales the captions to the real size of the picture. */
-const PLAY_WIDTH = 1080; const PLAY_HEIGHT = 1920;
+/**
+ * The picture the sizes below are written for, per shape of clip; libass scales the captions to the real size of the picture. Vertical is the
+ * shape the captions were first made for.
+ */
+export const captionCanvas: Record<AspectChoice, { width: number; height: number }> = {
+  vertical: { width: 1080, height: 1920 }, portrait: { width: 1080, height: 1350 }, square: { width: 1080, height: 1080 }, landscape: { width: 1920, height: 1080 },
+};
+const PLAY_WIDTH = captionCanvas.vertical.width;
 const WHITE = '&H00FFFFFF&'; const HIGHLIGHT = '&H0000D7FF&'; // colours are blue-green-red: this is gold
 
 interface Look {
   fontSize: number; outline: number; shadow: number; alignment: number; marginV: number;
   uppercase: boolean; highlightWord: boolean; popIn: boolean; centre?: { x: number; y: number };
 }
+/** The looks for a vertical clip. `captionLookFor` moves them to the other shapes. */
 export const captionLooks: Record<VisibleCaptionStyle, Look> = {
   // Bottom of the text about 70% of the way down: clear of the buttons and the title the apps draw over the bottom of a short video.
   classic: { fontSize: 92, outline: 8, shadow: 0, alignment: 2, marginV: 560, uppercase: false, highlightWord: false, popIn: false },
@@ -147,8 +154,33 @@ export const captionLooks: Record<VisibleCaptionStyle, Look> = {
   pop: { fontSize: 124, outline: 10, shadow: 0, alignment: 5, marginV: 0, uppercase: true, highlightWord: true, popIn: true, centre: { x: PLAY_WIDTH / 2, y: 1180 } },
 };
 
+/**
+ * Where captions go and how big they are in each shape (the vertical values are what the captions always had). Vertical: the bottom of the text is about
+ * 70% of the way down, clear of what the apps draw over a short video. The other shapes are not covered like that, so their text sits lower, but still off
+ * the edge. `scale` is the size of the text against the vertical shape: a landscape picture is wider, not taller, so its text is a little smaller.
+ */
+const placements: Record<AspectChoice, { marginV: number; popY: number; scale: number }> = {
+  vertical: { marginV: 560, popY: 1180, scale: 1 },
+  portrait: { marginV: 200, popY: 800, scale: 1 },
+  square: { marginV: 150, popY: 640, scale: 1 },
+  landscape: { marginV: 110, popY: 640, scale: 0.8 },
+};
+
+/** The look of a style in a shape of clip. */
+export function captionLookFor(style: VisibleCaptionStyle, aspect: AspectChoice): Look {
+  const look = captionLooks[style];
+  if (aspect === 'vertical') return look;
+  const place = placements[aspect]; const canvas = captionCanvas[aspect];
+  const scaled = (value: number) => Math.round(value * place.scale);
+  return {
+    ...look, fontSize: scaled(look.fontSize), outline: scaled(look.outline),
+    marginV: look.centre ? 0 : place.marginV,
+    ...(look.centre ? { centre: { x: canvas.width / 2, y: place.popY } } : {}),
+  };
+}
+
 /** The width a line may have: the picture less the side margins (and a little room for the outline). */
-const SAFE_LINE_WIDTH = PLAY_WIDTH - 2 * 80 - 20;
+const safeLineWidth = (aspect: AspectChoice) => captionCanvas[aspect].width - 2 * 80 - 20;
 /** About how wide a word is, in multiples of the font size (capitals and digits are wider than other letters in this font). */
 function widthInEm(word: string) { let total = 0; for (const letter of word) total += /[\p{Lu}0-9]/u.test(letter) ? 0.72 : 0.58; return total; }
 
@@ -181,15 +213,16 @@ export function wordSpans(chunk: CaptionChunk): Array<{ index: number | null; st
   return spans;
 }
 
-export function renderAss(chunks: CaptionChunk[], style: VisibleCaptionStyle): string {
-  const look = captionLooks[style];
+export function renderAss(chunks: CaptionChunk[], style: VisibleCaptionStyle, aspect: AspectChoice = 'vertical'): string {
+  const look = captionLookFor(style, aspect);
+  const canvas = captionCanvas[aspect];
   const header = `[Script Info]
 Title: Captions
 ScriptType: v4.00+
 WrapStyle: 0
 ScaledBorderAndShadow: yes
-PlayResX: ${PLAY_WIDTH}
-PlayResY: ${PLAY_HEIGHT}
+PlayResX: ${canvas.width}
+PlayResY: ${canvas.height}
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
@@ -203,7 +236,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
   for (const chunk of chunks) {
     const words = chunk.words.map((word) => assText(look.uppercase ? word.text.toUpperCase() : word.text));
     // Lines are broken between words, so a word wider than the picture would be cut off at its edge: such a group is set smaller.
-    const fitSize = Math.floor(SAFE_LINE_WIDTH / Math.max(...words.map(widthInEm)));
+    const fitSize = Math.floor(safeLineWidth(aspect) / Math.max(...words.map(widthInEm)));
     const size = fitSize < look.fontSize ? Math.max(36, fitSize) : null;
     const spans = look.highlightWord ? wordSpans(chunk) : [{ index: null, startSeconds: chunk.startSeconds, endSeconds: chunk.endSeconds }];
     spans.forEach((span, spanNumber) => {
@@ -218,10 +251,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 }
 
 /** Writes the styled caption file FFmpeg burns into the clip. Returns how many caption groups it holds (0: nothing was said, no file is written). */
-export async function writeAssCaptions(path: string, segments: CaptionSegmentInput[], clipStartSeconds: number, clipEndSeconds: number, style: VisibleCaptionStyle) {
+export async function writeAssCaptions(path: string, segments: CaptionSegmentInput[], clipStartSeconds: number, clipEndSeconds: number, style: VisibleCaptionStyle, aspect: AspectChoice = 'vertical') {
   const chunks = buildCaptionChunks(segments, clipStartSeconds, clipEndSeconds, style);
   if (!chunks.length) return 0;
-  await writeFile(path, renderAss(chunks, style), 'utf8');
+  await writeFile(path, renderAss(chunks, style, aspect), 'utf8');
   return chunks.length;
 }
 

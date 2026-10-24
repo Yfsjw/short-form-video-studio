@@ -7,7 +7,8 @@ import { defaultFramingSettings, planFraming, type FramingObservation, type Fram
  * (and a server where face following is switched off) can put something else in its place.
  */
 export interface ClipFramer {
-  frame(request: { sourcePath: string; startSeconds: number; endSeconds: number }): Promise<FramingResult>;
+  /** `outputAspect` (width over height of the clip) is the shape of this clip when it is not the one the framer was made for. */
+  frame(request: { sourcePath: string; startSeconds: number; endSeconds: number; outputAspect?: number }): Promise<FramingResult>;
 }
 
 /** A grey picture: one byte per pixel, row after row. */
@@ -80,7 +81,7 @@ export interface FaceFramerOptions {
 export class FaceClipFramer implements ClipFramer {
   constructor(private readonly options: FaceFramerOptions) {}
 
-  async frame(request: { sourcePath: string; startSeconds: number; endSeconds: number }): Promise<FramingResult> {
+  async frame(request: { sourcePath: string; startSeconds: number; endSeconds: number; outputAspect?: number }): Promise<FramingResult> {
     const clipSeconds = request.endSeconds - request.startSeconds;
     if (!Number.isFinite(clipSeconds) || clipSeconds <= 0) throw new Error('The stretch to look for faces in must have a positive length.');
     const cascade = await loadFaceCascade();
@@ -100,7 +101,7 @@ export class FaceClipFramer implements ClipFramer {
       await new Promise<void>((resolve) => setImmediate(resolve));
     }
     if (!observations.length) throw new Error('No picture could be taken from the video to look for faces in.');
-    return planFraming(observations, clipSeconds, this.options.outputAspect / (width / height), { ...defaultFramingSettings, ...this.options.settings });
+    return planFraming(observations, clipSeconds, (request.outputAspect ?? this.options.outputAspect) / (width / height), { ...defaultFramingSettings, ...this.options.settings });
   }
 
   /** FFmpeg's pictures of the stretch, as they arrive. */

@@ -3,7 +3,7 @@ import test from 'node:test';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildCaptionChunks, captionLooks, chunkRules, chunkWords, clipWords, formatAssTime, formatSrtTime, renderAss, wordSpans, writeAssCaptions, writeSrtCaptions, type CaptionSegmentInput, type CaptionWord } from './captions.js';
+import { buildCaptionChunks, captionCanvas, captionLookFor, captionLooks, chunkRules, chunkWords, clipWords, formatAssTime, formatSrtTime, renderAss, wordSpans, writeAssCaptions, writeSrtCaptions, type CaptionSegmentInput, type CaptionWord } from './captions.js';
 
 /** Words one after the other, each lasting `length` seconds, from `start` (so tests can say what is spoken and not worry about every time). */
 function spoken(text: string, start = 0, length = 0.4): CaptionWord[] {
@@ -178,5 +178,71 @@ test('a caption file is written only when something was said inside the clip', a
     await assert.rejects(readFile(path), /ENOENT/);
     assert.equal(await writeAssCaptions(path, SAMPLE, 0, 6, 'highlight'), 1);
     assert.match(await readFile(path, 'utf8'), /\[Events\]\nFormat: Layer/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+// The fields of the one style line of a caption file, by name.
+const styleOf = (ass: string) => {
+  const fields = /^Style: (.*)$/m.exec(ass)![1].split(',');
+  return { fontSize: Number(fields[2]), outline: Number(fields[16]), alignment: Number(fields[18]), marginV: Number(fields[21]) };
+};
+
+test('the caption file is written for the shape of the clip, and a vertical clip gets exactly the file it always got', () => {
+  for (const style of ['classic', 'highlight', 'pop'] as const) {
+    const chunks = buildCaptionChunks(SAMPLE, 0, 6, style);
+    assert.equal(renderAss(chunks, style, 'vertical'), renderAss(chunks, style), `${style}: vertical is the default`);
+    for (const aspect of ['vertical', 'portrait', 'square', 'landscape'] as const) {
+      const ass = renderAss(chunks, style, aspect);
+      const canvas = captionCanvas[aspect];
+      assert.ok(ass.includes(`PlayResX: ${canvas.width}\nPlayResY: ${canvas.height}\n`), `${style} ${aspect}: the file describes the picture it is drawn on`);
+      const look = captionLookFor(style, aspect);
+      assert.deepEqual(styleOf(ass), { fontSize: look.fontSize, outline: look.outline, alignment: look.alignment, marginV: look.marginV }, `${style} ${aspect}`);
+    }
+  }
+  assert.deepEqual(captionCanvas, { vertical: { width: 1080, height: 1920 }, portrait: { width: 1080, height: 1350 }, square: { width: 1080, height: 1080 }, landscape: { width: 1920, height: 1080 } });
+  assert.equal(captionLookFor('classic', 'vertical'), captionLooks.classic, 'the vertical look is the one that was always used');
+});
+
+test('captions keep clear of the bottom edge in every shape, a little higher where apps draw over the picture', () => {
+  // Where the bottom of the text is, as a share of the picture's height: the margin below the text is MarginV.
+  const bottomShare = (aspect: 'vertical' | 'portrait' | 'square' | 'landscape') => 1 - captionLookFor('classic', aspect).marginV / captionCanvas[aspect].height;
+  assert.ok(bottomShare('vertical') > 0.69 && bottomShare('vertical') < 0.72, 'vertical: about 70% of the way down, as before');
+  for (const aspect of ['portrait', 'square', 'landscape'] as const) {
+    assert.ok(bottomShare(aspect) > bottomShare('vertical'), `${aspect}: lower than in a vertical clip, nothing is drawn over it`);
+    assert.ok(bottomShare(aspect) < 0.92, `${aspect}: but not at the very edge`);
+  }
+  // The text is as large as it was on 1080 pixels in every shape that is 1080 wide, and a fifth smaller in the wider landscape one.
+  for (const style of ['classic', 'highlight', 'pop'] as const) {
+    for (const aspect of ['portrait', 'square'] as const) assert.equal(captionLookFor(style, aspect).fontSize, captionLooks[style].fontSize, `${style} ${aspect}`);
+    assert.equal(captionLookFor(style, 'landscape').fontSize, Math.round(captionLooks[style].fontSize * 0.8), `${style} landscape`);
+  }
+});
+
+test('pop captions are centred on the middle of the picture of each shape, a little below its centre', () => {
+  for (const aspect of ['vertical', 'portrait', 'square', 'landscape'] as const) {
+    const canvas = captionCanvas[aspect];
+    const lines = dialogues(renderAss(buildCaptionChunks(SAMPLE, 0, 6, 'pop'), 'pop', aspect));
+    const [, x, y] = /\{\\an5\\pos\((\d+),(\d+)\)/.exec(lines[0])!.map(Number);
+    assert.equal(x, canvas.width / 2, `${aspect}: horizontally in the middle`);
+    assert.ok(y > canvas.height * 0.5 && y < canvas.height * 0.7, `${aspect}: ${y} is below the middle and above the bottom third`);
+    assert.ok(lines.every((line) => line.includes(`\\pos(${x},${y})`)), `${aspect}: every line on the same spot`);
+  }
+});
+
+test('how much of a word fits depends on how wide the picture is: a long word is set smaller in a narrow shape and keeps its size in a wide one', () => {
+  const long: CaptionSegmentInput[] = [{ startSeconds: 0, endSeconds: 3, text: 'x', words: [{ text: 'Telecommunications', startSeconds: 0, endSeconds: 1 }] }];
+  const sizeIn = (aspect: 'vertical' | 'portrait' | 'square' | 'landscape') => /\\fs(\d+)/.exec(dialogues(renderAss(buildCaptionChunks(long, 0, 3, 'classic'), 'classic', aspect))[0])?.[1];
+  assert.ok(Number(sizeIn('vertical')) < captionLooks.classic.fontSize);
+  assert.equal(sizeIn('square'), sizeIn('vertical'), 'the same width, the same room');
+  assert.equal(sizeIn('landscape'), undefined, 'a landscape picture has room for it at the normal size');
+});
+
+test('a caption file for another shape is written the same way and holds the same groups', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'studio-captions-shape-')); const path = join(root, 'clip.ass');
+  try {
+    assert.equal(await writeAssCaptions(path, SAMPLE, 0, 6, 'highlight', 'square'), 1);
+    const ass = await readFile(path, 'utf8');
+    assert.match(ass, /PlayResX: 1080\nPlayResY: 1080/);
+    assert.equal(dialogues(ass).length, dialogues(renderAss(buildCaptionChunks(SAMPLE, 0, 6, 'highlight'), 'highlight')).length);
   } finally { await rm(root, { recursive: true, force: true }); }
 });

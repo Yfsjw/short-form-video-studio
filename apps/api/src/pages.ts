@@ -81,12 +81,13 @@ export interface UploadPageInfo {
 
 export function renderUploadPage(info: UploadPageInfo): string {
   const fast = outputSizeFor(info.clipSize, 'standard');
-  const sizeText = (size: { width: number; height: number }) => `${size.width}×${size.height}`;
+  // The picture size depends on the shape chosen below (1080x1920 vertical, 1920x1080 landscape), so the choice is named by what they all share: the short side.
+  const sizeText = (size: { width: number; height: number }) => `${Math.min(size.width, size.height)}p`;
   const counts = Array.from({ length: MAX_CLIP_COUNT }, (_, index) => index + 1);
   return shell('Upload a video', `
 <h1>Upload a video</h1>
 <p class="lead">Choose a video (MP4, MOV, MKV, WebM, AVI or M4V) of up to ${info.maxUploadMb} MB.</p>
-<p class="lead">It is turned into short vertical clips with captions. The next page shows your clips as soon as they are ready.</p>
+<p class="lead">It is turned into short clips with captions (vertical, unless you choose another shape under Options). The next page shows your clips as soon as they are ready.</p>
 <form class="card" action="/test-upload" method="post" enctype="multipart/form-data">
   <label class="field"><span class="label">Video</span><input name="video" type="file" accept="video/*" required></label>
   <details>
@@ -99,6 +100,13 @@ export function renderUploadPage(info: UploadPageInfo): string {
         <option value="short">Short (${clipLengthRanges.short.min}–${clipLengthRanges.short.max} s)</option>
         <option value="medium">Medium (${clipLengthRanges.medium.min}–${clipLengthRanges.medium.max} s)</option>
         <option value="long">Long (${clipLengthRanges.long.min}–${clipLengthRanges.long.max} s)</option>
+      </select></label>
+    <label class="field"><span class="label">Shape</span>
+      <select name="aspect">
+        <option value="vertical">Vertical 9:16 (Shorts, Reels, TikTok)</option>
+        <option value="portrait">Portrait 4:5 (Instagram and Facebook posts)</option>
+        <option value="square">Square 1:1</option>
+        <option value="landscape">Landscape 16:9 (YouTube)</option>
       </select></label>
     <label class="field"><span class="label">Quality</span>
       <select name="quality"><option value="hd">Best (${sizeText(info.clipSize)})</option>${fast.width === info.clipSize.width ? '' : `<option value="standard">Faster (${sizeText(fast)})</option>`}</select></label>
@@ -115,7 +123,7 @@ export function renderUploadPage(info: UploadPageInfo): string {
         <option value="face">Follow a face (beta)</option>` : ''}
         <option value="fit">Whole picture, blurred background</option>
       </select></label>
-    <div class="hint">A clip is much narrower than most videos, so "Middle of the picture" keeps only about a third of the width. "Whole picture" keeps everything in view (good for slides, screens and sport) and fills the empty space with a blurred copy of the picture.${info.faceFraming ? ' "Follow a face" moves the picture to keep a face in view: the most visible one, not necessarily whoever is talking. It takes a little longer.' : ''}</div>
+    <div class="hint">A vertical clip is much narrower than most videos, so "Middle of the picture" keeps only about a third of the width (more for the squarer shapes, all of it for a landscape clip). "Whole picture" keeps everything in view (good for slides, screens and sport) and fills the empty space with a blurred copy of the picture.${info.faceFraming ? ' "Follow a face" moves the picture to keep a face in view: the most visible one, not necessarily whoever is talking. It takes a little longer.' : ''}</div>
   </details>
   <button type="submit">Upload video</button>
 </form>

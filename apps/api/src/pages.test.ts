@@ -57,6 +57,15 @@ test('the upload page offers "follow a face" only when the server can do it, say
   assert.match(on, /good for slides, screens and sport/);
 });
 
+test('the upload page offers the four shapes of clip, vertical first, and names the quality by what every shape shares', () => {
+  const page = renderUploadPage(uploadInfo);
+  assert.match(page, /<select name="aspect">\s*<option value="vertical">Vertical 9:16[^<]*<\/option>\s*<option value="portrait">Portrait 4:5[^<]*<\/option>\s*<option value="square">Square 1:1<\/option>\s*<option value="landscape">Landscape 16:9[^<]*<\/option>\s*<\/select>/, 'the default comes first');
+  assert.match(page, /<option value="hd">Best \(1080p\)<\/option><option value="standard">Faster \(720p\)<\/option>/, 'the size depends on the shape, so the choice is not named by one');
+  assert.doesNotMatch(page, /1080×1920|720×1280/);
+  assert.match(page, /vertical, unless you choose another shape/);
+  assert.doesNotMatch(renderUploadPage({ ...uploadInfo, clipSize: { width: 720, height: 1280 } }), /value="standard"/, 'a server already at the fast size offers no faster one');
+});
+
 test('a clip says how it was framed when it was asked to follow a face, in words that are escaped, and says nothing when nothing was asked', () => {
   const followed = renderJobPage(job(), [clip({ framing: 'Followed a face, seen in 80% of the moments checked.' })]);
   assert.match(followed, /<div class="meta">Followed a face, seen in 80% of the moments checked\.<\/div>/);

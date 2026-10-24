@@ -22,6 +22,13 @@ export type CaptionStyle = (typeof captionStyles)[number];
 export const framingChoices = ['center', 'face', 'fit'] as const;
 export type FramingChoice = (typeof framingChoices)[number];
 
+/**
+ * The shape of the clips. `vertical` (9:16) is for Shorts, Reels and TikTok and is the shape the server is configured for (CLIP_VERTICAL_WIDTH and
+ * CLIP_VERTICAL_HEIGHT); `portrait` (4:5) and `square` (1:1) are for feed posts; `landscape` (16:9) is the usual shape of a video on a computer or a TV.
+ */
+export const aspectChoices = ['vertical', 'portrait', 'square', 'landscape'] as const;
+export type AspectChoice = (typeof aspectChoices)[number];
+
 /** What the person asked for when uploading. Stored with the job so a resumed job is finished the way it was started. */
 export interface JobOptions {
   /** At most this many clips; null leaves it to the server's default (CLIP_MAX_CANDIDATES). */
@@ -30,8 +37,10 @@ export interface JobOptions {
   quality: QualityChoice;
   captionStyle: CaptionStyle;
   framing: FramingChoice;
+  /** The shape of the clips; a job stored before shapes existed is vertical, as every clip then was. */
+  aspect: AspectChoice;
 }
-export const defaultJobOptions: JobOptions = { clipCount: null, clipLength: 'auto', quality: 'hd', captionStyle: 'classic', framing: 'center' };
+export const defaultJobOptions: JobOptions = { clipCount: null, clipLength: 'auto', quality: 'hd', captionStyle: 'classic', framing: 'center', aspect: 'vertical' };
 
 export interface VideoJob {
   id: string; originalFilename: string; storedFilename: string; mimeType: string; sizeBytes: number;

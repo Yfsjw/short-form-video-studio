@@ -1,7 +1,7 @@
 # Short-Form Video Studio
 
-Turns a long video into short vertical clips with captions. Upload a video, and the service finds the most promising
-passages from the speech in it, cuts them out, reframes them to 9:16 and burns the captions in.
+Turns a long video into short clips with captions, vertical (9:16) unless another shape is chosen. Upload a video, and the service finds the most promising
+passages from the speech in it, cuts them out, reframes them to the chosen shape and burns the captions in.
 
 The pipeline is deliberately plain and inspectable: **no proprietary AI API, no invented output.** Speech recognition is a
 local `whisper.cpp` model, highlight ranking is a deterministic scoring function over the transcript, and every clip is a
@@ -11,7 +11,7 @@ real FFmpeg render of a real time range of the uploaded video. If a stage cannot
 
 ```
 upload ─► job row (Postgres) ─► video copied to Cloudflare R2 ─► ffprobe ─► audio extraction ─► whisper.cpp transcript
-      ─► highlight ranking ─► (optional: look for a face to follow) ─► FFmpeg render (9:16 crop + burned-in captions) ─► clips uploaded to R2 ─► download link
+      ─► highlight ranking ─► (optional: look for a face to follow) ─► FFmpeg render (crop to the chosen shape + burned-in captions) ─► clips uploaded to R2 ─► download link
 ```
 
 | Piece | What it is |
@@ -192,7 +192,7 @@ All configuration comes from environment variables; see [`.env.example`](.env.ex
 | `TRANSCRIPTION_API_URL`, `TRANSCRIPTION_API_KEY`, `TRANSCRIPTION_API_MODEL` | Only for `openai_compatible`: the service's base address (ending in `/v1`), its key (never logged, never shown in a message) and the model (default `whisper-1`). The address and key are required when that engine is chosen. |
 | `TRANSCRIPTION_CHUNK_SECONDS`, `TRANSCRIPTION_API_CONCURRENCY`, `TRANSCRIPTION_API_TIMEOUT_MS` | Only for `openai_compatible`: about how many seconds of audio go in one request (default 600), how many requests run at once (default 3) and the time limit of one request (default 300000 ms). |
 | `CLIP_MAX_CANDIDATES` | Highest-ranked candidates rendered per job (default 3). |
-| `CLIP_VERTICAL_WIDTH`, `CLIP_VERTICAL_HEIGHT` | Output size; must be 9:16 (default 1080×1920). |
+| `CLIP_VERTICAL_WIDTH`, `CLIP_VERTICAL_HEIGHT` | Output size of a vertical clip; must be 9:16 (default 1080×1920). The other shapes are worked out from it (see `aspect` under [Job options](#job-options)). |
 | `CLIP_VIDEO_CODEC`, `CLIP_AUDIO_CODEC`, `CLIP_CRF`, `CLIP_PRESET` | FFmpeg encoding (defaults `libx264`, `aac`, 23, `veryfast`). |
 | `FACE_FRAMING_ENABLED` | `false` removes the "Follow a face" choice from the upload page and makes every clip be cut from the middle (default `true`; a person still has to choose it per video). Anything other than a clear yes/no is rejected. See [Following a face](#following-a-face-beta-opt-in). |
 | `TOOLCHAIN_CHECK_ENABLED` | `false` switches off the start-up check of the video tools (default `true`). See [Start-up check of the video tools](#start-up-check-of-the-video-tools). Anything other than a clear yes/no is rejected. |
@@ -224,8 +224,9 @@ is resumed after a restart is finished the way it was started.
 | --- | --- | --- |
 | `clipCount` | `1`–`5` | At most this many clips (default: `CLIP_MAX_CANDIDATES`). |
 | `clipLength` | `auto`, `short` (15–30 s), `medium` (30–60 s), `long` (60–90 s) | Length of each clip (`auto` uses `HIGHLIGHT_MIN/MAX_DURATION_SECONDS`). |
-| `quality` | `hd`, `standard` | `hd` is the configured clip size (1080×1920 by default); `standard` is two thirds of it (720×1280), which renders noticeably faster on a small server. |
-| `framing` | `center`, `face`, `fit` | How the picture is placed in the 9:16 clip. `center` (default): the middle of the picture is cut out. `face`: the window follows a face (beta, see [Following a face](#following-a-face-beta-opt-in)); costs extra processing time. `fit`: nothing is cut off: the whole picture is shown across the width of the clip, over a blurred copy of itself (good for slides, screens and sport). |
+| `aspect` | `vertical`, `portrait`, `square`, `landscape` | The shape of the clips: `vertical` 9:16 (default; Shorts, Reels, TikTok), `portrait` 4:5 and `square` 1:1 (feed posts), `landscape` 16:9 (YouTube). With the default size they are 1080×1920, 1080×1350, 1080×1080 and 1920×1080: every shape has the same short side. The captions are laid out for the shape (lower in the shapes where nothing is drawn over the picture, a little smaller in landscape), a face is followed with a window of the shape's width, and a landscape clip cut from a landscape video keeps all of it (so there is nothing for a face to be followed in). A job stored before shapes existed is vertical. |
+| `quality` | `hd`, `standard` | `hd` is the configured clip size of the shape (1080 pixels on its short side by default); `standard` is two thirds of it (720), which renders noticeably faster on a small server. |
+| `framing` | `center`, `face`, `fit` | How the picture is placed in the clip. `center` (default): the middle of the picture is cut out. `face`: the window follows a face (beta, see [Following a face](#following-a-face-beta-opt-in)); costs extra processing time. `fit`: nothing is cut off: the whole picture is shown across the width of the clip, over a blurred copy of itself (good for slides, screens and sport). |
 | `captionStyle` | `classic`, `highlight`, `pop`, `none` | `classic`: short phrases in white. `highlight`: the same phrases with the word being spoken lit in gold. `pop`: a few big upper-case words at a time, the spoken word lit, popping in. `none`: leave the picture clean. See [Captions](#captions). |
 
 ### Progress and timings
@@ -268,7 +269,7 @@ word before or after is heard (it uses the timing of every word when the transcr
 is frame-accurate and placed before the input, so the range does not depend on source keyframes, the clip's own timeline starts at
 zero (which is what the captions are counted from), and a clip deep inside a long video does not require decoding everything
 before it. FFmpeg then
-**scales the picture to fill 9:16 and crops it** (from the centre, or along the path of a face when the person chose `framing: face`),
+**scales the picture to fill the shape of the clip (9:16 unless another was chosen) and crops it** (from the centre, or along the path of a face when the person chose `framing: face`),
 burns in the captions for the words spoken inside the range (see below), and encodes H.264/AAC with `+faststart`. Without that
 choice the crop is fixed to the centre of the frame. With `framing: fit` nothing is cropped: the whole picture is scaled to the
 width of the clip and laid over a blurred copy of the same picture that fills the rest of the frame. The copy is made at an eighth

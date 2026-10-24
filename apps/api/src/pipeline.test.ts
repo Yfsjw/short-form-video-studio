@@ -659,7 +659,7 @@ test('makes the clips the way the person asked: how many, how long, with or with
   const talk = Array.from({ length: 36 }, (_, index) => ({ segmentIndex: index, startSeconds: index * 5, endSeconds: index * 5 + 5, text: index % 3 === 2 ? 'Is this the best part of all?' : `Sentence number ${index} makes a point.` }));
   const ctx = await setup({ transcriber: { transcribe: async () => talk }, renderer, media: { ...fakeMedia, probe: async () => ({ durationSeconds: 180, width: 1920, height: 1080 }) } });
   try {
-    await addJob(ctx, 'j-chosen', { options: { clipCount: 2, clipLength: 'short', quality: 'standard', captionStyle: 'none', framing: 'center' } });
+    await addJob(ctx, 'j-chosen', { options: { clipCount: 2, clipLength: 'short', quality: 'standard', captionStyle: 'none', framing: 'center', aspect: 'vertical' } });
     await ctx.pipeline.run('j-chosen');
     assert.equal((await ctx.db.getJob('j-chosen'))?.status, 'completed');
     assert.equal(requests.length, 2, 'two clips were asked for');
@@ -678,6 +678,37 @@ test('makes the clips the way the person asked: how many, how long, with or with
     assert.equal(requests[0].quality, 'hd');
     const length = requests[0].endSeconds - requests[0].startSeconds;
     assert.ok(length >= 1 && length <= 10, 'the default clip length comes from the server settings');
+  } finally { await ctx.cleanup(); }
+});
+
+test('the shape the person chose reaches the caption file, the renderer and the face follower, and without a choice the clips are the vertical ones they always were', async () => {
+  const seen: Array<{ aspect: string | undefined; canvas: string | null; layout: string | undefined }> = [];
+  const renderer: ClipRenderer = { render: async (request) => {
+    const ass = request.captionPath ? await readFile(request.captionPath, 'utf8') : '';
+    seen.push({ aspect: request.aspect, canvas: /PlayResX: (\d+)\nPlayResY: (\d+)/.exec(ass)?.slice(1).join('x') ?? null, layout: request.layout });
+    await writeFile(request.outputPath, 'rendered clip');
+    return { durationSeconds: request.endSeconds - request.startSeconds, sizeBytes: 13 };
+  } };
+  const asked: Array<number | undefined> = [];
+  const framer: ClipFramer = { frame: async (request) => { asked.push(request.outputAspect); return { followed: false, note: 'Centred: a test.' }; } };
+  const ctx = await setup({ renderer, framer });
+  try {
+    await addJob(ctx, 'j-square', { options: { ...defaultJobOptions, aspect: 'square', framing: 'face' } });
+    await ctx.pipeline.run('j-square');
+    assert.equal((await ctx.db.getJob('j-square'))?.status, 'completed');
+    assert.deepEqual(seen, [{ aspect: 'square', canvas: '1080x1080', layout: 'fill' }], 'the captions are laid out for a square picture and the renderer cuts a square one');
+    assert.deepEqual(asked, [1], 'the follower plans a window of the shape of the clip');
+
+    seen.length = 0; asked.length = 0;
+    await addJob(ctx, 'j-landscape', { options: { ...defaultJobOptions, aspect: 'landscape', framing: 'fit' } });
+    await ctx.pipeline.run('j-landscape');
+    assert.deepEqual(seen, [{ aspect: 'landscape', canvas: '1920x1080', layout: 'fit' }]);
+    assert.deepEqual(asked, [], 'nobody looks for a face unless asked to');
+
+    seen.length = 0;
+    await addJob(ctx, 'j-default');
+    await ctx.pipeline.run('j-default');
+    assert.deepEqual(seen, [{ aspect: 'vertical', canvas: '1080x1920', layout: 'fill' }]);
   } finally { await ctx.cleanup(); }
 });
 
@@ -807,7 +838,7 @@ test('following a face: only when asked for, each clip is checked on its own str
     assert.equal((await ctx.db.getJob('j-face'))?.status, 'completed');
     assert.equal(requests.length, 2); assert.equal(asked.length, 2, 'one look for a face per clip');
     for (const [index, request] of requests.entries()) {
-      assert.deepEqual(asked[index], { sourcePath: request.sourcePath, startSeconds: request.startSeconds, endSeconds: request.endSeconds }, 'the face is looked for in exactly the stretch that becomes the clip');
+      assert.deepEqual(asked[index], { sourcePath: request.sourcePath, startSeconds: request.startSeconds, endSeconds: request.endSeconds, outputAspect: 9 / 16 }, 'the face is looked for in exactly the stretch that becomes the clip, for a window of the shape of the clip');
       assert.deepEqual(request.framing, plan, 'the renderer is given the plan');
     }
     const clips = await ctx.db.listClips('j-face');
