@@ -114,11 +114,20 @@ customers. Render's documentation (October 2026) lists these web service sizes: 
 Pro 2 CPU / 4 GB. Starter has the same memory as the free plan, so it would not relieve the memory pressure; prices are on
 render.com/pricing.
 
+The start-up check of the video tools (see "Start-up check of the video tools") ran on the live service on 24 October 2026 and passed all
+eleven of its checks in 19.2 seconds: FFmpeg and ffprobe `5.1.9-0+deb12u1` (the host is Debian 12), the `libx264` and `aac` encoders, all
+six filters, the bundled caption font actually in use (not one installed on the server), whisper.cpp with a 57 MB model, and tiny real
+clips showing that captions are drawn (160 bright points), that the whole-picture layout shows the whole picture, that the crop window
+moves, and that the face follower follows the portrait of the test video across the picture (seen in 100% of the moments checked). That
+shows the tools the clips need exist and behave on that host, on three-second test clips. It says nothing about how fast a customer's
+video is made there (see above).
+
 ## Prerequisites
 
 - Node.js **22+**.
 - PostgreSQL reachable through `DATABASE_URL` (the default points at a local instance on `localhost:5432`).
-- FFmpeg, including `ffprobe`, on `PATH` (`sudo apt-get install ffmpeg`, or `brew install ffmpeg`).
+- FFmpeg, including `ffprobe`, on `PATH` (`sudo apt-get install ffmpeg`, or `brew install ffmpeg`). CI runs the whole test suite on
+  FFmpeg 5.1 (a Debian 12 container, the version Render's server has), 6.1 and 8.
 - A [whisper.cpp](https://github.com/ggml-org/whisper.cpp) `whisper-cli` executable and a GGML model such as `ggml-base.en.bin`
   (`npm run setup:whisper` builds both into `.render/`, which is where the defaults look).
 - Cloudflare R2 credentials are optional for local development (see below) and required in production.
