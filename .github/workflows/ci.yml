@@ -13,15 +13,27 @@ concurrency:
 
 jobs:
   api:
-    # Two runner images with two different FFmpeg generations: ubuntu-24.04 installs FFmpeg 6.1, ubuntu-latest (now Ubuntu 26) FFmpeg 8.
-    # The video tools are the part of this program that differs most from host to host, and the host that serves customers decides
-    # which one it gets, so a change is proven on both before it can reach main.
-    name: api (${{ matrix.os }})
+    # Three FFmpeg generations. The video tools are the part of this program that differs most from host to host, and the host that
+    # serves customers decides which one it gets, so a change is proven on all of them before it can reach main:
+    # ubuntu-24.04 installs FFmpeg 6.1, ubuntu-latest (now Ubuntu 26) FFmpeg 8, and the Debian 12 container FFmpeg 5.1, which is what
+    # Render's server has (its start-up check logged "ffmpeg 5.1.9-0+deb12u1"), so that container is the one closest to production.
+    name: api (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-latest]
+        include:
+          - name: Ubuntu 24.04, FFmpeg 6.1
+            os: ubuntu-24.04
+            db_host: localhost
+          - name: Ubuntu latest, FFmpeg 8
+            os: ubuntu-latest
+            db_host: localhost
+          - name: Debian 12, FFmpeg 5.1, as on Render
+            os: ubuntu-latest
+            container: debian:12
+            db_host: postgres
     services:
       postgres:
         image: postgres:16
@@ -37,16 +49,20 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     env:
-      DATABASE_URL: postgresql://postgres:localtest@localhost:5432/studio_local_test
+      # A job inside a container reaches the database service by its name, one on the runner itself by localhost.
+      DATABASE_URL: postgresql://postgres:localtest@${{ matrix.db_host }}:5432/studio_local_test
     steps:
+      # The end-to-end tests render real video with FFmpeg. They fail loudly in CI (instead of being skipped) when it is missing.
+      - if: matrix.container
+        run: apt-get update && apt-get install -y ffmpeg git ca-certificates
+      - if: ${{ !matrix.container }}
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: package-lock.json
-      # The end-to-end tests render real video with FFmpeg. They fail loudly in CI (instead of being skipped) when it is missing.
-      - run: sudo apt-get update && sudo apt-get install -y ffmpeg
       # Says which FFmpeg this run has (the runner image changes now and then, and so does what it installs).
       - run: echo "::notice title=FFmpeg of this run::$(ffmpeg -version | head -1)"
       # Records how this FFmpeg lays out the listings the start-up check reads (the layout changed in FFmpeg 8), so that the real text can be

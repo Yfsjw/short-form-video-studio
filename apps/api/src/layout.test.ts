@@ -26,6 +26,16 @@ async function firstFrame(path: string) {
   return (x: number, y: number) => { const at = (y * WIDTH + x) * 3; return { r: stdout[at], g: stdout[at + 1], b: stdout[at + 2] }; };
 }
 
+// Stores a copy of a video that players turn by 90 degrees when they show it, as phones do. FFmpeg 6 and later set this with -display_rotation
+// (counterclockwise); the FFmpeg 5.1 that Render installs does not have that option and knows the older `rotate` tag, which counts clockwise.
+async function turnedWhenPlayed(stored: string, turned: string) {
+  try {
+    await run('ffmpeg', ['-nostdin', '-y', '-v', 'error', '-display_rotation', '90', '-i', stored, '-c', 'copy', turned]);
+  } catch {
+    await run('ffmpeg', ['-nostdin', '-y', '-v', 'error', '-i', stored, '-c', 'copy', '-metadata:s:v:0', 'rotate=270', turned]);
+  }
+}
+
 async function bands(directory: string, size: { width: number; height: number }, name = 'bands.mp4') {
   const part = (colour: string, width: number) => ['-f', 'lavfi', '-i', `color=c=${colour}:s=${width}x${size.height}:r=10:d=2`];
   const third = Math.round(size.width / 3);
@@ -80,7 +90,7 @@ test('a video stored sideways and turned when played (as phones do) is laid out 
   try {
     const stored = await bands(directory, { width: 640, height: 360 });
     const turned = join(directory, 'turned.mp4');
-    await run('ffmpeg', ['-nostdin', '-y', '-v', 'error', '-display_rotation', '90', '-i', stored, '-c', 'copy', turned]);
+    await turnedWhenPlayed(stored, turned);
     const renderer = new FfmpegClipRenderer('ffmpeg', 'libx264', 'aac', 23, 'ultrafast', WIDTH, HEIGHT);
     await renderer.render({ sourcePath: turned, startSeconds: 0, endSeconds: 1, outputPath: join(directory, 'turned-fit.mp4'), layout: 'fit' });
     const frame = await firstFrame(join(directory, 'turned-fit.mp4'));
