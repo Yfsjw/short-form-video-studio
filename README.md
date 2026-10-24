@@ -186,6 +186,7 @@ All configuration comes from environment variables; see [`.env.example`](.env.ex
 | `CLIP_VERTICAL_WIDTH`, `CLIP_VERTICAL_HEIGHT` | Output size; must be 9:16 (default 1080×1920). |
 | `CLIP_VIDEO_CODEC`, `CLIP_AUDIO_CODEC`, `CLIP_CRF`, `CLIP_PRESET` | FFmpeg encoding (defaults `libx264`, `aac`, 23, `veryfast`). |
 | `FACE_FRAMING_ENABLED` | `false` removes the "Follow a face" choice from the upload page and makes every clip be cut from the middle (default `true`; a person still has to choose it per video). Anything other than a clear yes/no is rejected. See [Following a face](#following-a-face-beta-opt-in). |
+| `TOOLCHAIN_CHECK_ENABLED` | `false` switches off the start-up check of the video tools (default `true`). See [Start-up check of the video tools](#start-up-check-of-the-video-tools). Anything other than a clear yes/no is rejected. |
 | `HIGHLIGHT_MIN_DURATION_SECONDS`, `HIGHLIGHT_MAX_DURATION_SECONDS` | Candidate window bounds (20 and 60 s). |
 | `HIGHLIGHT_MAX_CANDIDATES`, `HIGHLIGHT_OVERLAP_THRESHOLD` | Ranked candidates kept and overlap suppression threshold (default 0.3: two clips may share at most 30 % of the shorter one, so the clips are different moments). |
 | `HIGHLIGHT_WEIGHT_*` | Non-negative scoring weights (density, emphasis, question, number, contrast, hook, completeness, standalone, continuity, length). |
@@ -201,7 +202,7 @@ All configuration comes from environment variables; see [`.env.example`](.env.ex
 - `GET /api/jobs/:id/transcript` — timestamped transcript segments.
 - `GET /api/jobs/:id/highlights` — ranked highlight candidates with their scoring signals.
 - `GET /api/jobs/:jobId/clips/:clipId` — redirects to a short-lived signed R2 link (add `?download=1` to force a download). In local-only mode the file is streamed from disk.
-- `GET /api/health` — `{ status, service, storage: { backend: "r2" | "local-only", selfTest, checkedAt }, access: { codeRequired } }`. Always open, even when an access code is set.
+- `GET /api/health` — `{ status, service, storage: { backend: "r2" | "local-only", selfTest, checkedAt }, access: { codeRequired }, toolchain: { state, checkedAt, failed } }`. Always open, even when an access code is set. `toolchain` is the result of the [start-up check of the video tools](#start-up-check-of-the-video-tools): `state` is `pending`, `running`, `passed`, `failed`, `skipped` or `disabled`, and `failed` names the checks that failed (never versions or paths).
 - `GET /login`, `POST /login` (form field `code`, optional `next`), `GET /logout` — the way in when `ACCESS_CODE` is set; without it `/login` just sends the person on. With a code set, every other route answers `401` `ACCESS_CODE_REQUIRED` (under `/api/`) or sends the browser to `/login` until the code is given.
 - `GET /test-upload`, `POST /test-upload`, `GET /jobs/:id` — the built-in phone-friendly pages. `GET /` redirects to `/test-upload`.
 
@@ -397,6 +398,39 @@ closed gate stores nothing, login and logout, cookie attributes, header forms, t
 upload and clip download), and the tests were mutation-checked (fifteen deliberate breakages of the gate are all caught). Not
 proven: behaviour on the live Render service with a real code, which client address Render's proxy shows, and the `Secure` cookie
 behind Render's https.
+
+### Start-up check of the video tools
+
+The tests prove that the code is right for the FFmpeg and whisper.cpp of the development machine and of CI. They cannot know what a
+host installs, and a host that updates FFmpeg, or builds it without the caption library, would otherwise be found out by the first
+customer's clip. So once the server is listening, and only when it has nothing else to do, it looks at the machine it really runs
+on and writes the result to the log. "Nothing else to do" means no job running and no request being handled: a check on top of a
+running job could use up the memory of the 512 MB instance, so it looks again every 20 seconds and gives up after 10 minutes (state
+`skipped`, said in the log).
+
+- FFmpeg and ffprobe start and say which version they are. The video and audio encoders named in `CLIP_VIDEO_CODEC` and `CLIP_AUDIO_CODEC`
+  and the filters the clips use (`ass`, `crop`, `scale`, `split`, `boxblur`, `overlay`) exist. The bundled caption font is installed.
+- whisper.cpp, when it is the speech engine: the program is executable and prints its usage text, and the model file is there and
+  not truncated. The model is not loaded (that needs far more memory than a small server can spare), and a hosted speech service is
+  not called (that would send audio and cost money).
+- Tiny real clips (144x256, one second) made by the very code that makes the customers' clips, judged by single pixels, because an
+  FFmpeg that ignores a filter option still produces a playable video: the captions are drawn, with the bundled font and not with one
+  that happens to be installed on the server (libass reports which it used); the whole-picture layout shows the whole picture over a
+  dark blurred copy; and a crop window planned to move from the left edge to the right does move.
+- When "Follow a face" is on offer: the real face follower watches a three-second video of a public-domain portrait (the one in
+  `apps/api/test-assets`) crossing the picture, and has to follow it across.
+
+The log gets one line, `Toolchain check passed (…)` at info level with every step (what was found, how long it took), or
+`Toolchain check FAILED: <names>` at error level. `/api/health` shows only a summary, `toolchain: { state, checkedAt, failed }`,
+because versions and paths are nobody's business but the operator's. A failed check does not make the health check fail: a host
+would restart the service for ever, and a server whose captions are broken can still make clips without them.
+`TOOLCHAIN_CHECK_ENABLED=false` switches the check off.
+
+Evidence: every step is tested against the real FFmpeg and against stand-in programs that break exactly one thing (no caption
+filter, captions silently dropped, a wrong font folder, a crop window that never moves or starts in the wrong place, a whole picture
+cut instead of fitted, a program that is not FFmpeg, a truncated model, a portrait without a face...), and eighteen deliberate
+breakages of the check itself were each caught by those tests. What the check says on the live service is shown in its log (see
+"What the free instance has actually done").
 
 ## Not implemented
 

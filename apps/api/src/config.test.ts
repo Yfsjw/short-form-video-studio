@@ -58,6 +58,14 @@ test('following a face is on by default (a person still has to ask for it per vi
   assert.throws(() => loadConfig({ FACE_FRAMING_ENABLED: 'flase' }));
 });
 
+test('the start-up check of the video tools is on by default, can be switched off, and rejects typos like the other flags', () => {
+  assert.equal(loadConfig({}).TOOLCHAIN_CHECK_ENABLED, true);
+  assert.equal(loadConfig({ TOOLCHAIN_CHECK_ENABLED: '' }).TOOLCHAIN_CHECK_ENABLED, true);
+  for (const off of ['false', 'FALSE', '0', 'no', 'off']) assert.equal(loadConfig({ TOOLCHAIN_CHECK_ENABLED: off }).TOOLCHAIN_CHECK_ENABLED, false, `"${off}" should switch it off`);
+  for (const on of ['true', '1', 'yes', 'on']) assert.equal(loadConfig({ TOOLCHAIN_CHECK_ENABLED: on }).TOOLCHAIN_CHECK_ENABLED, true);
+  assert.throws(() => loadConfig({ TOOLCHAIN_CHECK_ENABLED: 'flase' }));
+});
+
 test('the public address Render provides is used when valid, and a bad one never stops the server from starting', () => {
   assert.equal(loadConfig({}).RENDER_EXTERNAL_URL, undefined);
   assert.equal(loadConfig({ RENDER_EXTERNAL_URL: 'https://studio.onrender.com' }).RENDER_EXTERNAL_URL, 'https://studio.onrender.com');

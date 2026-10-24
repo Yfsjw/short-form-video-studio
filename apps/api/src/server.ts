@@ -2,9 +2,11 @@ import { createApp } from './app.js';
 import { loadConfig } from './config.js';
 
 const config = loadConfig();
-const { app } = await createApp(config);
+const { app, toolchain } = await createApp(config);
 const server = app.listen(config.PORT, config.HOST, () => {
   console.info(`API listening at http://${config.HOST}:${config.PORT}`);
+  // Once the server is open (and a visitor never waits for it), look at whether the video tools really work on this machine.
+  if (config.TOOLCHAIN_CHECK_ENABLED) void toolchain.run();
 });
 // Node's defaults (60s headers / 5min full-request) are tuned for typical APIs, not
 // someone uploading a large video over a slow mobile connection -- confirmed live:

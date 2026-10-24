@@ -15,6 +15,7 @@ import { FfmpegAdapter } from './ffmpeg.js';
 import { VideoPipeline } from './pipeline.js';
 import { createTranscriptionEngine } from './engines.js';
 import { FaceClipFramer, type ClipFramer } from './face-track.js';
+import { ToolchainMonitor, checkToolchain, type ToolchainReport } from './toolchain.js';
 import type { TranscriptionEngine } from './transcription.js';
 import { DeterministicHighlightDetector, type HighlightOptions } from './highlights.js';
 import { FfmpegClipRenderer, isSafeClipIdentifier, resolveClipOutputPath } from './clips.js';
@@ -58,6 +59,9 @@ export interface AppOverrides {
   accessFailureDelayMs?: number;
   /** The longest start-up waits for the look at interrupted jobs before the server opens anyway (default 30 seconds; tests make it short). */
   bootRecoveryWaitMs?: number;
+  /** What the check of the video tools does (a stand-in for tests; production passes nothing and gets the real check) and how often it looks whether the server is idle yet. */
+  toolchainCheck?: () => Promise<ToolchainReport>;
+  toolchainRetryMs?: number;
 }
 
 const DEFAULT_BOOT_RECOVERY_WAIT_MS = 30_000;
@@ -136,6 +140,19 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
   // Requests that are being handled right now (a big upload from a phone can take many minutes). Health checks are left
   // out, so neither Render's own nor the keep-awake request below can make the server look busy all by itself.
   let requestsInFlight = 0;
+  // The check of the video tools is started by whoever starts the server (server.ts), once it is listening: it waits for the server to be
+  // idle, because a memory spike on top of a running job could kill a small instance.
+  const toolchain = new ToolchainMonitor({
+    check: overrides.toolchainCheck ?? (() => checkToolchain({
+      ffmpegPath: config.FFMPEG_PATH, ffprobePath: config.FFPROBE_PATH, videoCodec: config.CLIP_VIDEO_CODEC, audioCodec: config.CLIP_AUDIO_CODEC, crf: config.CLIP_CRF, preset: config.CLIP_PRESET,
+      workDirectory: config.TEMP_DIR,
+      whisper: config.TRANSCRIPTION_ENGINE === 'whisper_cpp' ? { binaryPath: config.WHISPER_CPP_PATH, modelPath: config.WHISPER_MODEL_PATH } : null,
+      faceFollowing: framer !== undefined,
+    })),
+    isBusy: () => pipeline.activeJobCount > 0 || requestsInFlight > 0,
+    logger,
+    retryMs: overrides.toolchainRetryMs,
+  });
   const app = express();
   // On Render the first proxy in front of the server is Render's own: believe it about the visitor's address and about https.
   if (config.RENDER_EXTERNAL_URL) app.set('trust proxy', 1);
@@ -190,7 +207,7 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
     });
   });
 
-  app.get('/api/health', (_req, res) => res.json({ status: 'ok', service: 'short-form-video-studio', storage: storageStatus, access: { codeRequired: accessGate.enabled } }));
+  app.get('/api/health', (_req, res) => res.json({ status: 'ok', service: 'short-form-video-studio', storage: storageStatus, access: { codeRequired: accessGate.enabled }, toolchain: config.TOOLCHAIN_CHECK_ENABLED ? toolchain.status : { state: 'disabled', checkedAt: null, failed: [] } }));
   app.post('/api/youtube', async (req, res, next) => {
     try {
       if (!config.COBALT_API_URL) return res.status(503).json({ error: { code: 'YOUTUBE_INGESTION_NOT_CONFIGURED', message: 'YouTube ingestion is not configured on this deployment.' } });
@@ -275,6 +292,6 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
     : undefined;
   if (keepAwake) { keepAwake.start(); logger.info({ publicUrl: config.RENDER_EXTERNAL_URL }, 'While a job is processing or an upload is arriving, the instance keeps itself awake'); }
 
-  const close = async (options?: { dropSchema?: boolean }) => { keepAwake?.stop(); pipeline.close(); await db.close(options); };
-  return { app, db, pipeline, storageStatus, close };
+  const close = async (options?: { dropSchema?: boolean }) => { keepAwake?.stop(); toolchain.stop(); pipeline.close(); await db.close(options); };
+  return { app, db, pipeline, storageStatus, toolchain, close };
 }
