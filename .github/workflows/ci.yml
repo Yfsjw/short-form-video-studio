@@ -41,6 +41,19 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y ffmpeg
       # Says which FFmpeg this run has (the runner image changes now and then, and so does what it installs).
       - run: echo "::notice title=FFmpeg of this run::$(ffmpeg -version | head -1)"
+      # Records how this FFmpeg lays out the listings the start-up check reads (the layout changed in FFmpeg 8), so that the real text can be
+      # read later from the annotations of the run. It only observes: it never fails the run.
+      - continue-on-error: true
+        run: |
+          text=$( {
+            echo "-filters, first lines:"; ffmpeg -hide_banner -filters | head -8
+            echo "-filters, ass and crop:"; ffmpeg -hide_banner -filters | grep -w -E 'ass|crop' | head -4
+            echo "-encoders, libx264 and aac:"; ffmpeg -hide_banner -encoders | grep -w -E 'libx264|aac' | head -3
+            echo "-h filter=ass:"; ffmpeg -hide_banner -h filter=ass | head -2
+            echo "-h encoder=libx264:"; ffmpeg -hide_banner -h encoder=libx264 | head -2
+          } 2>&1 ) || true
+          text="${text//'%'/'%25'}"; text="${text//$'\r'/'%0D'}"; text="${text//$'\n'/'%0A'}"
+          echo "::notice title=How this FFmpeg lists its filters and encoders::${text}"
       # Installs exactly the versions in package-lock.json (and fails if package.json and the lockfile disagree), so what
       # is tested here is what Render builds. Update the lockfile on purpose, never by accident.
       - run: npm ci

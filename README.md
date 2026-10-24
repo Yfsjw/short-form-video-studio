@@ -409,7 +409,10 @@ running job could use up the memory of the 512 MB instance, so it looks again ev
 `skipped`, said in the log).
 
 - FFmpeg and ffprobe start and say which version they are. The video and audio encoders named in `CLIP_VIDEO_CODEC` and `CLIP_AUDIO_CODEC`
-  and the filters the clips use (`ass`, `crop`, `scale`, `split`, `boxblur`, `overlay`) exist. The bundled caption font is installed.
+  and the filters the clips use (`ass`, `crop`, `scale`, `split`, `boxblur`, `overlay`) exist. They are looked up in FFmpeg's own
+  listings and, when a name is not found there (the layout of the listings has changed between FFmpeg versions, and the check has
+  to be right on whichever one the host installs), FFmpeg is asked about that one name (`ffmpeg -h filter=NAME`,
+  `-h encoder=NAME`) before it is called missing. The bundled caption font is installed.
 - whisper.cpp, when it is the speech engine: the program is executable and prints its usage text, and the model file is there and
   not truncated. The model is not loaded (that needs far more memory than a small server can spare), and a hosted speech service is
   not called (that would send audio and cost money).
@@ -428,7 +431,7 @@ would restart the service for ever, and a server whose captions are broken can s
 
 Evidence: every step is tested against the real FFmpeg and against stand-in programs that break exactly one thing (no caption
 filter, captions silently dropped, a wrong font folder, a crop window that never moves or starts in the wrong place, a whole picture
-cut instead of fitted, a program that is not FFmpeg, a truncated model, a portrait without a face...), and eighteen deliberate
+cut instead of fitted, a program that is not FFmpeg, a truncated model, a portrait without a face...), and twenty-four deliberate
 breakages of the check itself were each caught by those tests. What the check says on the live service is shown in its log (see
 "What the free instance has actually done").
 

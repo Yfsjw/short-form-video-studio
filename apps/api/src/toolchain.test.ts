@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import test, { after, before } from 'node:test';
 import { promisify } from 'node:util';
 import { BUNDLED_FONTS_DIRECTORY } from './clips.js';
-import { MIN_MODEL_BYTES, REQUIRED_FILTERS, ToolchainMonitor, checkToolchain, countAtLeast, fontChosenIn, isBundledFont, listsEncoder, listsFilter, pixelAt, versionOf, type ToolchainCheckOptions, type ToolchainReport } from './toolchain.js';
+import { MIN_MODEL_BYTES, REQUIRED_FILTERS, ToolchainMonitor, checkToolchain, countAtLeast, fontChosenIn, helpShowsEncoder, helpShowsFilter, isBundledFont, listsEncoder, listsFilter, pixelAt, versionOf, type ToolchainCheckOptions, type ToolchainReport } from './toolchain.js';
 import { sleep } from './test-support.js';
 
 const run = promisify(execFile);
@@ -78,6 +78,24 @@ test('the version, the encoders and the filters are read from FFmpeg\'s own list
   assert.deepEqual([...REQUIRED_FILTERS], ['ass', 'crop', 'scale', 'split', 'boxblur', 'overlay']);
 });
 
+test('the help FFmpeg prints for one filter or encoder tells whether it exists, whatever layout the listings have', () => {
+  const assHelp = 'Filter ass\n  Render ASS subtitles onto input video using the libass library.\n    Inputs:\n       #0: default (video)\n';
+  assert.ok(helpShowsFilter(assHelp, 'ass'));
+  assert.ok(!helpShowsFilter(assHelp, 'as'));
+  assert.ok(!helpShowsFilter(assHelp, 'subtitles'));
+  assert.ok(!helpShowsFilter("Unknown filter 'ass'.\n", 'ass'));
+  assert.ok(!helpShowsFilter('', 'ass'));
+  const x264Help = 'Encoder libx264 [libx264 H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10]:\n    General capabilities: dr1 delay threads \n';
+  assert.ok(helpShowsEncoder(x264Help, 'libx264'));
+  assert.ok(!helpShowsEncoder(x264Help, 'libx26'));
+  assert.ok(!helpShowsEncoder("Codec 'libnope' is not recognized by FFmpeg.\n", 'libnope'));
+  assert.ok(!helpShowsEncoder('', 'libx264'));
+  // A listing with one more column of flags than today's is still read; one laid out in some other way is not, and is then left to the help above.
+  assert.ok(listsFilter(' TSCH ass               V->V       Render ASS subtitles onto input video using the libass library.\n', 'ass'));
+  assert.ok(listsEncoder(' V....D. libx264              libx264 H.264\n', 'libx264'));
+  assert.ok(!listsFilter('ass: Render ASS subtitles onto input video using the libass library.\n', 'ass'));
+});
+
 test('the font libass chose is recognised as the bundled one only when it is', () => {
   const faceLine = '[Parsed_ass_2 @ 0x55966d6ea440] fontselect: (Inter ExtraBold, 400, 0) -> Inter-ExtraBold, 0, Inter-ExtraBold';
   const pathLine = '[Parsed_ass_2 @ 0x1] fontselect: (Inter ExtraBold, 400, 0) -> /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf, 0, DejaVuSans';
@@ -143,7 +161,7 @@ const original = process.argv.slice(2);
 const changeArgs = ${changes.args ?? '(args) => args'};
 const changeListing = ${changes.listing ?? '(text) => text'};
 const result = spawnSync('ffmpeg', changeArgs([...original]), { maxBuffer: 256 * 1024 * 1024 });
-const listing = original.includes('-filters') || original.includes('-encoders') || original.includes('-version');
+const listing = original.includes('-filters') || original.includes('-encoders') || original.includes('-version') || original.includes('-h');
 process.stdout.write(listing ? changeListing(result.stdout.toString('utf8'), original) : result.stdout);
 process.stderr.write(result.stderr);
 process.exitCode = result.status === null ? 1 : result.status;
@@ -217,10 +235,19 @@ test('an encoder this FFmpeg does not have is named', needsFfmpeg, async () => {
 });
 
 test('an FFmpeg built without the caption library is told apart from one that has it', needsFfmpeg, async () => {
-  const withoutAss = await ffmpegThat({ listing: String.raw`(text, args) => args.includes('-filters') ? text.split('\n').filter((line) => !/\sass\s/.test(line)).join('\n') : text` });
+  // Neither the listing nor the help of the filter knows `ass`, as in a build without libass.
+  const withoutAss = await ffmpegThat({ listing: String.raw`(text, args) => args.includes('-filters') ? text.split('\n').filter((line) => !/\sass\s/.test(line)).join('\n') : args.includes('filter=ass') ? "Unknown filter 'ass'.\n" : text` });
   const report = await checkToolchain(await optionsFor({ ffmpegPath: withoutAss }));
-  assert.deepEqual(failedIn(report), ['filters'], 'only the listing was changed, so only the listing is wrong');
+  assert.deepEqual(failedIn(report), ['filters'], 'only the filters were changed, so only the filters are wrong');
   assert.match(stepOf(report, 'filters').detail, /no filter named ass \(it was built without the caption library\)/);
+});
+
+test('an FFmpeg whose listings are laid out differently (as FFmpeg 8 does) is not taken for a broken one, because the help of each filter and encoder is asked', needsFfmpeg, async () => {
+  const otherLayout = await ffmpegThat({ listing: String.raw`(text, args) => args.includes('-filters') || args.includes('-encoders') ? text.split('\n').map((line) => line.replace(/^\s*\S+\s+(\S+)\s+(.*)$/, '$1: $2')).join('\n') : text` });
+  const report = await checkToolchain(await optionsFor({ ffmpegPath: otherLayout }));
+  assert.equal(report.ok, true, JSON.stringify(report.steps.filter((step) => !step.ok)));
+  assert.equal(stepOf(report, 'filters').detail, REQUIRED_FILTERS.join(', '));
+  assert.equal(stepOf(report, 'encoders').detail, 'libx264, aac');
 });
 
 test('captions that are silently left out are caught by looking at the picture, not by whether FFmpeg complained', needsFfmpeg, async () => {

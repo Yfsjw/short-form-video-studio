@@ -67,13 +67,25 @@ const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&
 export function versionOf(text: string, program: 'ffmpeg' | 'ffprobe'): string | null {
   return new RegExp(`^${program} version (\\S+)`, 'm').exec(text)?.[1] ?? null;
 }
-/** Whether the output of `ffmpeg -encoders` lists an encoder. */
+/**
+ * Whether the output of `ffmpeg -encoders` lists an encoder. The layout of these listings has changed between FFmpeg versions (a CI run on
+ * FFmpeg 8 did not match what versions 4 to 7 print), so a name that is not found here is asked about directly with `helpShowsEncoder`
+ * before it is called missing.
+ */
 export function listsEncoder(text: string, name: string): boolean {
-  return new RegExp(`^\\s*[VAS][A-Za-z.]{5}\\s+${escapeRegExp(name)}(?:\\s|$)`, 'm').test(text);
+  return new RegExp(`^\\s*[VAS][A-Za-z.]{3,8}\\s+${escapeRegExp(name)}(?:\\s|$)`, 'm').test(text);
 }
-/** Whether the output of `ffmpeg -filters` lists a filter. */
+/** Whether the output of `ffmpeg -filters` lists a filter (same caution as above: `helpShowsFilter` has the last word). */
 export function listsFilter(text: string, name: string): boolean {
-  return new RegExp(`^\\s*[T.][S.][C.]\\s+${escapeRegExp(name)}\\s`, 'm').test(text);
+  return new RegExp(`^\\s*[A-Za-z.|]{3,6}\\s+${escapeRegExp(name)}\\s`, 'm').test(text);
+}
+/** Whether the output of `ffmpeg -h filter=NAME` is the help of a filter that exists ("Filter ass") and not "Unknown filter 'ass'.". */
+export function helpShowsFilter(text: string, name: string): boolean {
+  return new RegExp(`^Filter ${escapeRegExp(name)}\\s*$`, 'm').test(text);
+}
+/** Whether the output of `ffmpeg -h encoder=NAME` is the help of an encoder that exists ("Encoder libx264 [...]:") and not "Codec 'x' is not recognized". */
+export function helpShowsEncoder(text: string, name: string): boolean {
+  return new RegExp(`^Encoder ${escapeRegExp(name)}\\s`, 'm').test(text);
 }
 /**
  * What libass says it chose for the caption font, from FFmpeg's verbose log; null when the log does not say (older libass versions are silent).
@@ -156,13 +168,23 @@ export async function checkToolchain(options: ToolchainCheckOptions): Promise<To
   if (ffmpegWorks) {
     await record('encoders', async () => {
       const listing = await text(options.ffmpegPath, ['-hide_banner', '-encoders']);
-      const missing = [options.videoCodec, options.audioCodec].filter((name) => !listsEncoder(listing, name));
+      const missing: string[] = [];
+      for (const name of [options.videoCodec, options.audioCodec]) {
+        if (listsEncoder(listing, name)) continue;
+        const help = await text(options.ffmpegPath, ['-hide_banner', '-h', `encoder=${name}`]).catch(() => '');
+        if (!helpShowsEncoder(help, name)) missing.push(name);
+      }
       if (missing.length) throw new Error(`this FFmpeg has no encoder named ${missing.join(' or ')}`);
       return `${options.videoCodec}, ${options.audioCodec}`;
     });
     await record('filters', async () => {
       const listing = await text(options.ffmpegPath, ['-hide_banner', '-filters']);
-      const missing = REQUIRED_FILTERS.filter((name) => !listsFilter(listing, name));
+      const missing: string[] = [];
+      for (const name of REQUIRED_FILTERS) {
+        if (listsFilter(listing, name)) continue;
+        const help = await text(options.ffmpegPath, ['-hide_banner', '-h', `filter=${name}`]).catch(() => '');
+        if (!helpShowsFilter(help, name)) missing.push(name);
+      }
       if (missing.length) throw new Error(`this FFmpeg has no filter named ${missing.join(', ')}${missing.includes('ass') ? ' (it was built without the caption library)' : ''}`);
       return REQUIRED_FILTERS.join(', ');
     });
