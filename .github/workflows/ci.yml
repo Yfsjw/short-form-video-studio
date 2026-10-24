@@ -13,7 +13,15 @@ concurrency:
 
 jobs:
   api:
-    runs-on: ubuntu-latest
+    # Two runner images with two different FFmpeg generations: ubuntu-24.04 installs FFmpeg 6.1, ubuntu-latest (now Ubuntu 26) FFmpeg 8.
+    # The video tools are the part of this program that differs most from host to host, and the host that serves customers decides
+    # which one it gets, so a change is proven on both before it can reach main.
+    name: api (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-latest]
     services:
       postgres:
         image: postgres:16

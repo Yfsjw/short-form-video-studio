@@ -75,9 +75,12 @@ export function versionOf(text: string, program: 'ffmpeg' | 'ffprobe'): string |
 export function listsEncoder(text: string, name: string): boolean {
   return new RegExp(`^\\s*[VAS][A-Za-z.]{3,8}\\s+${escapeRegExp(name)}(?:\\s|$)`, 'm').test(text);
 }
-/** Whether the output of `ffmpeg -filters` lists a filter (same caution as above: `helpShowsFilter` has the last word). */
+/**
+ * Whether the output of `ffmpeg -filters` lists a filter. FFmpeg 4 to 7 print three flag characters before the name (` ... ass`),
+ * FFmpeg 8 prints two (` .. ass`); same caution as above: `helpShowsFilter` has the last word.
+ */
 export function listsFilter(text: string, name: string): boolean {
-  return new RegExp(`^\\s*[A-Za-z.|]{3,6}\\s+${escapeRegExp(name)}\\s`, 'm').test(text);
+  return new RegExp(`^\\s*[A-Za-z.|]{2,6}\\s+${escapeRegExp(name)}\\s`, 'm').test(text);
 }
 /** Whether the output of `ffmpeg -h filter=NAME` is the help of a filter that exists ("Filter ass") and not "Unknown filter 'ass'.". */
 export function helpShowsFilter(text: string, name: string): boolean {

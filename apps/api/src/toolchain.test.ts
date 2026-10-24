@@ -56,6 +56,20 @@ const FILTERS_TEXT = `Filters:
  ... subtitles         V->V       Render text subtitles onto input video using the libass library.
 `;
 
+// Copied from a CI run on the GitHub runner of October 2026 (ffmpeg 8.0.1-3ubuntu2): the flags before a filter's name went from three characters to two.
+const FFMPEG_8_FILTERS_TEXT = `Filters:
+  T.. = Timeline support
+  .S. = Slice threading
+  A = Audio input/output
+  V = Video input/output
+  N = Dynamic number and/or type of input/output
+  | = Source or sink filter
+ TS aap               AA->A      Apply Affine Projection algorithm to first audio stream.
+ .. ass               V->V       Render ASS subtitles onto input video using the libass library.
+ .. crop              V->V       Crop the input video.
+ T. cropdetect        V->V       Auto-detect crop size.
+`;
+
 test('the version, the encoders and the filters are read from FFmpeg\'s own listings, and look-alikes are not mistaken for them', () => {
   assert.equal(versionOf(VERSION_TEXT, 'ffmpeg'), '6.1.1-3ubuntu5');
   assert.equal(versionOf(VERSION_TEXT, 'ffprobe'), null, 'ffprobe prints its own name');
@@ -76,6 +90,12 @@ test('the version, the encoders and the filters are read from FFmpeg\'s own list
   assert.ok(!listsFilter(FILTERS_TEXT.replace(/^ \.\.\. ass .*\n/m, ''), 'ass'), 'a build without the caption library lists no `ass`');
   assert.ok(listsFilter(FILTERS_TEXT.replace(/^ \.\.\. ass .*\n/m, ''), 'subtitles'), '...and the text above shows that `subtitles` alone is no substitute');
   assert.deepEqual([...REQUIRED_FILTERS], ['ass', 'crop', 'scale', 'split', 'boxblur', 'overlay']);
+
+  // The listing of FFmpeg 8, as a real runner printed it: two flag characters, not three.
+  for (const name of ['aap', 'ass', 'crop', 'cropdetect']) assert.ok(listsFilter(FFMPEG_8_FILTERS_TEXT, name), name);
+  assert.ok(!listsFilter(FFMPEG_8_FILTERS_TEXT, 'cro'));
+  assert.ok(!listsFilter(FFMPEG_8_FILTERS_TEXT, 'subtitles'));
+  assert.ok(!listsFilter(FFMPEG_8_FILTERS_TEXT.replace(/^ \.\. ass .*\n/m, ''), 'ass'), 'a build without the caption library lists no `ass`');
 });
 
 test('the help FFmpeg prints for one filter or encoder tells whether it exists, whatever layout the listings have', () => {
