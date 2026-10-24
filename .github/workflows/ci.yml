@@ -48,6 +48,10 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+    defaults:
+      run:
+        # The same shell, with errors in a pipeline counted, on every host and in the container (which would otherwise choose its own).
+        shell: bash
     env:
       # A job inside a container reaches the database service by its name, one on the runner itself by localhost.
       DATABASE_URL: postgresql://postgres:localtest@${{ matrix.db_host }}:5432/studio_local_test
@@ -85,9 +89,7 @@ jobs:
       - run: npm run check
       # API tests: real PostgreSQL, real FFmpeg, real HTTP uploads. Cloudflare R2 and speech recognition are replaced by test doubles.
       # The output is kept so that failing tests can be shown as annotations on the run (its full log is not always reachable).
-      - run: |
-          set -o pipefail
-          npm test 2>&1 | tee test-output.txt
+      - run: npm test 2>&1 | tee test-output.txt
       - if: failure()
         run: node .github/scripts/show-failures.mjs test-output.txt
       # The compile step Render runs after building whisper.cpp; catches anything that only breaks in a production build.
