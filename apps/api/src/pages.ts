@@ -117,6 +117,27 @@ export function renderUploadPage(info: UploadPageInfo): string {
         <option value="pop">Big words that pop in</option>
         <option value="none">No captions</option>
       </select></label>
+    <label class="field"><span class="label">Colour of the spoken word</span>
+      <select name="captionAccent">
+        <option value="gold">Gold</option>
+        <option value="green">Green</option>
+        <option value="cyan">Cyan</option>
+        <option value="pink">Pink</option>
+        <option value="red">Red</option>
+      </select></label>
+    <label class="field"><span class="label">Where the captions go</span>
+      <select name="captionPosition">
+        <option value="lower">Lower part (clear of the buttons)</option>
+        <option value="middle">Middle</option>
+        <option value="top">Top</option>
+      </select></label>
+    <label class="field"><span class="label">Caption size</span>
+      <select name="captionSize">
+        <option value="small">Small</option>
+        <option value="medium" selected>Medium</option>
+        <option value="large">Large</option>
+      </select></label>
+    <div class="hint">The colour is for the word being spoken, so it shows with the two styles that light a word. Where the captions go and their size apply to every style. The lower part keeps them clear of the buttons and titles that Shorts, Reels and TikTok draw over the bottom of the picture.</div>
     <label class="field"><span class="label">Framing</span>
       <select name="framing">
         <option value="center">Middle of the picture</option>${info.faceFraming ? `

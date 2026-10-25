@@ -228,6 +228,9 @@ is resumed after a restart is finished the way it was started.
 | `quality` | `hd`, `standard` | `hd` is the configured clip size of the shape (1080 pixels on its short side by default); `standard` is two thirds of it (720), which renders noticeably faster on a small server. |
 | `framing` | `center`, `face`, `fit` | How the picture is placed in the clip. `center` (default): the middle of the picture is cut out. `face`: the window follows a face (beta, see [Following a face](#following-a-face-beta-opt-in)); costs extra processing time. `fit`: nothing is cut off: the whole picture is shown across the width of the clip, over a blurred copy of itself (good for slides, screens and sport). |
 | `captionStyle` | `classic`, `highlight`, `pop`, `none` | `classic`: short phrases in white. `highlight`: the same phrases with the word being spoken lit in gold. `pop`: a few big upper-case words at a time, the spoken word lit, popping in. `none`: leave the picture clean. See [Captions](#captions). |
+| `captionAccent` | `gold`, `green`, `cyan`, `pink`, `red` | The colour of the word being spoken, in the two styles that light a word (`highlight` and `pop`). Gold is the default and the colour it always had. Plain phrases (`classic`) have no lit word, so the colour changes nothing there. |
+| `captionPosition` | `lower`, `middle`, `top` | Where the captions go. `lower` (default) is where they always were: in a vertical clip the bottom of the text is about 70% of the way down, clear of the buttons and titles that Shorts, Reels and TikTok draw over the bottom of the picture (the other shapes put it lower still, as nothing is drawn over them). `middle` is the middle of the picture. `top` leaves about 15% of a vertical clip free above the text (the apps draw there too) and a little less in the other shapes. |
+| `captionSize` | `small`, `medium`, `large` | How large the letters are: 0.8, 1 (default, the size they always had) and 1.25 times the usual size. Larger letters fit fewer words on a line, so fewer are shown at once (the groups are kept to about two lines); smaller letters fit more. |
 
 ### Progress and timings
 
@@ -332,6 +335,20 @@ long enough, at a pause, or when it would no longer fit (about 30 characters for
 does not end on a word such as "a" or "the" that belongs with the next one; a sentence does not end on a group of one word when
 the group before it can spare a word; a group stays up a moment after its last word, never into the next group. A word wider than
 the picture is set smaller instead of running off its edge.
+
+The look can be changed without changing what the captions say, with three choices on the upload page: the colour of the spoken word
+(`captionAccent`: gold, green, cyan, pink or red; it is the colour of the lit word, so it shows with `highlight` and `pop` and changes
+nothing for `classic`), where the captions go (`captionPosition`: the lower part, the middle or the top) and how large the letters are
+(`captionSize`: 0.8, 1 or 1.25 times the usual size). The defaults are exactly what captions looked like before there was a choice: the
+files of the default look were compared byte for byte with the previous release for every style and shape. Larger letters fit fewer
+words on a line, so a larger size also shows fewer words at once (a group is kept to about two lines) and a smaller one shows more; a
+word that is wider than the picture is still set smaller than the chosen size. The top position leaves about 15% of a vertical clip free
+(the apps draw there as well). Captions are drawn over whatever is in the picture, so with a followed face the middle or the top can
+cover it: the lower part is the safe choice. Checked with the real FFmpeg and its caption renderer, reading single pixels: where the text
+is in every shape and every place (lower, middle, top; plain, lit and pop-in words), the colour of the lit word for each of the five
+accents (and that the other words stay white, and that the lit word moves along with the speech), the height of the letters (0.8 and 1.25
+times), and that at the largest size nothing runs off the picture in any shape or place; also by eye on real footage, and with twenty-two
+deliberate breakages of the code, every one of which the tests caught.
 
 Each clip gets two caption files: a plain `.srt` of the same phrases, kept in storage next to the clip, and a styled `.ass` that
 FFmpeg's libass burns into the picture (and that is thrown away afterwards). The letters are drawn with **Inter ExtraBold, which

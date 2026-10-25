@@ -76,3 +76,12 @@ test('a clip says how it was framed when it was asked to follow a face, in words
   assert.doesNotMatch(hostile, /<img src=x/);
   assert.match(hostile, /&lt;img src=x onerror=alert\(1\)&gt;/);
 });
+
+test('the upload page lets the look of the captions be chosen, each choice starting from what captions always looked like, and says what the colour is for', () => {
+  const page = renderUploadPage(uploadInfo);
+  assert.match(page, /<select name="captionAccent">\s*<option value="gold">Gold<\/option>\s*<option value="green">Green<\/option>\s*<option value="cyan">Cyan<\/option>\s*<option value="pink">Pink<\/option>\s*<option value="red">Red<\/option>\s*<\/select>/, 'gold, the colour it always was, comes first');
+  assert.match(page, /<select name="captionPosition">\s*<option value="lower">Lower part[^<]*<\/option>\s*<option value="middle">Middle<\/option>\s*<option value="top">Top<\/option>\s*<\/select>/, 'the lower part comes first');
+  assert.match(page, /<select name="captionSize">\s*<option value="small">Small<\/option>\s*<option value="medium" selected>Medium<\/option>\s*<option value="large">Large<\/option>\s*<\/select>/, 'medium is the one that starts selected');
+  assert.match(page, /colour is for the word being spoken, so it shows with the two styles that light a word/, 'the page does not promise a colour for plain phrases');
+  assert.ok(page.indexOf('name="captionStyle"') < page.indexOf('name="captionAccent"') && page.indexOf('name="captionSize"') < page.indexOf('name="framing"'), 'the look sits with the captions, before the framing');
+});

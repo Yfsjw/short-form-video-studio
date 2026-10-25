@@ -3,7 +3,8 @@ import test from 'node:test';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildCaptionChunks, captionCanvas, captionLookFor, captionLooks, chunkRules, chunkWords, clipWords, formatAssTime, formatSrtTime, renderAss, wordSpans, writeAssCaptions, writeSrtCaptions, type CaptionSegmentInput, type CaptionWord } from './captions.js';
+import { accentColours, buildCaptionChunks, captionCanvas, captionLookFor, captionLooks, chunkRules, chunkRulesFor, chunkWords, clipWords, defaultCaptionChoices, formatAssTime, formatSrtTime, renderAss, sizeScales, wordSpans, writeAssCaptions, writeSrtCaptions, type CaptionChoices, type CaptionSegmentInput, type CaptionWord } from './captions.js';
+import { captionAccents, captionPositions, captionSizes } from './domain.js';
 
 /** Words one after the other, each lasting `length` seconds, from `start` (so tests can say what is spoken and not worry about every time). */
 function spoken(text: string, start = 0, length = 0.4): CaptionWord[] {
@@ -200,7 +201,7 @@ test('the caption file is written for the shape of the clip, and a vertical clip
     }
   }
   assert.deepEqual(captionCanvas, { vertical: { width: 1080, height: 1920 }, portrait: { width: 1080, height: 1350 }, square: { width: 1080, height: 1080 }, landscape: { width: 1920, height: 1080 } });
-  assert.equal(captionLookFor('classic', 'vertical'), captionLooks.classic, 'the vertical look is the one that was always used');
+  assert.deepEqual(captionLookFor('classic', 'vertical'), captionLooks.classic, 'the vertical look is the one that was always used');
 });
 
 test('captions keep clear of the bottom edge in every shape, a little higher where apps draw over the picture', () => {
@@ -244,5 +245,154 @@ test('a caption file for another shape is written the same way and holds the sam
     const ass = await readFile(path, 'utf8');
     assert.match(ass, /PlayResX: 1080\nPlayResY: 1080/);
     assert.equal(dialogues(ass).length, dialogues(renderAss(buildCaptionChunks(SAMPLE, 0, 6, 'highlight'), 'highlight')).length);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+// ---------------------------------------------------------------------------------------------------------------------------
+// What a person can choose about the look: the colour of the spoken word, where the captions go and how large they are.
+
+const LONG: CaptionSegmentInput[] = [{ startSeconds: 0, endSeconds: 40, text: 'x', words: [
+  ...spoken('When the music stops, everyone must sit down quickly because nobody wants to lose.', 0.4, 0.3),
+  ...spoken('International businesses understand responsibility differently than individuals do.', 12, 0.35),
+  ...spoken('Is this the best part of all? Yes it is, and here is the reason why it matters.', 24, 0.3)] }];
+const choose = (choices: Partial<CaptionChoices>): CaptionChoices => ({ ...defaultCaptionChoices, ...choices });
+
+test('with nothing chosen the captions look exactly as they always did: gold, lower, the usual size', () => {
+  assert.deepEqual(defaultCaptionChoices, { accent: 'gold', position: 'lower', size: 'medium' });
+  assert.equal(accentColours.gold, '&H0000D7FF&', 'the colour of a lit word has not changed');
+  assert.equal(sizeScales.medium, 1);
+  for (const style of ['classic', 'highlight', 'pop'] as const) {
+    assert.equal(chunkRulesFor(style), chunkRules[style], `${style}: the usual size groups words by the usual rules`);
+    assert.equal(chunkRulesFor(style, 'medium'), chunkRules[style]);
+    const chunks = buildCaptionChunks(LONG, 0, 40, style);
+    assert.deepEqual(buildCaptionChunks(LONG, 0, 40, style, 'medium'), chunks, `${style}: the same groups`);
+    for (const aspect of ['vertical', 'portrait', 'square', 'landscape'] as const) {
+      assert.equal(renderAss(chunks, style, aspect), renderAss(chunks, style, aspect, defaultCaptionChoices), `${style} ${aspect}`);
+      assert.equal(renderAss(chunks, style, aspect), renderAss(chunks, style, aspect, choose({})), `${style} ${aspect}`);
+    }
+  }
+  // The style lines of the vertical files, written out: these are the numbers the live service has been using.
+  const styleLine = (style: 'classic' | 'highlight' | 'pop') => /^Style: .*$/m.exec(renderAss(buildCaptionChunks(SAMPLE, 0, 6, style), style))![0];
+  assert.equal(styleLine('classic'), 'Style: Caption,Inter ExtraBold,92,&H00FFFFFF&,&H000000FF&,&H00000000&,&H80000000&,0,0,0,0,100,100,0,0,1,8,0,2,80,80,560,1');
+  assert.equal(styleLine('highlight'), 'Style: Caption,Inter ExtraBold,96,&H00FFFFFF&,&H000000FF&,&H00000000&,&H80000000&,0,0,0,0,100,100,0,0,1,8,0,2,80,80,560,1');
+  assert.equal(styleLine('pop'), 'Style: Caption,Inter ExtraBold,124,&H00FFFFFF&,&H000000FF&,&H00000000&,&H80000000&,0,0,0,0,100,100,0,0,1,10,0,5,80,80,0,1');
+});
+
+test('the colour of the spoken word is the one chosen, in the styles that light a word, and nothing else changes', () => {
+  assert.deepEqual([...captionAccents], ['gold', 'green', 'cyan', 'pink', 'red']);
+  const colours = captionAccents.map((accent) => accentColours[accent]);
+  for (const colour of colours) assert.match(colour, /^&H00[0-9A-F]{6}&$/, `${colour} is not a colour a caption file can hold`);
+  assert.equal(new Set(colours).size, captionAccents.length, 'every accent is a different colour');
+  for (const style of ['highlight', 'pop'] as const) {
+    for (const accent of captionAccents) {
+      const chunks = buildCaptionChunks(SAMPLE, 0, 6, style);
+      const ass = renderAss(chunks, style, 'vertical', choose({ accent }));
+      const lit = [...ass.matchAll(/\{\\1c(&H[0-9A-F]{8}&|&H[0-9A-F]{6}&)\}[^{]+\{\\1c&H00FFFFFF&\}/g)].map((match) => match[1]);
+      assert.ok(lit.length >= 3, `${style} ${accent}: the spoken words are lit`);
+      assert.ok(lit.every((colour) => colour === accentColours[accent]), `${style} ${accent}: lit in ${[...new Set(lit)].join(', ')}`);
+      // Only the colour differs from the default file.
+      assert.equal(ass.split(accentColours[accent]).join(accentColours.gold), renderAss(chunks, style, 'vertical'), `${style} ${accent}: nothing but the colour changed`);
+    }
+  }
+  // Plain phrases have no lit word, so there is nothing for a colour to apply to.
+  const classic = buildCaptionChunks(SAMPLE, 0, 6, 'classic');
+  assert.equal(renderAss(classic, 'classic', 'vertical', choose({ accent: 'pink' })), renderAss(classic, 'classic'));
+});
+
+test('the captions go where they were asked to, in every shape: the lower part, the middle, or the top', () => {
+  const styleOfFile = (style: 'classic' | 'highlight', aspect: 'vertical' | 'portrait' | 'square' | 'landscape', position: 'lower' | 'middle' | 'top') =>
+    styleOf(renderAss(buildCaptionChunks(SAMPLE, 0, 6, style), style, aspect, choose({ position })));
+  for (const style of ['classic', 'highlight'] as const) {
+    for (const aspect of ['vertical', 'portrait', 'square', 'landscape'] as const) {
+      const height = captionCanvas[aspect].height;
+      const lower = styleOfFile(style, aspect, 'lower'); const middle = styleOfFile(style, aspect, 'middle'); const top = styleOfFile(style, aspect, 'top');
+      assert.equal(lower.alignment, 2, `${style} ${aspect}: the lower part is set from the bottom edge`);
+      assert.equal(middle.alignment, 5, `${style} ${aspect}: the middle is centred on the picture`);
+      assert.equal(top.alignment, 8, `${style} ${aspect}: the top is set from the top edge`);
+      assert.equal(lower.marginV, captionLookFor(style, aspect).marginV, `${style} ${aspect}: the lower part is where it always was`);
+      assert.ok(top.marginV > 0.07 * height && top.marginV < 0.2 * height, `${style} ${aspect}: the top margin is ${top.marginV} of ${height}`);
+      // Where the text starts (top) or ends (lower), as a share of the height: the top is clearly above the lower part.
+      assert.ok(top.marginV / height < 1 - lower.marginV / height - 0.4, `${style} ${aspect}: top and lower are far apart`);
+    }
+  }
+  // A vertical clip keeps the top of the picture free of what the apps draw there; the other shapes are not drawn over.
+  const topMargin = (aspect: 'vertical' | 'portrait' | 'square' | 'landscape') => captionLookFor('classic', aspect, choose({ position: 'top' })).marginV / captionCanvas[aspect].height;
+  assert.ok(topMargin('vertical') >= 0.14, 'vertical: clear of the top of the apps');
+  for (const aspect of ['portrait', 'square', 'landscape'] as const) assert.ok(topMargin(aspect) < topMargin('vertical'), `${aspect}: nothing is drawn over the top, so the text can be closer to the edge`);
+  // The big pop-in words are placed by the middle of the block.
+  for (const aspect of ['vertical', 'portrait', 'square', 'landscape'] as const) {
+    const height = captionCanvas[aspect].height;
+    const centreY = (position: 'lower' | 'middle' | 'top') => captionLookFor('pop', aspect, choose({ position })).centre!.y;
+    assert.equal(centreY('lower'), captionLookFor('pop', aspect).centre!.y, `pop ${aspect}: the lower part is where it always was`);
+    assert.equal(centreY('middle'), height / 2, `pop ${aspect}: the middle is the middle`);
+    assert.ok(centreY('top') < centreY('middle') && centreY('middle') < centreY('lower'), `pop ${aspect}: top above middle above lower`);
+    assert.ok(centreY('top') > 0.1 * height && centreY('top') < 0.3 * height, `pop ${aspect}: the top is in the upper part (${centreY('top')} of ${height})`);
+    const lines = dialogues(renderAss(buildCaptionChunks(SAMPLE, 0, 6, 'pop'), 'pop', aspect, choose({ position: 'top' })));
+    assert.ok(lines.every((line) => line.includes(`\\an5\\pos(${captionCanvas[aspect].width / 2},${centreY('top')})`)), `pop ${aspect}: every line is on the chosen spot`);
+  }
+  assert.deepEqual([...captionPositions], ['lower', 'middle', 'top']);
+});
+
+test('the size of the captions is the size chosen, in every shape, and the lines stay about two lines long', () => {
+  assert.deepEqual([...captionSizes], ['small', 'medium', 'large']);
+  assert.ok(sizeScales.small < sizeScales.medium && sizeScales.medium < sizeScales.large);
+  for (const style of ['classic', 'highlight', 'pop'] as const) {
+    for (const aspect of ['vertical', 'portrait', 'square', 'landscape'] as const) {
+      const small = captionLookFor(style, aspect, choose({ size: 'small' })); const medium = captionLookFor(style, aspect); const large = captionLookFor(style, aspect, choose({ size: 'large' }));
+      assert.ok(small.fontSize < medium.fontSize && medium.fontSize < large.fontSize, `${style} ${aspect}: ${small.fontSize} < ${medium.fontSize} < ${large.fontSize}`);
+      assert.ok(small.outline <= medium.outline && medium.outline < large.outline, `${style} ${aspect}: the outline grows with the letters`);
+      assert.ok(Math.abs(large.fontSize / medium.fontSize - sizeScales.large) < 0.02, `${style} ${aspect}: large is ${sizeScales.large} times the usual size`);
+      assert.ok(Math.abs(small.fontSize / medium.fontSize - sizeScales.small) < 0.02, `${style} ${aspect}: small is ${sizeScales.small} times the usual size`);
+      assert.equal(styleOf(renderAss(buildCaptionChunks(SAMPLE, 0, 6, style, 'large'), style, aspect, choose({ size: 'large' }))).fontSize, large.fontSize, `${style} ${aspect}: the file says so`);
+    }
+  }
+  // Letters that are larger fit fewer words on a line, so fewer are shown at once; smaller ones fit more. About two lines either way.
+  for (const style of ['classic', 'highlight', 'pop'] as const) {
+    assert.ok(chunkRulesFor(style, 'large').maxChars < chunkRules[style].maxChars && chunkRules[style].maxChars < chunkRulesFor(style, 'small').maxChars, `${style}: the longer the letters, the shorter the group`);
+    assert.equal(chunkRulesFor(style, 'large').maxWords, chunkRules[style].maxWords, `${style}: only the length changes, not how many words`);
+    const groups = (size: 'small' | 'medium' | 'large') => buildCaptionChunks(LONG, 0, 40, style, size).length;
+    assert.ok(groups('large') >= groups('medium') && groups('medium') >= groups('small'), `${style}: larger letters mean more, shorter groups (${groups('small')}, ${groups('medium')}, ${groups('large')})`);
+    for (const size of captionSizes) {
+      const rules = chunkRulesFor(style, size);
+      const chunks = buildCaptionChunks(LONG, 0, 40, style, size);
+      const spokenWords = chunks.flatMap((chunk) => chunk.words.map((word) => word.text));
+      assert.deepEqual(spokenWords, clipWords(LONG, 0, 40).map((word) => word.text), `${style} ${size}: no word is lost or repeated`);
+      for (const chunk of chunks) {
+        const chars = chunk.words.map((word) => word.text).join(' ').length;
+        assert.ok(chunk.words.length === 1 || chars <= rules.maxChars, `${style} ${size}: "${chunk.words.map((word) => word.text).join(' ')}" is longer than the rules allow`);
+      }
+      // A group is shown on at most two lines: its width in letters of this size, over the width of the picture, is at most two.
+      const look = captionLookFor(style, 'vertical', choose({ size }));
+      for (const chunk of chunks) {
+        if (chunk.words.length === 1) continue;
+        const text = chunk.words.map((word) => (look.uppercase ? word.text.toUpperCase() : word.text)).join(' ');
+        const em = [...text].reduce((total, letter) => total + (/[\p{Lu}0-9]/u.test(letter) ? 0.72 : letter === ' ' ? 0.3 : 0.58), 0);
+        assert.ok(em * look.fontSize <= 2 * (1080 - 2 * 80), `${style} ${size}: "${text}" would need more than two lines`);
+      }
+    }
+  }
+  // A word wider than the picture is still set smaller than the chosen size, and an ordinary word keeps the chosen size.
+  const long: CaptionSegmentInput[] = [{ startSeconds: 0, endSeconds: 3, text: 'x', words: [{ text: 'Telecommunications', startSeconds: 0, endSeconds: 1 }] }];
+  for (const size of captionSizes) {
+    const line = dialogues(renderAss(buildCaptionChunks(long, 0, 3, 'classic', size), 'classic', 'vertical', choose({ size })))[0];
+    const chosen = captionLookFor('classic', 'vertical', choose({ size })).fontSize;
+    const fitted = /\\fs(\d+)/.exec(line)?.[1];
+    // The word is 18 letters, about 10.6 times as wide as the letters are tall, and the picture leaves 900 pixels for a line.
+    if (10.58 * chosen > 900) assert.ok(Number(fitted) >= 36 && Number(fitted) < chosen, `${size}: too wide at ${chosen}, set at ${fitted}`);
+    else assert.equal(fitted, undefined, `${size}: the word fits at ${chosen}, so it keeps that size`);
+    assert.ok(!/\\fs\d/.test(dialogues(renderAss(buildCaptionChunks(SAMPLE, 0, 6, 'highlight', size), 'highlight', 'vertical', choose({ size })))[0]), `${size}: an ordinary word keeps the chosen size`);
+  }
+});
+
+test('a caption file is written with the look that was chosen', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'studio-captions-look-')); const path = join(root, 'clip.ass');
+  try {
+    // Larger letters fit fewer words on a line, so the four words are shown in more than one group.
+    assert.equal(await writeAssCaptions(path, SAMPLE, 0, 6, 'highlight', 'vertical', { accent: 'green', position: 'top', size: 'large' }), buildCaptionChunks(SAMPLE, 0, 6, 'highlight', 'large').length);
+    const ass = await readFile(path, 'utf8');
+    assert.deepEqual(styleOf(ass), { fontSize: 120, outline: 10, alignment: 8, marginV: 300 });
+    assert.equal([...ass.matchAll(/\\1c&H0050F032&/g)].length, 4, 'one lit word per spoken word, in green');
+    assert.equal(await writeAssCaptions(path, SAMPLE, 0, 6, 'highlight'), 1);
+    assert.equal(await readFile(path, 'utf8'), renderAss(buildCaptionChunks(SAMPLE, 0, 6, 'highlight'), 'highlight'), 'without a look the file is the one it always was');
   } finally { await rm(root, { recursive: true, force: true }); }
 });

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { aspectChoices, captionStyles, defaultJobOptions, framingChoices } from './domain.js';
+import { aspectChoices, captionAccents, captionPositions, captionSizes, captionStyles, defaultJobOptions, framingChoices } from './domain.js';
 import { aspectRatios, highlightOptionsFor, MAX_CLIP_COUNT, outputSizeFor, parseJobOptions, readStoredOptions, shapeSize } from './options.js';
 
 const base = { minDurationSeconds: 20, maxDurationSeconds: 60, maxCandidates: 5, overlapThreshold: 0.65, weights: { density: 1 } };
@@ -8,12 +8,12 @@ const base = { minDurationSeconds: 20, maxDurationSeconds: 60, maxCandidates: 5,
 test('no options at all, or an untouched form, mean the defaults', () => {
   assert.deepEqual(parseJobOptions({}), { ok: true, options: defaultJobOptions });
   assert.deepEqual(parseJobOptions(undefined), { ok: true, options: defaultJobOptions });
-  assert.deepEqual(parseJobOptions({ clipCount: '', clipLength: '', quality: '', captionStyle: '', framing: '', aspect: '' }), { ok: true, options: defaultJobOptions });
+  assert.deepEqual(parseJobOptions({ clipCount: '', clipLength: '', quality: '', captionStyle: '', captionAccent: '', captionPosition: '', captionSize: '', framing: '', aspect: '' }), { ok: true, options: defaultJobOptions });
 });
 
 test('reads what the upload form sends (everything arrives as text)', () => {
-  assert.deepEqual(parseJobOptions({ clipCount: '2', clipLength: 'short', quality: 'standard', captionStyle: 'none' }), { ok: true, options: { clipCount: 2, clipLength: 'short', quality: 'standard', captionStyle: 'none', framing: 'center', aspect: 'vertical' } });
-  assert.deepEqual(parseJobOptions({ clipCount: '3', clipLength: 'long', quality: 'hd', captionStyle: 'pop', framing: 'face', aspect: 'square' }), { ok: true, options: { clipCount: 3, clipLength: 'long', quality: 'hd', captionStyle: 'pop', framing: 'face', aspect: 'square' } });
+  assert.deepEqual(parseJobOptions({ clipCount: '2', clipLength: 'short', quality: 'standard', captionStyle: 'none' }), { ok: true, options: { clipCount: 2, clipLength: 'short', quality: 'standard', captionStyle: 'none', captionAccent: 'gold', captionPosition: 'lower', captionSize: 'medium', framing: 'center', aspect: 'vertical' } });
+  assert.deepEqual(parseJobOptions({ clipCount: '3', clipLength: 'long', quality: 'hd', captionStyle: 'pop', captionAccent: 'gold', captionPosition: 'lower', captionSize: 'medium', framing: 'face', aspect: 'square' }), { ok: true, options: { clipCount: 3, clipLength: 'long', quality: 'hd', captionStyle: 'pop', captionAccent: 'gold', captionPosition: 'lower', captionSize: 'medium', framing: 'face', aspect: 'square' } });
 });
 
 test('framing: the middle of the picture unless something else is asked for, and each choice survives being stored and read back', () => {
@@ -39,7 +39,7 @@ test('every caption style on offer is accepted, and each one survives being stor
 
 test('ignores fields it does not know, and refuses values that are not allowed with a plain message', () => {
   assert.deepEqual(parseJobOptions({ video: 'x', somethingElse: 1 }), { ok: true, options: defaultJobOptions });
-  for (const bad of [{ clipCount: '0' }, { clipCount: String(MAX_CLIP_COUNT + 1) }, { clipCount: '2.5' }, { clipCount: 'many' }, { clipLength: 'huge' }, { quality: '4k' }, { captionStyle: 'rainbow' }, { framing: 'sideways' }, { framing: 'FACE' }, { aspect: '4:5' }, { aspect: 'wide' }, { aspect: 'SQUARE' }]) {
+  for (const bad of [{ clipCount: '0' }, { clipCount: String(MAX_CLIP_COUNT + 1) }, { clipCount: '2.5' }, { clipCount: 'many' }, { clipLength: 'huge' }, { quality: '4k' }, { captionStyle: 'rainbow' }, { framing: 'sideways' }, { framing: 'FACE' }, { aspect: '4:5' }, { aspect: 'wide' }, { aspect: 'SQUARE' }, { captionAccent: 'purple' }, { captionAccent: 'GOLD' }, { captionPosition: 'bottom' }, { captionPosition: 'Top' }, { captionSize: 'huge' }, { captionSize: '3' }]) {
     const result = parseJobOptions(bad);
     assert.equal(result.ok, false, JSON.stringify(bad));
     if (!result.ok) assert.match(result.message, /is not valid/);
@@ -52,13 +52,13 @@ test('options read back from the database: a value that is no longer allowed fal
   assert.deepEqual(readStoredOptions(null), defaultJobOptions);
   assert.deepEqual(readStoredOptions('not json'), defaultJobOptions);
   assert.deepEqual(readStoredOptions('[1,2]'), defaultJobOptions);
-  assert.deepEqual(readStoredOptions(JSON.stringify({ clipCount: 4, clipLength: 'gone', quality: 'standard', captionStyle: 'none' })), { clipCount: 4, clipLength: 'auto', quality: 'standard', captionStyle: 'none', framing: 'center', aspect: 'vertical' });
+  assert.deepEqual(readStoredOptions(JSON.stringify({ clipCount: 4, clipLength: 'gone', quality: 'standard', captionStyle: 'none' })), { clipCount: 4, clipLength: 'auto', quality: 'standard', captionStyle: 'none', captionAccent: 'gold', captionPosition: 'lower', captionSize: 'medium', framing: 'center', aspect: 'vertical' });
   assert.deepEqual(readStoredOptions(JSON.stringify({ clipCount: 99 })), defaultJobOptions);
 });
 
 test('jobs stored before face framing existed, or with a framing that is no longer offered, are read as the middle of the picture', () => {
   const before = JSON.stringify({ clipCount: 2, clipLength: 'short', quality: 'hd', captionStyle: 'highlight' });
-  assert.deepEqual(readStoredOptions(before), { clipCount: 2, clipLength: 'short', quality: 'hd', captionStyle: 'highlight', framing: 'center', aspect: 'vertical' });
+  assert.deepEqual(readStoredOptions(before), { clipCount: 2, clipLength: 'short', quality: 'hd', captionStyle: 'highlight', captionAccent: 'gold', captionPosition: 'lower', captionSize: 'medium', framing: 'center', aspect: 'vertical' });
   assert.equal(readStoredOptions(JSON.stringify({ framing: 'gone' })).framing, 'center');
   assert.equal(readStoredOptions(JSON.stringify({ framing: 7 })).framing, 'center');
   assert.equal(readStoredOptions(JSON.stringify({ framing: 'face', clipCount: 99 })).framing, 'face', 'one value that is no longer allowed must not undo the others');
@@ -121,4 +121,30 @@ test('every shape has exactly its own proportions, at both qualities, with even 
   assert.deepEqual(outputSizeFor({ width: 720, height: 1280 }, 'standard', 'portrait'), { width: 720, height: 900 });
   assert.deepEqual(outputSizeFor({ width: 2160, height: 3840 }, 'standard', 'landscape'), { width: 2560, height: 1440 });
   assert.deepEqual(outputSizeFor({ width: 2160, height: 3840 }, 'hd', 'square'), { width: 2160, height: 2160 });
+});
+
+test('caption look: gold, lower and medium unless something else is asked for, each choice survives being stored, and jobs stored before the choices existed look as they did', () => {
+  assert.deepEqual([...captionAccents], ['gold', 'green', 'cyan', 'pink', 'red']);
+  assert.deepEqual([...captionPositions], ['lower', 'middle', 'top']);
+  assert.deepEqual([...captionSizes], ['small', 'medium', 'large']);
+  assert.deepEqual({ accent: defaultJobOptions.captionAccent, position: defaultJobOptions.captionPosition, size: defaultJobOptions.captionSize }, { accent: 'gold', position: 'lower', size: 'medium' }, 'what every caption looked like so far stays the default');
+  for (const [field, choices] of [['captionAccent', captionAccents], ['captionPosition', captionPositions], ['captionSize', captionSizes]] as const) {
+    for (const choice of choices) {
+      const parsed = parseJobOptions({ [field]: choice });
+      assert.deepEqual(parsed, { ok: true, options: { ...defaultJobOptions, [field]: choice } }, `${field} ${choice}`);
+      assert.equal(readStoredOptions(JSON.stringify((parsed as { options: unknown }).options))[field], choice, `${field} ${choice} survives being stored`);
+    }
+  }
+  const chosen = parseJobOptions({ captionStyle: 'highlight', captionAccent: 'green', captionPosition: 'top', captionSize: 'large', aspect: 'square' });
+  assert.ok(chosen.ok && chosen.options.captionStyle === 'highlight' && chosen.options.captionAccent === 'green' && chosen.options.captionPosition === 'top' && chosen.options.captionSize === 'large' && chosen.options.aspect === 'square', 'the choices are read together');
+  const before = JSON.stringify({ clipCount: 2, clipLength: 'short', quality: 'hd', captionStyle: 'pop', framing: 'face', aspect: 'square' });
+  assert.deepEqual(readStoredOptions(before), { clipCount: 2, clipLength: 'short', quality: 'hd', captionStyle: 'pop', captionAccent: 'gold', captionPosition: 'lower', captionSize: 'medium', framing: 'face', aspect: 'square' }, 'a job stored before the look could be chosen');
+  for (const stored of [{ captionAccent: 'gone' }, { captionAccent: 3 }, { captionPosition: 'gone' }, { captionPosition: null }, { captionSize: 'gone' }, { captionSize: [] }]) {
+    const read = readStoredOptions(JSON.stringify(stored));
+    assert.deepEqual({ accent: read.captionAccent, position: read.captionPosition, size: read.captionSize }, { accent: 'gold', position: 'lower', size: 'medium' }, JSON.stringify(stored));
+  }
+  const mixed = readStoredOptions(JSON.stringify({ captionAccent: 'pink', captionPosition: 'gone', captionSize: 'small', clipCount: 99 }));
+  assert.deepEqual({ accent: mixed.captionAccent, position: mixed.captionPosition, size: mixed.captionSize }, { accent: 'pink', position: 'lower', size: 'small' }, 'one value that is no longer allowed must not undo the others');
+  const refused = parseJobOptions({ captionAccent: 'purple' });
+  assert.ok(!refused.ok && /captionAccent/.test(refused.message) && /is not valid/.test(refused.message), 'the message says which option');
 });

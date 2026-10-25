@@ -383,13 +383,13 @@ test('options chosen at upload are kept with the job and shape the clip, and the
     const response = await uploadWith(server.base, '/api/jobs', await readFile(sampleVideo), { clipCount: '1', quality: 'standard', captionStyle: 'none' });
     assert.equal(response.status, 202);
     const { job } = await response.json() as { job: { id: string; options: unknown } };
-    assert.deepEqual(job.options, { clipCount: 1, clipLength: 'auto', quality: 'standard', captionStyle: 'none', framing: 'center', aspect: 'vertical' });
+    assert.deepEqual(job.options, { clipCount: 1, clipLength: 'auto', quality: 'standard', captionStyle: 'none', captionAccent: 'gold', captionPosition: 'lower', captionSize: 'medium', framing: 'center', aspect: 'vertical' });
 
     const finished = await waitForJob(server.base, job.id) as JobView & { job: { progress: number; stageTimings: Record<string, number>; options: unknown } };
     assert.equal(finished.job.status, 'completed', finished.job.errorMessage ?? '');
     assert.equal(finished.job.progress, 100);
     assert.ok(Object.keys(finished.job.stageTimings).includes('transcribing') && Object.keys(finished.job.stageTimings).includes('extracting_clips'), 'the stages must be timed');
-    assert.deepEqual(finished.job.options, { clipCount: 1, clipLength: 'auto', quality: 'standard', captionStyle: 'none', framing: 'center', aspect: 'vertical' });
+    assert.deepEqual(finished.job.options, { clipCount: 1, clipLength: 'auto', quality: 'standard', captionStyle: 'none', captionAccent: 'gold', captionPosition: 'lower', captionSize: 'medium', framing: 'center', aspect: 'vertical' });
     await untilSettled(server);
 
     const clip = finished.clips[0];
@@ -433,7 +433,7 @@ test('the options from the upload form are read, kept, and shown as choices on t
   const schema = schemaName('form'); const server = await start({ schema });
   try {
     const page = await (await fetch(`${server.base}/test-upload`)).text();
-    for (const name of ['clipCount', 'clipLength', 'quality', 'captionStyle', 'framing', 'aspect']) assert.ok(page.includes(`name="${name}"`), `the form has no ${name} choice`);
+    for (const name of ['clipCount', 'clipLength', 'quality', 'captionStyle', 'captionAccent', 'captionPosition', 'captionSize', 'framing', 'aspect']) assert.ok(page.includes(`name="${name}"`), `the form has no ${name} choice`);
     for (const aspect of ['vertical', 'portrait', 'square', 'landscape']) assert.ok(page.includes(`<option value="${aspect}">`), `the form does not offer the ${aspect} shape`);
     for (const framing of ['center', 'face', 'fit']) assert.ok(page.includes(`<option value="${framing}">`), `the form does not offer the ${framing} framing`);
     for (const style of ['classic', 'highlight', 'pop', 'none']) assert.ok(page.includes(`<option value="${style}">`), `the form does not offer the ${style} captions`);
@@ -444,7 +444,7 @@ test('the options from the upload form are read, kept, and shown as choices on t
     assert.equal(response.status, 200);
     const id = response.url.match(/\/jobs\/([0-9a-f-]{36})$/)![1];
     const finished = await waitForJob(server.base, id) as JobView & { job: { options: unknown } };
-    assert.deepEqual(finished.job.options, { clipCount: 1, clipLength: 'auto', quality: 'hd', captionStyle: 'classic', framing: 'center', aspect: 'vertical' }, 'a blank choice means automatic');
+    assert.deepEqual(finished.job.options, { clipCount: 1, clipLength: 'auto', quality: 'hd', captionStyle: 'classic', captionAccent: 'gold', captionPosition: 'lower', captionSize: 'medium', framing: 'center', aspect: 'vertical' }, 'a blank choice means automatic');
     assert.equal(finished.job.status, 'completed', finished.job.errorMessage ?? '');
   } finally { await server.stop(); await dropSchema(schema); }
 });
@@ -469,6 +469,12 @@ test('an option that is not allowed is refused with a plain message and leaves n
     const shape = await uploadWith(server.base, '/api/jobs', Buffer.alloc(64 * 1024, 3), { aspect: 'cinema' });
     assert.equal(shape.status, 400);
     assert.match(((await shape.json()) as { error: { message: string } }).error.message, /aspect/);
+
+    for (const [field, value] of [['captionAccent', 'purple'], ['captionPosition', 'bottom'], ['captionSize', 'huge']]) {
+      const look = await uploadWith(server.base, '/api/jobs', Buffer.alloc(64 * 1024, 3), { [field]: value });
+      assert.equal(look.status, 400, `${field}=${value}`);
+      assert.match(((await look.json()) as { error: { message: string } }).error.message, new RegExp(field));
+    }
 
     assert.deepEqual(await readdir(server.dirs.UPLOAD_DIR), [], 'the refused videos must not stay on the disk');
     assert.equal((await server.studio.db.listUnfinishedJobs()).length, 0);

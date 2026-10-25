@@ -659,7 +659,7 @@ test('makes the clips the way the person asked: how many, how long, with or with
   const talk = Array.from({ length: 36 }, (_, index) => ({ segmentIndex: index, startSeconds: index * 5, endSeconds: index * 5 + 5, text: index % 3 === 2 ? 'Is this the best part of all?' : `Sentence number ${index} makes a point.` }));
   const ctx = await setup({ transcriber: { transcribe: async () => talk }, renderer, media: { ...fakeMedia, probe: async () => ({ durationSeconds: 180, width: 1920, height: 1080 }) } });
   try {
-    await addJob(ctx, 'j-chosen', { options: { clipCount: 2, clipLength: 'short', quality: 'standard', captionStyle: 'none', framing: 'center', aspect: 'vertical' } });
+    await addJob(ctx, 'j-chosen', { options: { clipCount: 2, clipLength: 'short', quality: 'standard', captionStyle: 'none', captionAccent: 'gold', captionPosition: 'lower', captionSize: 'medium', framing: 'center', aspect: 'vertical' } });
     await ctx.pipeline.run('j-chosen');
     assert.equal((await ctx.db.getJob('j-chosen'))?.status, 'completed');
     assert.equal(requests.length, 2, 'two clips were asked for');
@@ -742,6 +742,33 @@ test('burns the styled captions the person chose into each clip (with the spoken
     await addJob(ctx, 'j-default');
     await ctx.pipeline.run('j-default');
     assert.doesNotMatch(seen[0].text, /\\1c&H/, 'the default style does not light words');
+  } finally { await ctx.cleanup(); }
+});
+
+test('the look the person chose for the captions (colour of the spoken word, place and size) reaches the caption file, and without a choice the file is the one it always was', async () => {
+  const seen: string[] = [];
+  const renderer: ClipRenderer = { render: async (request) => { seen.push(request.captionPath ? await readFile(request.captionPath, 'utf8') : ''); await writeFile(request.outputPath, 'rendered clip'); return { durationSeconds: request.endSeconds - request.startSeconds, sizeBytes: 13 }; } };
+  const word = (text: string, startSeconds: number, endSeconds: number) => ({ text, startSeconds, endSeconds });
+  const transcriber: TranscriptionEngine = { transcribe: async () => [{ segmentIndex: 0, startSeconds: 0, endSeconds: 4, text: 'Nobody tells you this.', words: [word('Nobody', 0.2, 1), word('tells', 1, 1.8), word('you', 1.8, 2.5), word('this.', 2.5, 3.6)] }] };
+  const ctx = await setup({ transcriber, renderer });
+  try {
+    await addJob(ctx, 'j-look', { options: { ...defaultJobOptions, captionStyle: 'highlight', captionAccent: 'green', captionPosition: 'top', captionSize: 'small' } });
+    await ctx.pipeline.run('j-look');
+    assert.equal((await ctx.db.getJob('j-look'))?.status, 'completed');
+    const fields = /^Style: (.*)$/m.exec(seen[0])![1].split(',');
+    assert.deepEqual({ fontSize: Number(fields[2]), alignment: Number(fields[18]), marginV: Number(fields[21]) }, { fontSize: 77, alignment: 8, marginV: 300 }, 'small letters, set from the top');
+    assert.equal([...seen[0].matchAll(/\\1c&H0050F032&/g)].length, 4, 'every lit word is green');
+    assert.doesNotMatch(seen[0], /\\1c&H0000D7FF&/, 'and none is gold');
+
+    seen.length = 0;
+    await addJob(ctx, 'j-plain-look', { options: { ...defaultJobOptions, captionStyle: 'highlight' } });
+    await ctx.pipeline.run('j-plain-look');
+    const plain = /^Style: (.*)$/m.exec(seen[0])![1].split(',');
+    assert.deepEqual({ fontSize: Number(plain[2]), alignment: Number(plain[18]), marginV: Number(plain[21]) }, { fontSize: 96, alignment: 2, marginV: 560 }, 'the look it always had');
+    assert.equal([...seen[0].matchAll(/\\1c&H0000D7FF&/g)].length, 4, 'gold');
+
+    // The look is stored with the job, so a job that is resumed is finished the way it was started.
+    assert.deepEqual({ accent: (await ctx.db.getJob('j-look'))?.options.captionAccent, position: (await ctx.db.getJob('j-look'))?.options.captionPosition, size: (await ctx.db.getJob('j-look'))?.options.captionSize }, { accent: 'green', position: 'top', size: 'small' });
   } finally { await ctx.cleanup(); }
 });
 

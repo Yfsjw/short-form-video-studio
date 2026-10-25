@@ -433,7 +433,7 @@ export class VideoPipeline {
           let captionCount = 0; let styledCount = 0;
           if (captionStyle !== 'none') {
             captionCount = await writeSrtCaptions(captionPath, transcript, range.startSeconds, range.endSeconds);
-            styledCount = await writeAssCaptions(styledCaptionPath, transcript, range.startSeconds, range.endSeconds, captionStyle, options.aspect);
+            styledCount = await writeAssCaptions(styledCaptionPath, transcript, range.startSeconds, range.endSeconds, captionStyle, options.aspect, { accent: options.captionAccent, position: options.captionPosition, size: options.captionSize });
           }
           const rendered = await this.clipRenderer.render({ sourcePath, startSeconds: range.startSeconds, endSeconds: range.endSeconds, outputPath, captionPath: styledCount ? styledCaptionPath : null, quality: options.quality, aspect: options.aspect, framing: framing?.followed ? framing.plan : null, layout: options.framing === 'fit' ? 'fit' : 'fill' });
           await rm(styledCaptionPath, { force: true });

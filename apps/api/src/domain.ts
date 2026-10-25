@@ -13,6 +13,15 @@ export type QualityChoice = (typeof qualityChoices)[number];
  */
 export const captionStyles = ['classic', 'highlight', 'pop', 'none'] as const;
 export type CaptionStyle = (typeof captionStyles)[number];
+/** The colour of the word being spoken, in the two styles that light a word (`highlight` and `pop`). `gold` is the colour it always had. */
+export const captionAccents = ['gold', 'green', 'cyan', 'pink', 'red'] as const;
+export type CaptionAccent = (typeof captionAccents)[number];
+/** Where the captions are on the picture. `lower` is where they always were: a little below the middle of a vertical clip, clear of what the apps draw over the bottom. */
+export const captionPositions = ['lower', 'middle', 'top'] as const;
+export type CaptionPosition = (typeof captionPositions)[number];
+/** How large the captions are. `medium` is the size they always had. */
+export const captionSizes = ['small', 'medium', 'large'] as const;
+export type CaptionSize = (typeof captionSizes)[number];
 
 /**
  * How the picture of a clip is placed in the vertical frame when the video is wider than the clip. `center`: the middle of the picture is cut out.
@@ -36,11 +45,15 @@ export interface JobOptions {
   clipLength: ClipLengthChoice;
   quality: QualityChoice;
   captionStyle: CaptionStyle;
+  /** How the captions look besides their style; a job stored before these existed has the look every caption had. */
+  captionAccent: CaptionAccent;
+  captionPosition: CaptionPosition;
+  captionSize: CaptionSize;
   framing: FramingChoice;
   /** The shape of the clips; a job stored before shapes existed is vertical, as every clip then was. */
   aspect: AspectChoice;
 }
-export const defaultJobOptions: JobOptions = { clipCount: null, clipLength: 'auto', quality: 'hd', captionStyle: 'classic', framing: 'center', aspect: 'vertical' };
+export const defaultJobOptions: JobOptions = { clipCount: null, clipLength: 'auto', quality: 'hd', captionStyle: 'classic', captionAccent: 'gold', captionPosition: 'lower', captionSize: 'medium', framing: 'center', aspect: 'vertical' };
 
 export interface VideoJob {
   id: string; originalFilename: string; storedFilename: string; mimeType: string; sizeBytes: number;
