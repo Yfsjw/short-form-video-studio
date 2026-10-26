@@ -163,7 +163,7 @@ function whyThisMoment(clip: GeneratedClip): string {
     <div class="hint">Chosen by plain rules over the transcript (words, pauses, length), not by an AI model.</div>${reasons ? `<ul>${reasons}</ul>` : ''}</details>`;
 }
 
-const STAGE_ORDER = ['preparing_source', 'saving_source', 'restoring_source', 'probing_video', 'extracting_audio', 'transcribing', 'detecting_highlights', 'extracting_clips'];
+const STAGE_ORDER = ['preparing_source', 'saving_source', 'restoring_source', 'probing_video', 'extracting_audio', 'transcribing', 'reusing_transcript', 'detecting_highlights', 'extracting_clips'];
 
 export function renderJobPage(job: VideoJob, clips: GeneratedClip[], now: number = Date.now()): string {
   const stillWorking = job.status !== 'completed' && job.status !== 'failed';

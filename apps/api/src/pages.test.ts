@@ -85,3 +85,10 @@ test('the upload page lets the look of the captions be chosen, each choice start
   assert.match(page, /colour is for the word being spoken, so it shows with the two styles that light a word/, 'the page does not promise a colour for plain phrases');
   assert.ok(page.indexOf('name="captionStyle"') < page.indexOf('name="captionAccent"') && page.indexOf('name="captionSize"') < page.indexOf('name="framing"'), 'the look sits with the captions, before the framing');
 });
+
+test('the timings of a job whose transcript was reused say so in plain words', () => {
+  const html = renderJobPage(job({ stageTimings: { extracting_audio: 2000, reusing_transcript: 150, detecting_highlights: 20, extracting_clips: 61_000 } }), [clip({})]);
+  assert.match(html, /<tr><td>Reusing what was heard in this video before<\/td><td>0 s<\/td><\/tr>/);
+  assert.doesNotMatch(html, /Listening to the speech/, 'the speech was not listened to this time');
+  assert.ok(html.indexOf('Extracting the audio') < html.indexOf('Reusing what was heard') && html.indexOf('Reusing what was heard') < html.indexOf('Finding the best moments') && html.indexOf('Finding the best moments') < html.indexOf('Rendering the clips'), 'in the order things happen');
+});

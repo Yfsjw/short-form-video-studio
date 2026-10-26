@@ -101,3 +101,10 @@ test('hosted speech recognition settings that make no sense are refused at start
   for (const bad of ['0', '9']) assert.throws(() => loadConfig({ TRANSCRIPTION_API_CONCURRENCY: bad }), Error, `${bad} requests at once`);
   assert.throws(() => loadConfig({ TRANSCRIPTION_API_TIMEOUT_MS: '1000' }));
 });
+
+test('transcripts are kept for 30 days by default, never for longer than a year, and 0 keeps nothing', () => {
+  assert.equal(loadConfig({}).TRANSCRIPT_CACHE_DAYS, 30);
+  assert.equal(loadConfig({ TRANSCRIPT_CACHE_DAYS: '0' }).TRANSCRIPT_CACHE_DAYS, 0);
+  assert.equal(loadConfig({ TRANSCRIPT_CACHE_DAYS: '365' }).TRANSCRIPT_CACHE_DAYS, 365);
+  for (const bad of ['-1', '366', '1.5', 'many']) assert.throws(() => loadConfig({ TRANSCRIPT_CACHE_DAYS: bad }), Error, `${bad} days`);
+});

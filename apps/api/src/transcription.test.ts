@@ -142,3 +142,19 @@ test('a speech recognition program that runs past the time limit is stopped', as
     assert.ok(Date.now() - started < 5000, 'it must not wait for the program to finish by itself');
   } finally { await rm(root, { recursive: true, force: true }); }
 });
+
+test('the speech engine on this machine names the model (by file and size) and the language its transcripts depend on, and says nothing when it has no model to name', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'studio-whisper-key-'));
+  try {
+    const model = join(root, 'ggml-base.en.bin');
+    await writeFile(model, Buffer.alloc(1234, 1));
+    const engine = new WhisperCppTranscriber('/bin/true', model, 'en', 1000);
+    assert.equal(engine.cacheKey, 'whisper.cpp|ggml-base.en.bin|1234|en');
+    assert.notEqual(new WhisperCppTranscriber('/bin/true', model, 'ar', 1000).cacheKey, engine.cacheKey, 'another language is another transcript');
+    await writeFile(model, Buffer.alloc(5678, 1));
+    assert.equal(engine.cacheKey, 'whisper.cpp|ggml-base.en.bin|5678|en', 'a different model in the same place is a different key');
+    await writeFile(join(root, 'other.bin'), Buffer.alloc(5678, 1));
+    assert.notEqual(new WhisperCppTranscriber('/bin/true', join(root, 'other.bin'), 'en', 1000).cacheKey, engine.cacheKey, 'and so is another file of the same size');
+    assert.equal(new WhisperCppTranscriber('/bin/true', join(root, 'not-there.bin'), 'en', 1000).cacheKey, undefined, 'no model, no key: nothing is reused');
+  } finally { await rm(root, { recursive: true, force: true }); }
+});

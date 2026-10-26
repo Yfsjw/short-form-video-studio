@@ -94,7 +94,11 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
     heartbeatMs: config.JOB_HEARTBEAT_SECONDS * 1000,
     recheckMs: Math.max(1000, config.JOB_STALE_AFTER_SECONDS * 500),
     watchdogMs: Math.max(5000, config.JOB_STALE_AFTER_SECONDS * 3000),
+    transcriptCacheDays: config.TRANSCRIPT_CACHE_DAYS,
   }, framer);
+  // Forget the transcripts nobody has asked for lately; with 0 days (nothing is to be kept) that is all of them, so switching the cache off also clears it.
+  // Best effort: housekeeping must never stop the server from starting.
+  db.pruneTranscriptCache(new Date(Date.now() - config.TRANSCRIPT_CACHE_DAYS * 86_400_000).toISOString()).then((removed) => { if (removed) logger.info({ removed }, 'Forgot transcripts that nobody had needed for a while'); }, (error) => logger.warn({ err: error }, 'Could not forget old transcripts'));
 
   // Prove at startup (and leave a clear line in the logs) whether durable storage really works,
   // instead of finding out when the first customer's upload fails.

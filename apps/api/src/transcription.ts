@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { statSync } from 'node:fs';
 import { access, readFile } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 import type { TranscriptSegment } from './domain.js';
@@ -8,6 +9,12 @@ export type TranscriptInput = Array<Omit<TranscriptSegment, 'id' | 'jobId' | 'cr
 export interface TranscriptionEngine {
   /** `onProgress` (optional) is told how far along the work is, as a fraction from 0 to 1, whenever the engine knows. */
   transcribe(audioPath: string, workDir: string, onProgress?: (fraction: number) => void): Promise<TranscriptInput>;
+  /**
+   * Names everything the transcript depends on besides the sound (which engine, which model, which language). The transcript of a sound
+   * is kept and reused only for an engine that has one; two engines that are not set up the same way must never share a key. An engine
+   * without one (or one that cannot tell right now) is simply never cached.
+   */
+  readonly cacheKey?: string | undefined;
 }
 
 type WhisperTimes = { offsets?: { from?: unknown; to?: unknown }; timestamps?: { from?: unknown; to?: unknown } };
@@ -99,6 +106,12 @@ function trimDiagnostic(value: string): string {
 
 export class WhisperCppTranscriber implements TranscriptionEngine {
   constructor(private readonly executablePath: string, private readonly modelPath: string, private readonly language: string, private readonly timeoutMs: number) {}
+
+  /** The model is named by its file name and size, so a different model put in the same place is a different key. No readable model, no key. */
+  get cacheKey(): string | undefined {
+    try { return `whisper.cpp|${basename(this.modelPath)}|${statSync(this.modelPath).size}|${this.language}`; } catch { return undefined; }
+  }
+
   async transcribe(audioPath: string, workDir: string, onProgress?: (fraction: number) => void): Promise<TranscriptInput> {
     const outputBase = join(workDir, basename(audioPath, '.wav'));
     let stdout = '';

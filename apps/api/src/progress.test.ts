@@ -21,6 +21,7 @@ test('progress inside a long stage is spread over its range and kept inside it',
 
 test('every stage has a readable name, and an unknown one is shown rather than hidden', () => {
   assert.equal(stageLabel('transcribing'), 'Listening to the speech');
+  assert.equal(stageLabel('reusing_transcript'), 'Reusing what was heard in this video before');
   assert.equal(stageLabel('some_new_stage'), 'some new stage');
 });
 
@@ -43,4 +44,11 @@ test('the stage clock records every stage once it ends, and a stage entered twic
   assert.deepEqual(clock.finish(), { a: 400, b: 500 });
   assert.equal(totalMilliseconds(clock.finish()), 900);
   assert.equal(totalMilliseconds({ a: Number.NaN, b: 5 }), 5);
+});
+
+test('reusing a transcript sits where listening to the speech does, so progress still only moves forward', () => {
+  assert.equal(stageProgress('reusing_transcript'), stageProgress('transcribing'));
+  const order = ['extracting_audio', 'reusing_transcript', 'detecting_highlights', 'extracting_clips'];
+  const values = order.map((stage) => stageProgress(stage));
+  assert.deepEqual(values, [...values].sort((a, b) => a - b), `not increasing: ${values}`);
 });

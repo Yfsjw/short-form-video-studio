@@ -62,6 +62,9 @@ const schema = z.object({
   WHISPER_MODEL_PATH: z.string().default('../../.render/ggml-base.en.bin'),
   TRANSCRIPTION_LANGUAGE: z.string().min(2).max(12).default('en'),
   TRANSCRIPTION_TIMEOUT_MS: z.coerce.number().int().positive().default(3_600_000),
+  // How many days the transcript of a sound is kept after it was last used, so the same video uploaded again (to try other choices) or a job
+  // started over after a restart does not have its speech recognised twice. 0 keeps nothing.
+  TRANSCRIPT_CACHE_DAYS: z.coerce.number().int().min(0).max(365).default(30),
   // Only used when TRANSCRIPTION_ENGINE=openai_compatible (a hosted service that speaks the OpenAI audio/transcriptions protocol).
   TRANSCRIPTION_API_URL: z.string().url().optional(),
   TRANSCRIPTION_API_KEY: z.string().optional(),

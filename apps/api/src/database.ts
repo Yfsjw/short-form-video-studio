@@ -2,6 +2,8 @@ import { randomUUID } from 'node:crypto';
 import { Pool, type PoolClient } from 'pg';
 import { defaultJobOptions, type GeneratedClip, type HighlightCandidate, type JobStatus, type NewVideoJob, type TranscriptSegment, type VideoJob } from './domain.js';
 import { readStoredOptions } from './options.js';
+import type { TranscriptInput } from './transcription.js';
+import { parseCachedSegments, serializeSegments } from './transcript-cache.js';
 import { parseStoredWords } from './words.js';
 
 const CREATE_TABLES_SQL = `
@@ -27,6 +29,12 @@ const CREATE_TABLES_SQL = `
     start_seconds DOUBLE PRECISION NOT NULL, end_seconds DOUBLE PRECISION NOT NULL, score DOUBLE PRECISION NOT NULL, quality TEXT NOT NULL,
     reasons_json TEXT NOT NULL, signals_json TEXT NOT NULL, source_segment_indexes_json TEXT NOT NULL, created_at TEXT NOT NULL,
     UNIQUE(job_id, candidate_index)
+  );
+  -- What speech recognition wrote down for a given sound by a given engine, so the same sound is not recognised twice (see transcript-cache.ts).
+  CREATE TABLE IF NOT EXISTS transcript_cache (
+    audio_sha256 TEXT NOT NULL, engine_key TEXT NOT NULL, segments_json TEXT NOT NULL,
+    created_at TEXT NOT NULL, last_used_at TEXT NOT NULL, uses INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (audio_sha256, engine_key)
   );
 `;
 
@@ -190,6 +198,32 @@ export class StudioDatabase {
         );
       }
     });
+  }
+
+  /**
+   * The transcript this engine wrote for this sound before, if it is still kept and still usable. Looking it up counts as using it, which is
+   * what keeps it from being pruned. A stored transcript that has been damaged is not returned.
+   */
+  async findCachedTranscript(audioSha256: string, engineKey: string): Promise<TranscriptInput | undefined> {
+    const result = await this.pool.query('UPDATE transcript_cache SET last_used_at = $3, uses = uses + 1 WHERE audio_sha256 = $1 AND engine_key = $2 RETURNING segments_json', [audioSha256, engineKey, new Date().toISOString()]);
+    return parseCachedSegments(result.rows[0]?.segments_json);
+  }
+
+  /** Keeps a transcript for the next time the same sound comes. A transcript of nothing is not kept: a failed run must not be repeated for ever. */
+  async storeCachedTranscript(audioSha256: string, engineKey: string, segments: TranscriptInput) {
+    if (!segments.length) return;
+    const now = new Date().toISOString();
+    await this.pool.query(
+      `INSERT INTO transcript_cache (audio_sha256, engine_key, segments_json, created_at, last_used_at, uses) VALUES ($1,$2,$3,$4,$4,0)
+       ON CONFLICT (audio_sha256, engine_key) DO UPDATE SET segments_json = EXCLUDED.segments_json, last_used_at = EXCLUDED.last_used_at`,
+      [audioSha256, engineKey, serializeSegments(segments), now]
+    );
+  }
+
+  /** Forgets the transcripts nobody has asked for since `unusedSince` (an ISO time). Returns how many were forgotten. */
+  async pruneTranscriptCache(unusedSince: string): Promise<number> {
+    const result = await this.pool.query('DELETE FROM transcript_cache WHERE last_used_at < $1', [unusedSince]);
+    return result.rowCount ?? 0;
   }
 
   async listTranscript(jobId: string): Promise<TranscriptSegment[]> {

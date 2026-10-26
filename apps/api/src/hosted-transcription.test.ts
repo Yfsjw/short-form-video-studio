@@ -248,3 +248,15 @@ test('when one piece fails the others are stopped, the job fails with that reaso
     });
   } finally { await service.close(); }
 });
+
+test('the hosted engine names the service, model, language and piece length its transcripts depend on, and never the key', () => {
+  const settings: HostedTranscriptionSettings = { apiUrl: 'https://speech.example/v1', apiKey: 'this-is-a-secret-key-1234', model: 'whisper-large-v3-turbo', language: 'en', timeoutMs: 30_000, chunkSeconds: 600, concurrency: 2, ffmpegPath: 'ffmpeg', ffprobePath: 'ffprobe' };
+  const key = new OpenAiCompatibleTranscriber(settings).cacheKey;
+  assert.equal(key, 'hosted|speech.example|whisper-large-v3-turbo|en|600');
+  assert.ok(!key!.includes('secret'), 'the key is not part of it');
+  for (const change of [{ apiUrl: 'https://other.example/v1' }, { model: 'whisper-1' }, { language: 'auto' }, { chunkSeconds: 300 }]) {
+    assert.notEqual(new OpenAiCompatibleTranscriber({ ...settings, ...change }).cacheKey, key, JSON.stringify(change));
+  }
+  assert.equal(new OpenAiCompatibleTranscriber({ ...settings, apiKey: 'another-key-5678', concurrency: 5, timeoutMs: 1_000_000 }).cacheKey, key, 'the key, how many requests at once and how long to wait change nothing about the transcript');
+  assert.equal(new OpenAiCompatibleTranscriber({ ...settings, apiUrl: 'not an address' }).cacheKey, undefined, 'an address that cannot be read is no key');
+});

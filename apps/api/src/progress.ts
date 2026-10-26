@@ -13,6 +13,7 @@ const stages: Record<string, { label: string; from: number; to: number }> = {
   probing_video: { label: 'Reading the video', from: 5, to: 6 },
   extracting_audio: { label: 'Extracting the audio', from: 6, to: 10 },
   transcribing: { label: 'Listening to the speech', from: 10, to: 70 },
+  reusing_transcript: { label: 'Reusing what was heard in this video before', from: 10, to: 70 },
   detecting_highlights: { label: 'Finding the best moments', from: 70, to: 72 },
   extracting_clips: { label: 'Rendering the clips', from: 72, to: 99 },
   clip_extraction_complete: { label: 'Done', from: 100, to: 100 },

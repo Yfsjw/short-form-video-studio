@@ -947,3 +947,46 @@ test('the check does not run while a job is being processed, and runs as soon as
     assert.equal(looked.length, 1, 'once, after the job');
   } finally { await server.stop(); await dropSchema(schema); }
 });
+
+test('the same video uploaded twice is listened to once, end to end, and TRANSCRIPT_CACHE_DAYS=0 switches that off', needsFfmpeg, async () => {
+  const counting = (calls: { n: number }): TranscriptionEngine => ({ cacheKey: 'e2e-engine|1', transcribe: async (audioPath, workDir, onProgress) => { calls.n += 1; return talk.transcribe(audioPath, workDir, onProgress); } });
+  for (const [days, listenedTo, kept] of [[undefined, 1, 1], ['0', 2, 0]] as const) {
+    const schema = schemaName('cache_e2e'); const calls = { n: 0 };
+    const server = await start({ schema, transcriber: counting(calls), env: days === undefined ? {} : { TRANSCRIPT_CACHE_DAYS: days } });
+    const raw = new Pool({ connectionString: TEST_DATABASE_URL, options: `-c search_path="${schema}"` });
+    try {
+      const first = await uploadAndFinish(server); await untilSettled(server);
+      const second = await uploadAndFinish(server); await untilSettled(server);
+      for (const finished of [first, second]) assert.equal(finished.job.status, 'completed', finished.job.errorMessage ?? '');
+      assert.equal(calls.n, listenedTo, days === undefined ? 'the second upload had the same sound: nobody listened again' : 'with the cache switched off the speech is listened to each time');
+      assert.equal((await raw.query('SELECT count(*)::int AS n FROM transcript_cache')).rows[0].n, kept);
+      assert.equal(second.clips.length, 1, 'the clip is made as usual');
+      const page = await (await fetch(`${server.base}/jobs/${second.job.id}`)).text();
+      assert.equal(page.includes('Reusing what was heard in this video before'), days === undefined, 'the job page says whether the speech was reused');
+    } finally { await raw.end(); await server.stop(); await dropSchema(schema); }
+  }
+});
+
+test('start-up forgets the transcripts nobody has needed for as many days as are set, and clears them all when the cache is switched off', async () => {
+  const schema = schemaName('cache_prune');
+  const raw = new Pool({ connectionString: TEST_DATABASE_URL, options: `-c search_path="${schema}"` });
+  try {
+    const first = await start({ schema });
+    try {
+      const transcript = [{ segmentIndex: 0, startSeconds: 0, endSeconds: 1, text: 'Hello.' }];
+      for (const sound of ['fresh', 'old']) await first.studio.db.storeCachedTranscript(sound, 'engine', transcript);
+      await raw.query(`UPDATE transcript_cache SET last_used_at = $1 WHERE audio_sha256 = 'old'`, [new Date(Date.now() - 40 * 86_400_000).toISOString()]);
+    } finally { await first.stop(); }
+
+    const second = await start({ schema });
+    try {
+      const kept = () => raw.query('SELECT audio_sha256 FROM transcript_cache ORDER BY 1').then((result) => result.rows.map((row) => String(row.audio_sha256)));
+      await eventually('the transcript nobody asked for in 40 days to be forgotten (30 are kept by default)', kept, (sounds) => sounds.join() === 'fresh');
+    } finally { await second.stop(); }
+
+    const third = await start({ schema, env: { TRANSCRIPT_CACHE_DAYS: '0' } });
+    try {
+      await eventually('switching the cache off to clear it', () => raw.query('SELECT count(*)::int AS n FROM transcript_cache').then((result) => result.rows[0].n as number), (count) => count === 0);
+    } finally { await third.stop(); }
+  } finally { await raw.end(); await dropSchema(schema); }
+});

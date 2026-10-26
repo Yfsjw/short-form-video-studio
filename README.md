@@ -10,7 +10,7 @@ real FFmpeg render of a real time range of the uploaded video. If a stage cannot
 ## How a video travels through the system
 
 ```
-upload ─► job row (Postgres) ─► video copied to Cloudflare R2 ─► ffprobe ─► audio extraction ─► whisper.cpp transcript
+upload ─► job row (Postgres) ─► video copied to Cloudflare R2 ─► ffprobe ─► audio extraction ─► whisper.cpp transcript (or the one kept from the same sound)
       ─► highlight ranking ─► (optional: look for a face to follow) ─► FFmpeg render (crop to the chosen shape + burned-in captions) ─► clips uploaded to R2 ─► download link
 ```
 
@@ -92,7 +92,10 @@ Job stages you can see on the status page: `preparing_source`, `saving_source`, 
   `JOB_STALE_AFTER_SECONDS` (say, a long database outage) another process may take the job over while the first still works on
   it. There is no fencing between them.
 - **A resumed job starts again from the beginning.** Clips made by an interrupted attempt are thrown away rather than reused:
-  that is simpler and cannot mix the output of two attempts, at the price of repeating work after every interruption.
+  that is simpler and cannot mix the output of two attempts, at the price of repeating work after every interruption. The
+  transcript is the exception: it is the longest stage and it is kept as soon as it exists, so what a restart repeats is the
+  rendering, not the listening (see [Not listening twice](#not-listening-twice); this holds for engines that can be cached and
+  while `TRANSCRIPT_CACHE_DAYS` is above 0).
 - **A database that goes silent is not timed out.** node-postgres has no default timeout for connections or queries and none is
   configured here. A connection the database *closes* is handled (see point 7 above); one that is accepted and then never
   answered would stall the request or job that uses it.
@@ -191,6 +194,7 @@ All configuration comes from environment variables; see [`.env.example`](.env.ex
 | `TRANSCRIPTION_ENGINE` | `whisper_cpp` (default, runs on this machine) or `openai_compatible` (a hosted service, see [Faster speech recognition](#faster-speech-recognition-with-a-hosted-service-optional)). |
 | `TRANSCRIPTION_API_URL`, `TRANSCRIPTION_API_KEY`, `TRANSCRIPTION_API_MODEL` | Only for `openai_compatible`: the service's base address (ending in `/v1`), its key (never logged, never shown in a message) and the model (default `whisper-1`). The address and key are required when that engine is chosen. |
 | `TRANSCRIPTION_CHUNK_SECONDS`, `TRANSCRIPTION_API_CONCURRENCY`, `TRANSCRIPTION_API_TIMEOUT_MS` | Only for `openai_compatible`: about how many seconds of audio go in one request (default 600), how many requests run at once (default 3) and the time limit of one request (default 300000 ms). |
+| `TRANSCRIPT_CACHE_DAYS` | How many days the transcript of a sound is kept after it was last used, so that the same video is not listened to twice (0–365, default 30; `0` keeps nothing and clears what was kept the next time the server starts). See [Not listening twice](#not-listening-twice). |
 | `CLIP_MAX_CANDIDATES` | Highest-ranked candidates rendered per job (default 3). |
 | `CLIP_VERTICAL_WIDTH`, `CLIP_VERTICAL_HEIGHT` | Output size of a vertical clip; must be 9:16 (default 1080×1920). The other shapes are worked out from it (see `aspect` under [Job options](#job-options)). |
 | `CLIP_VIDEO_CODEC`, `CLIP_AUDIO_CODEC`, `CLIP_CRF`, `CLIP_PRESET` | FFmpeg encoding (defaults `libx264`, `aac`, 23, `veryfast`). |
@@ -388,6 +392,41 @@ Evidence: the engine is tested against a stand-in service that reads the real mu
 options, ordering of answers, retries, failures, no key in any message) with real FFmpeg for the pauses and the pieces. It has not
 been run against a real service yet: whether OpenAI's or Groq's actual answers read the same way, their rate limits, and the speed
 and quality for real recordings are not proven.
+
+### Not listening twice
+
+Recognising the speech is by far the longest stage on the free instance (about 14 times the length of the video, see above), so a
+video whose sound has been recognised before is not recognised again. After the audio is extracted, the program takes the
+SHA-256 of the 16 kHz mono sound it is about to hand to speech recognition and looks it up, together with a key that names the engine
+and everything its answer depends on besides the sound: for whisper.cpp the model's file name and size and the language; for a hosted
+service its address, model, language and the piece length (never the key). The same sound with another model or language is another
+entry and is listened to again, and an engine that cannot name itself (or a whisper.cpp whose model file cannot be read) is never
+cached. A transcript that is found is used as it was kept, word timing included. The job page then shows "Reusing what was heard in
+this video before" in place of "Listening to the speech", and the log line that ends the job says `transcriptReused: true`.
+
+It helps when the same video is uploaded again to try another shape, caption look or framing; when a video is uploaded twice by
+mistake; and when a job has to start over after a restart or failed in a later stage, because the transcript is kept as soon as it
+exists. It cannot know that two *different* files say the same words: the key is the sound itself, so the same recording saved in
+another format, trimmed or re-encoded is listened to again.
+
+What is kept is the text and the word times of what was said (table `transcript_cache`), not the video and not the sound. It is kept
+for `TRANSCRIPT_CACHE_DAYS` days (default 30) after it was last used and every use renews it; what has not been needed for that long is
+forgotten when the server starts and after each new transcript is kept. With `0` nothing is kept, and what was kept is cleared at the next
+start. Nobody can read a transcript by asking for it: it is only ever found by uploading the same sound, and the only thing that
+reveals is that the job was faster. A stored transcript that is damaged, has nothing in it or does not make sense (times that run
+backwards, the same segment twice) counts as not kept, and a transcript of nothing is never kept, so a failed or silent run is not repeated
+for ever. Whatever goes wrong with the cache (it cannot be read or written) is logged as an error and costs time, never the job.
+
+Evidence: the key, the reading back, the database table, the pipeline (reused or not, per engine, language and model, after a failed
+job, with a damaged or empty transcript, with the cache broken, forgetting old transcripts) and the whole application over HTTP
+(the same video uploaded twice reaches the speech engine once; with `TRANSCRIPT_CACHE_DAYS=0` it reaches it twice) are covered by tests that
+use real FFmpeg and a real Postgres database. To check that those tests would notice a mistake, the code was also broken on purpose in 64
+different ways, one at a time (a constant fingerprint, a key that ignores the language, a prune that deletes the wrong rows, a failing
+cache that fails the job, and so on); all were noticed except one that changes nothing (the program refuses to keep an empty transcript in
+two places, and removing only one of them leaves the other doing the job). That check was run by hand and is not part of the repository.
+**Not proven yet:** a reused transcript on the live service (it needs the same real video to be uploaded twice there), and
+how much time it saves on real recordings (the saving is the whole listening stage, which was 10 minutes for the one 45-second video
+measured, but that is one sample).
 
 ### The access code (optional)
 

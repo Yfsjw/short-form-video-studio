@@ -4,7 +4,8 @@ import { join } from 'node:path';
 import type { Logger } from 'pino';
 import type { StudioDatabase } from './database.js';
 import type { FfmpegAdapter } from './ffmpeg.js';
-import type { TranscriptionEngine } from './transcription.js';
+import type { TranscriptInput, TranscriptionEngine } from './transcription.js';
+import { fingerprintAudio } from './transcript-cache.js';
 import type { HighlightDetector, HighlightOptions } from './highlights.js';
 import type { ClipRenderer } from './clips.js';
 import type { ClipFramer } from './face-track.js';
@@ -16,7 +17,7 @@ import { aspectRatios, highlightOptionsFor } from './options.js';
 import { StageClock, stageProgress, totalMilliseconds } from './progress.js';
 import { sourceKeyFor, StoredObjectMissingError, type DurableStorage } from './storage.js';
 
-type PipelineStore = Pick<StudioDatabase, 'getJob' | 'updateJob' | 'replaceTranscript' | 'listTranscript' | 'replaceHighlights' | 'listHighlights' | 'createClip' | 'updateClip' | 'beginAttempt' | 'touchJob' | 'listUnfinishedJobs' | 'listFinishedJobsHoldingSource' | 'claimJobForRecovery' | 'failStaleJob' | 'deleteClipsForJob'>;
+type PipelineStore = Pick<StudioDatabase, 'getJob' | 'updateJob' | 'replaceTranscript' | 'listTranscript' | 'replaceHighlights' | 'listHighlights' | 'createClip' | 'updateClip' | 'beginAttempt' | 'touchJob' | 'listUnfinishedJobs' | 'listFinishedJobsHoldingSource' | 'claimJobForRecovery' | 'failStaleJob' | 'deleteClipsForJob' | 'findCachedTranscript' | 'storeCachedTranscript' | 'pruneTranscriptCache'>;
 type MediaProcessor = Pick<FfmpegAdapter, 'probe' | 'extractAudio'>;
 
 export interface PipelineRuntimeOptions {
@@ -36,9 +37,14 @@ export interface PipelineRuntimeOptions {
   watchdogMs: number;
   /** How many times a job may be started in total (the first run included) before it is failed for good. */
   maxAttempts: number;
+  /**
+   * How many days the transcript of a sound is kept after it was last used, so that the same sound (the same video uploaded again to try other
+   * choices, or a job started over after a restart) is not recognised again. 0 keeps nothing; left out means 0.
+   */
+  transcriptCacheDays?: number;
 }
 
-export const defaultRuntimeOptions: PipelineRuntimeOptions = { concurrency: 1, staleAfterMs: 60_000, heartbeatMs: 15_000, recheckMs: 30_000, watchdogMs: 180_000, maxAttempts: 3 };
+export const defaultRuntimeOptions: PipelineRuntimeOptions = { concurrency: 1, staleAfterMs: 60_000, heartbeatMs: 15_000, recheckMs: 30_000, watchdogMs: 180_000, maxAttempts: 3, transcriptCacheDays: 30 };
 
 export interface RecoverySummary {
   /** Jobs handed back to the pipeline because their video can still be obtained. */
@@ -391,6 +397,42 @@ export class VideoPipeline {
     }
   }
 
+  /**
+   * What was said, as segments with word timing. A sound that this engine has recognised before is not recognised again: its transcript is kept
+   * for `transcriptCacheDays` after it was last used (so trying other choices on the same video skips the longest stage, and a job that is started
+   * over after a restart does not lose a transcript it had already made). Whatever goes wrong with the cache, the speech is simply recognised:
+   * the cache can make a job faster, never make it fail.
+   */
+  private async recogniseSpeech(jobId: string, audioPath: string, workDir: string): Promise<{ segments: TranscriptInput; reused: boolean }> {
+    const days = this.options.transcriptCacheDays ?? 0;
+    const engineKey = days > 0 ? this.transcriber.cacheKey : undefined;
+    let fingerprint: string | undefined; let cached: TranscriptInput | undefined;
+    if (engineKey) {
+      try {
+        fingerprint = await fingerprintAudio(audioPath);
+        cached = await this.db.findCachedTranscript(fingerprint, engineKey);
+      } catch (error) {
+        this.logger.error({ err: error, jobId }, 'Could not look for an earlier transcript of this video; the speech will be recognised again');
+      }
+    }
+    if (cached) {
+      await this.enterStage(jobId, 'reusing_transcript');
+      this.logger.info({ jobId, audio: fingerprint?.slice(0, 12), segmentCount: cached.length }, 'The speech of this video was recognised before; that transcript is reused');
+      return { segments: cached, reused: true };
+    }
+    await this.enterStage(jobId, 'transcribing');
+    const segments = await this.transcriber.transcribe(audioPath, workDir, (fraction) => this.reportProgress(jobId, stageProgress('transcribing', fraction)));
+    if (engineKey && fingerprint && segments.length) {
+      try {
+        await this.db.storeCachedTranscript(fingerprint, engineKey, segments);
+        await this.db.pruneTranscriptCache(new Date(Date.now() - days * 86_400_000).toISOString());
+      } catch (error) {
+        this.logger.error({ err: error, jobId }, 'Could not keep the transcript for next time; the job goes on');
+      }
+    }
+    return { segments, reused: false };
+  }
+
   private async renderClips(job: VideoJob, sourcePath: string, jobOutputDir: string) {
     const jobId = job.id;
     await this.discardPreviousClips(jobId, jobOutputDir);
@@ -400,8 +442,7 @@ export class VideoPipeline {
     try {
       const audioPath = join(workDir, 'audio.wav');
       await this.ffmpeg.extractAudio(sourcePath, audioPath);
-      await this.enterStage(jobId, 'transcribing');
-      const segments = await this.transcriber.transcribe(audioPath, workDir, (fraction) => this.reportProgress(jobId, stageProgress('transcribing', fraction)));
+      const { segments, reused: transcriptReused } = await this.recogniseSpeech(jobId, audioPath, workDir);
       await this.db.replaceTranscript(jobId, segments);
       await this.enterStage(jobId, 'detecting_highlights');
       const options = job.options;
@@ -450,7 +491,7 @@ export class VideoPipeline {
       await this.progressWrites.get(jobId)?.catch(() => undefined);
       const stageTimings = this.clocks.get(jobId)?.finish() ?? {};
       await this.db.updateJob(jobId, { status: 'completed', stage: 'clip_extraction_complete', progress: 100, stageTimings });
-      this.logger.info({ jobId, metadata, options, stageTimingsMs: stageTimings, totalMs: totalMilliseconds(stageTimings), transcriptSegmentCount: segments.length, highlightCandidateCount: highlights.length, completedClipCount: completedCount, ...(options.framing === 'face' ? { framingMs } : {}) }, 'Video processing, vertical rendering, and caption burn-in completed');
+      this.logger.info({ jobId, metadata, options, stageTimingsMs: stageTimings, totalMs: totalMilliseconds(stageTimings), transcriptSegmentCount: segments.length, transcriptReused, highlightCandidateCount: highlights.length, completedClipCount: completedCount, ...(options.framing === 'face' ? { framingMs } : {}) }, 'Video processing, vertical rendering, and caption burn-in completed');
     } finally {
       await rm(workDir, { recursive: true, force: true });
     }

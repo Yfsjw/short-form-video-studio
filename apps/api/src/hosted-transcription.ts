@@ -123,6 +123,11 @@ const RETRIED_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
 export class OpenAiCompatibleTranscriber implements TranscriptionEngine {
   constructor(private readonly settings: HostedTranscriptionSettings, private readonly tools: HostedTranscriptionTools = {}) {}
 
+  /** Which service, which model, which language, and how the audio is cut up (the pieces decide where segments begin and end). The key is never part of it. */
+  get cacheKey(): string | undefined {
+    try { return `hosted|${new URL(this.settings.apiUrl).host}|${this.settings.model}|${this.settings.language}|${this.settings.chunkSeconds}`; } catch { return undefined; }
+  }
+
   async transcribe(audioPath: string, workDir: string, onProgress?: (fraction: number) => void): Promise<TranscriptInput> {
     const { ffmpegPath, ffprobePath, chunkSeconds, concurrency } = this.settings;
     const duration = await audioDuration(ffprobePath, audioPath);

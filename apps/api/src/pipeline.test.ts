@@ -11,7 +11,7 @@ import { defaultJobOptions, type JobOptions, type NewVideoJob } from './domain.j
 import { VideoPipeline, type PipelineRuntimeOptions } from './pipeline.js';
 import { NullStorage, type DurableStorage } from './storage.js';
 import { MemoryStorage, eventually, sleep } from './test-support.js';
-import type { TranscriptionEngine } from './transcription.js';
+import type { TranscriptInput, TranscriptionEngine } from './transcription.js';
 import { DeterministicHighlightDetector } from './highlights.js';
 import type { ClipRenderer, ClipRenderRequest } from './clips.js';
 import type { ClipFramer } from './face-track.js';
@@ -46,7 +46,9 @@ async function setup(options: { highlights?: Partial<typeof highlightOptions>; s
   const raw = new Pool({ connectionString: TEST_DATABASE_URL, options: `-c search_path="${schema}"` });
   const storage = options.storage ?? new MemoryStorage();
   const errors: string[] = [];
-  const logger = { info: () => undefined, error: (_fields: unknown, message?: string) => { errors.push(String(message)); } };
+  /** What the pipeline said about itself at the information level (the fields it attached, and the sentence). */
+  const infos: Array<{ fields: Record<string, unknown>; message: string }> = [];
+  const logger = { info: (fields: unknown, message?: string) => { infos.push({ fields: (fields && typeof fields === 'object' ? fields : {}) as Record<string, unknown>, message: String(message) }); }, error: (_fields: unknown, message?: string) => { errors.push(String(message)); } };
   const pipelines: VideoPipeline[] = [];
   const makePipeline = () => {
     const pipeline = new VideoPipeline(options.database ? options.database(db) : db, options.media ?? fakeMedia, options.transcriber ?? speech, new DeterministicHighlightDetector(), { ...highlightOptions, ...options.highlights }, options.renderer ?? writingRenderer, 1, uploadDir, tempDir, outputDir, logger, storage, { ...fastRuntime, ...options.runtime }, options.framer);
@@ -54,7 +56,7 @@ async function setup(options: { highlights?: Partial<typeof highlightOptions>; s
     return pipeline;
   };
   return {
-    root, uploadDir, tempDir, outputDir, db, storage, errors, makePipeline, pipeline: makePipeline(),
+    root, uploadDir, tempDir, outputDir, db, raw, storage, errors, infos, makePipeline, pipeline: makePipeline(),
     /** Pretend nothing has touched this job for a while, as if the process working on it had died. */
     backdate: async (id: string, minutes: number) => { await raw.query('UPDATE video_jobs SET updated_at = $1 WHERE id = $2', [new Date(Date.now() - minutes * 60_000).toISOString(), id]); },
     cleanup: async () => { for (const pipeline of pipelines) pipeline.close(); await raw.end(); await db.close({ dropSchema: true }); await rm(root, { recursive: true, force: true }); },
@@ -955,4 +957,174 @@ test('the whole picture over a blurred copy: every clip is rendered that way, no
     for (const request of requests) assert.equal(request.layout, 'fill', 'the middle of the picture is cut out, as before');
     assert.deepEqual(ctx.errors, []);
   } finally { await ctx.cleanup(); }
+});
+
+// ---------------------------------------------------------------------------------------------------------------------------
+// The same sound is not recognised twice.
+
+/** An engine that counts how often it is asked to listen, and whose cache key (what its transcripts depend on besides the sound) can be changed between runs. */
+function listeningEngine(options: { key?: string; segments?: TranscriptInput } = {}) {
+  const engine: TranscriptionEngine & { calls: number; key: string | undefined } = {
+    calls: 0, key: options.key,
+    get cacheKey() { return engine.key; },
+    transcribe: async () => {
+      engine.calls += 1;
+      return options.segments ?? [{ segmentIndex: 0, startSeconds: 0, endSeconds: 2, text: 'Said once, heard once.', words: [{ text: 'Said', startSeconds: 0, endSeconds: 0.5 }, { text: 'once,', startSeconds: 0.5, endSeconds: 1 }, { text: 'heard', startSeconds: 1, endSeconds: 1.5 }, { text: 'once.', startSeconds: 1.5, endSeconds: 2 }] }];
+    },
+  };
+  return engine;
+}
+/** The database, noting which of the cache's methods are called. */
+function watched(db: StudioDatabase, calls: string[]) {
+  return new Proxy(db, { get(target, property, receiver) {
+    const value = Reflect.get(target, property, receiver);
+    if (typeof value !== 'function') return value;
+    if (typeof property === 'string' && /CachedTranscript$/.test(property)) return (...args: unknown[]) => { calls.push(property); return value.apply(target, args); };
+    return value.bind(target);
+  } });
+}
+/** The sound of a video here is the bytes of the video file itself, so two uploads of the same bytes have the same sound. */
+const hearing = { ...fakeMedia, extractAudio: async (input: string, output: string) => { await writeFile(output, await readFile(input)); } };
+const withCache = { transcriptCacheDays: 30 };
+const heard = (ctx: Context) => ctx.infos.filter((entry) => entry.message.includes('caption burn-in completed')).map((entry) => entry.fields.transcriptReused);
+
+test('the same sound is recognised once: a video uploaded again reuses the transcript and says so, and its clips are made as usual', async () => {
+  const engine = listeningEngine({ key: 'test-engine|1' });
+  const ctx = await setup({ transcriber: engine, media: hearing, runtime: withCache });
+  try {
+    await addJob(ctx, 'j1'); await ctx.pipeline.run('j1');
+    assert.equal(engine.calls, 1);
+    const first = await ctx.db.getJob('j1');
+    assert.equal(first?.status, 'completed');
+    assert.ok('transcribing' in first!.stageTimings && !('reusing_transcript' in first!.stageTimings), 'the first time the speech is listened to');
+
+    await addJob(ctx, 'j2'); await ctx.pipeline.run('j2');
+    assert.equal(engine.calls, 1, 'the second video had the same sound: nobody listened again');
+    const second = await ctx.db.getJob('j2');
+    assert.equal(second?.status, 'completed', second?.errorMessage ?? '');
+    assert.ok('reusing_transcript' in second!.stageTimings && !('transcribing' in second!.stageTimings), 'and the job says it did not');
+    const shape = async (id: string) => (await ctx.db.listTranscript(id)).map(({ segmentIndex, startSeconds, endSeconds, text, words }) => ({ segmentIndex, startSeconds, endSeconds, text, words }));
+    assert.deepEqual(await shape('j2'), await shape('j1'), 'the transcript, words and their timing included, is the same');
+    assert.equal((await shape('j2'))[0].words?.length, 4);
+    assert.equal((await ctx.db.listClips('j2')).filter((clip) => clip.status === 'completed').length, 1, 'the clips are made from it as usual');
+    assert.deepEqual(heard(ctx), [false, true], 'the log says which time the speech was reused');
+    assert.equal(ctx.errors.length, 0);
+  } finally { await ctx.cleanup(); }
+});
+
+test('what is reused is the transcript of the same sound by the same engine: another sound, another engine, language or model, or no cache at all, means listening again', async () => {
+  const engine = listeningEngine({ key: 'test-engine|1' });
+  const ctx = await setup({ transcriber: engine, media: hearing, runtime: withCache });
+  try {
+    await addJob(ctx, 'j1'); await ctx.pipeline.run('j1');
+    assert.equal(engine.calls, 1);
+
+    await addJob(ctx, 'other-sound'); await writeFile(join(ctx.uploadDir, 'other-sound.mp4'), 'a different video, so a different sound');
+    await ctx.pipeline.run('other-sound');
+    assert.equal(engine.calls, 2, 'another sound is listened to');
+
+    engine.key = 'test-engine|2';
+    await addJob(ctx, 'other-engine'); await ctx.pipeline.run('other-engine');
+    assert.equal(engine.calls, 3, 'the same sound, but another model or language: listened to again');
+
+    engine.key = 'test-engine|1';
+    await addJob(ctx, 'back-again'); await ctx.pipeline.run('back-again');
+    assert.equal(engine.calls, 3, 'and with the first engine back, the first transcript is still there');
+    assert.deepEqual(heard(ctx), [false, false, false, true]);
+  } finally { await ctx.cleanup(); }
+
+  for (const [label, key, days] of [['an engine that has no key', undefined, 30], ['keeping nothing (0 days)', 'test-engine|1', 0]] as const) {
+    const silent = listeningEngine(key ? { key } : {}); const asked: string[] = [];
+    const plain = await setup({ transcriber: silent, media: hearing, runtime: { transcriptCacheDays: days }, database: (db) => watched(db, asked) });
+    try {
+      await addJob(plain, 'a'); await plain.pipeline.run('a'); await addJob(plain, 'b'); await plain.pipeline.run('b');
+      assert.equal(silent.calls, 2, `${label}: the same sound is listened to each time`);
+      assert.deepEqual(asked, [], `${label}: the cache is not even asked, let alone filled`);
+      assert.equal((await plain.raw.query('SELECT count(*)::int AS n FROM transcript_cache')).rows[0].n, 0, `${label}: nothing is kept`);
+    } finally { await plain.cleanup(); }
+  }
+});
+
+test('a transcript is kept even when the job that made it failed afterwards, so the next try does not listen again', async () => {
+  const engine = listeningEngine({ key: 'test-engine|1' });
+  let breaking = true;
+  const renderer: ClipRenderer = { render: async (request) => { if (breaking) throw new Error('the renderer broke'); await writeFile(request.outputPath, 'rendered clip'); return { durationSeconds: request.endSeconds - request.startSeconds, sizeBytes: 13 }; } };
+  const ctx = await setup({ transcriber: engine, media: hearing, renderer, runtime: withCache });
+  try {
+    await addJob(ctx, 'j1'); await ctx.pipeline.run('j1');
+    assert.equal((await ctx.db.getJob('j1'))?.status, 'failed');
+    assert.equal(engine.calls, 1);
+    breaking = false;
+    await addJob(ctx, 'j2'); await ctx.pipeline.run('j2');
+    assert.equal((await ctx.db.getJob('j2'))?.status, 'completed');
+    assert.equal(engine.calls, 1, 'the speech was already written down, so nobody listens again');
+  } finally { await ctx.cleanup(); }
+});
+
+test('a transcript of nothing is not kept, and a damaged one is not trusted: the speech is listened to again', async () => {
+  const quiet = listeningEngine({ key: 'test-engine|1', segments: [] });
+  const ctx = await setup({ transcriber: quiet, media: hearing, runtime: withCache });
+  try {
+    await addJob(ctx, 'q1'); await ctx.pipeline.run('q1');
+    assert.equal((await ctx.db.getJob('q1'))?.status, 'failed');
+    assert.match((await ctx.db.getJob('q1'))?.errorMessage ?? '', /No speech was recognised/);
+    await addJob(ctx, 'q2'); await ctx.pipeline.run('q2');
+    assert.equal(quiet.calls, 2, 'nothing was said last time, which says nothing about this time');
+    assert.equal((await ctx.raw.query('SELECT count(*)::int AS n FROM transcript_cache')).rows[0].n, 0, 'not even a row of it is kept');
+  } finally { await ctx.cleanup(); }
+
+  const engine = listeningEngine({ key: 'test-engine|1' });
+  const damaged = await setup({ transcriber: engine, media: hearing, runtime: withCache });
+  try {
+    await addJob(damaged, 'j1'); await damaged.pipeline.run('j1');
+    await damaged.raw.query(`UPDATE transcript_cache SET segments_json = '[{"segmentIndex":0,"startSeconds":0,"endSeconds":2,"text":"cut off'`);
+    await addJob(damaged, 'j2'); await damaged.pipeline.run('j2');
+    assert.equal((await damaged.db.getJob('j2'))?.status, 'completed');
+    assert.equal(engine.calls, 2, 'the damaged transcript was not used');
+    await addJob(damaged, 'j3'); await damaged.pipeline.run('j3');
+    assert.equal(engine.calls, 2, 'and the one made instead of it is good');
+  } finally { await damaged.cleanup(); }
+});
+
+test('transcripts nobody has needed for as many days as are kept are forgotten as a new one is made, and the ones still in use are not', async () => {
+  const engine = listeningEngine({ key: 'test-engine|1' });
+  const ctx = await setup({ transcriber: engine, media: hearing, runtime: { transcriptCacheDays: 30 } });
+  try {
+    const transcript = '[{"segmentIndex":0,"startSeconds":0,"endSeconds":1,"text":"Said before."}]';
+    const keep = (sound: string, daysAgo: number) => ctx.raw.query(
+      `INSERT INTO transcript_cache (audio_sha256, engine_key, segments_json, created_at, last_used_at, uses) VALUES ($1, 'test-engine|1', $2, $3, $3, 0)`,
+      [sound, transcript, new Date(Date.now() - daysAgo * 86_400_000).toISOString()]);
+    await keep('unused-for-31-days', 31); await keep('unused-for-29-days', 29); await keep('unused-for-a-day', 1);
+    await addJob(ctx, 'j1'); await ctx.pipeline.run('j1');
+    assert.equal((await ctx.db.getJob('j1'))?.status, 'completed');
+    const left = (await ctx.raw.query('SELECT audio_sha256 FROM transcript_cache')).rows.map((row) => String(row.audio_sha256));
+    assert.ok(!left.includes('unused-for-31-days'), 'a transcript nobody needed for 31 days (30 are kept) is forgotten');
+    assert.ok(left.includes('unused-for-29-days') && left.includes('unused-for-a-day'), 'the ones used within the last 30 days stay');
+    assert.equal(left.length, 3, 'and the one just made is kept with them');
+  } finally { await ctx.cleanup(); }
+});
+
+test('whatever goes wrong with the cache, the job is done: a cache that cannot be read or written costs time, never the job', async () => {
+  const failing = (db: StudioDatabase, methods: string[]) => new Proxy(db, { get(target, property, receiver) {
+    const value = Reflect.get(target, property, receiver);
+    if (typeof property === 'string' && methods.includes(property)) return () => Promise.reject(new Error('the cache is out of order'));
+    return typeof value === 'function' ? value.bind(target) : value;
+  } });
+  const engine = listeningEngine({ key: 'test-engine|1' });
+  const unreadable = await setup({ transcriber: engine, media: hearing, runtime: withCache, database: (db) => failing(db, ['findCachedTranscript']) });
+  try {
+    await addJob(unreadable, 'j1'); await unreadable.pipeline.run('j1');
+    assert.equal((await unreadable.db.getJob('j1'))?.status, 'completed', 'the speech was listened to instead');
+    assert.equal(engine.calls, 1);
+    assert.ok(unreadable.errors.some((message) => /Could not look for an earlier transcript/.test(message)), 'and the log says why');
+  } finally { await unreadable.cleanup(); }
+
+  const writeEngine = listeningEngine({ key: 'test-engine|1' });
+  const unwritable = await setup({ transcriber: writeEngine, media: hearing, runtime: withCache, database: (db) => failing(db, ['storeCachedTranscript']) });
+  try {
+    await addJob(unwritable, 'j1'); await unwritable.pipeline.run('j1');
+    assert.equal((await unwritable.db.getJob('j1'))?.status, 'completed');
+    assert.ok(unwritable.errors.some((message) => /Could not keep the transcript for next time/.test(message)));
+    assert.equal((await unwritable.db.listClips('j1')).filter((clip) => clip.status === 'completed').length, 1);
+  } finally { await unwritable.cleanup(); }
 });

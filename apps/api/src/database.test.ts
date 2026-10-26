@@ -344,3 +344,64 @@ test('deleting a job\'s clips returns them (so their files can be removed) and s
   assert.deepEqual((await db.listClips('j2')).map((clip) => clip.id), ['c3']);
   assert.deepEqual(await db.deleteClipsForJob('j1'), []);
 }));
+
+test('a transcript is kept for the next time the same sound comes, per engine; finding it counts as using it; a damaged or empty one is never trusted', async () => {
+  const schema = schemaName('transcript_cache');
+  const db = await StudioDatabase.connect(TEST_DATABASE_URL, schema);
+  const raw = new Pool({ connectionString: TEST_DATABASE_URL, options: `-c search_path="${schema}"` });
+  try {
+    const segments = [
+      { segmentIndex: 0, startSeconds: 0.5, endSeconds: 2.25, text: 'Hello there, world.', words: [{ text: 'Hello', startSeconds: 0.5, endSeconds: 1 }, { text: 'there,', startSeconds: 1, endSeconds: 1.5 }, { text: 'world.', startSeconds: 1.5, endSeconds: 2.25 }] },
+      { segmentIndex: 1, startSeconds: 3, endSeconds: 4, text: 'No word timing here.' },
+    ];
+    assert.equal(await db.findCachedTranscript('sound-a', 'engine-1'), undefined, 'nothing is kept before it is stored');
+    await db.storeCachedTranscript('sound-a', 'engine-1', segments);
+    assert.deepEqual(await db.findCachedTranscript('sound-a', 'engine-1'), segments, 'it comes back as it went in, words and all');
+    assert.equal(await db.findCachedTranscript('sound-a', 'engine-2'), undefined, 'another engine (or model, or language) does not get it');
+    assert.equal(await db.findCachedTranscript('sound-b', 'engine-1'), undefined, 'another sound does not get it');
+
+    await raw.query(`UPDATE transcript_cache SET last_used_at = $1`, [minutesAgo(60 * 24 * 40)]);
+    await db.storeCachedTranscript('sound-a', 'engine-1', [{ segmentIndex: 0, startSeconds: 0, endSeconds: 1, text: 'A better transcript.' }]);
+    assert.equal(await db.pruneTranscriptCache(minutesAgo(60 * 24 * 30)), 0, 'a transcript that replaces an old one counts as used now, so it is not forgotten for the age of what it replaced');
+    assert.equal((await db.findCachedTranscript('sound-a', 'engine-1'))?.[0].text, 'A better transcript.', 'storing again replaces what was kept');
+    assert.equal((await raw.query('SELECT count(*)::int AS n FROM transcript_cache')).rows[0].n, 1, 'and does not keep two');
+
+    await db.storeCachedTranscript('sound-empty', 'engine-1', []);
+    assert.equal(await db.findCachedTranscript('sound-empty', 'engine-1'), undefined, 'a transcript of nothing is not kept: a failed run must not be repeated for ever');
+    assert.equal((await raw.query(`SELECT count(*)::int AS n FROM transcript_cache WHERE audio_sha256 = 'sound-empty'`)).rows[0].n, 0, 'not even a row of it');
+
+    await db.storeCachedTranscript('sound-damaged', 'engine-1', segments);
+    await raw.query(`UPDATE transcript_cache SET segments_json = '[{"segmentIndex":0,"text":"cut off in the middle' WHERE audio_sha256 = 'sound-damaged'`);
+    assert.equal(await db.findCachedTranscript('sound-damaged', 'engine-1'), undefined, 'a damaged transcript counts as not kept');
+
+    // Looking a transcript up counts as using it, which is what keeps it from being forgotten.
+    await db.storeCachedTranscript('sound-old', 'engine-1', segments); await db.storeCachedTranscript('sound-used', 'engine-1', segments);
+    await raw.query(`UPDATE transcript_cache SET last_used_at = $1 WHERE audio_sha256 IN ('sound-old', 'sound-used')`, [minutesAgo(60 * 24 * 40)]);
+    assert.ok(await db.findCachedTranscript('sound-used', 'engine-1'));
+    assert.equal((await raw.query(`SELECT uses FROM transcript_cache WHERE audio_sha256 = 'sound-used'`)).rows[0].uses, 1);
+    const removed = await db.pruneTranscriptCache(minutesAgo(60 * 24 * 30));
+    assert.equal(removed, 1, 'only the transcript nobody has asked for in the last 30 days is forgotten');
+    assert.equal(await db.findCachedTranscript('sound-old', 'engine-1'), undefined);
+    assert.ok(await db.findCachedTranscript('sound-used', 'engine-1'), 'the one that was used is still there');
+    assert.ok(await db.findCachedTranscript('sound-a', 'engine-1'), 'and so is the recent one');
+    assert.equal(await db.pruneTranscriptCache(new Date(Date.now() + 60_000).toISOString()) >= 2, true, 'a cut-off in the future forgets everything');
+    assert.equal((await raw.query('SELECT count(*)::int AS n FROM transcript_cache')).rows[0].n, 0);
+  } finally { await raw.end(); await db.close({ dropSchema: true }); }
+});
+
+test('a database created before transcripts were kept gets the table, and keeps its jobs', async () => {
+  const schema = schemaName('cache_upgrade');
+  const first = await StudioDatabase.connect(TEST_DATABASE_URL, schema);
+  const raw = new Pool({ connectionString: TEST_DATABASE_URL, options: `-c search_path="${schema}"` });
+  try {
+    await first.createJob(makeJob('before', 'completed'));
+    await raw.query('DROP TABLE transcript_cache');
+    await first.close();
+    const second = await StudioDatabase.connect(TEST_DATABASE_URL, schema);
+    try {
+      assert.equal((await second.getJob('before'))?.status, 'completed', 'the jobs are still there');
+      await second.storeCachedTranscript('x', 'y', [{ segmentIndex: 0, startSeconds: 0, endSeconds: 1, text: 'Works.' }]);
+      assert.equal((await second.findCachedTranscript('x', 'y'))?.[0].text, 'Works.', 'and the table is back');
+    } finally { await second.close({ dropSchema: true }); }
+  } finally { await raw.end(); }
+});
