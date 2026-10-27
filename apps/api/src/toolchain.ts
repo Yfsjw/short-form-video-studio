@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process';
-import { access, constants, mkdtemp, readdir, rm, stat } from 'node:fs/promises';
+import { access, constants, mkdtemp, readdir, readFile, rm, stat } from 'node:fs/promises';
+import { availableParallelism, totalmem } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
@@ -7,6 +8,7 @@ import { writeAssCaptions } from './captions.js';
 import { BUNDLED_FONTS_DIRECTORY, FfmpegClipRenderer, type FfmpegRunner } from './clips.js';
 import { FaceClipFramer } from './face-track.js';
 import { positionAt, type FramingPlan } from './framing.js';
+import { WhisperCppTranscriber, type TranscriptInput } from './transcription.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -37,14 +39,26 @@ export interface ToolchainCheckOptions {
   /** Where the temporary files go: a folder of its own is made inside it and removed afterwards. */
   workDirectory: string;
   fontsDirectory?: string;
-  /** The whisper.cpp files to look at; null when speech recognition is done by a hosted service (nothing on this machine to check). */
-  whisper?: { binaryPath: string; modelPath: string } | null;
+  /** The whisper.cpp files to look at; null when speech recognition is done by a hosted service (nothing on this machine to check). `threads` is how it is started (`-t`); left out, it chooses for itself. */
+  whisper?: { binaryPath: string; modelPath: string; threads?: number } | null;
   /** Whether the "Follow a face" choice is on offer, so that it is checked too. */
   faceFollowing?: boolean;
   /** The portrait the face follower is shown (default: the one in test-assets, which comes with the program). */
   portraitPath?: string;
   /** How long one program may take (default two minutes: a small shared processor is slow, not stuck). */
   stepTimeoutMs?: number;
+  /**
+   * Whether to also learn what this machine really does, which the other checks cannot say: what limits it has, how whisper.cpp does with a
+   * recording of real speech (that its output is understood, with the times of the words, and how long it takes), and how long FFmpeg takes
+   * for a few seconds of video at the size of real clips. On a small shared processor that costs a minute or two, which is why it is a choice.
+   */
+  realSamples?: boolean;
+  /** The size of a vertical clip, which the render sample is made at (without it there is no render sample). */
+  clipSize?: { width: number; height: number };
+  /** The recording of speech whisper.cpp listens to (default: the one in test-assets, which comes with the program). */
+  speechSamplePath?: string;
+  /** Where to find what limits this machine (default: the control group files of the container). */
+  machine?: () => Promise<MachineLimits>;
 }
 
 /** The filters the clips are made with (see clips.ts): captions, the cut-out window, and the whole picture over a blurred copy. */
@@ -117,6 +131,98 @@ export const pixelAt = (grey: Buffer, width: number, x: number, y: number) => gr
 export const countAtLeast = (grey: Buffer, level: number) => { let count = 0; for (const value of grey) if (value >= level) count += 1; return count; };
 
 // ---------------------------------------------------------------------------------------------------------------------------
+// Learning what this machine really does (optional, see `realSamples`).
+
+/** A recording of speech that comes with the program (see test-assets/README.md): 11 seconds, 16 kHz mono, the end of a famous public-domain speech. */
+export const SPEECH_SAMPLE_PATH = fileURLToPath(new URL('../test-assets/jfk.wav', import.meta.url));
+export const SPEECH_SAMPLE_TEXT = 'And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country.';
+export const SPEECH_SAMPLE_SECONDS = 11;
+
+const wordsOf = (text: string) => text.toLowerCase().replace(/[^\p{L}\p{N}\s']/gu, ' ').split(/\s+/).filter(Boolean);
+
+/** How much of what was said was written, as a share: the longest run of words that both texts have in the same order, over the number of words said. */
+export function shareOfWordsHeard(written: string, said: string): number {
+  const heard = wordsOf(written); const spoken = wordsOf(said);
+  if (!spoken.length) return 0;
+  let previous = new Array<number>(heard.length + 1).fill(0);
+  for (const word of spoken) {
+    const row = [0];
+    for (let index = 0; index < heard.length; index += 1) row.push(heard[index] === word ? previous[index] + 1 : Math.max(previous[index + 1], row[index]));
+    previous = row;
+  }
+  return previous[heard.length] / spoken.length;
+}
+
+export interface SpeechSampleVerdict { words: number; share: number; text: string; }
+
+/**
+ * Whether what the speech engine wrote for the recording is what a working engine writes: the words of the speech (most of them, in order),
+ * each with a time, the times in order and spread over the recording and not piled up at one end. Throws, saying what is wrong, when not.
+ * What this finds is a model that is damaged or not the one expected, output that is read wrongly, and word times that cannot be used.
+ */
+export function judgeSpeechSample(segments: TranscriptInput): SpeechSampleVerdict {
+  if (!segments.length) throw new Error('nothing was written for a recording of clear speech');
+  const text = segments.map((segment) => segment.text).join(' ');
+  const share = shareOfWordsHeard(text, SPEECH_SAMPLE_TEXT);
+  if (share < 0.75) throw new Error(`the recording says "${SPEECH_SAMPLE_TEXT}" but what was written is "${text.slice(0, 160)}" (${Math.round(share * 100)}% of the words)`);
+  const words = segments.flatMap((segment) => segment.words ?? []);
+  if (!words.length) throw new Error('the text came without a time for each word, so the captions could not light the word being spoken');
+  let previousStart = 0;
+  for (const word of words) {
+    const usable = Number.isFinite(word.startSeconds) && Number.isFinite(word.endSeconds) && word.startSeconds >= 0 && word.endSeconds >= word.startSeconds && word.endSeconds <= SPEECH_SAMPLE_SECONDS + 1;
+    if (!usable) throw new Error(`the word "${word.text}" has a time that cannot be right (${word.startSeconds} to ${word.endSeconds} s in a recording of ${SPEECH_SAMPLE_SECONDS} s)`);
+    if (word.startSeconds < previousStart - 0.05) throw new Error(`the word "${word.text}" is timed before the one that comes before it`);
+    previousStart = word.startSeconds;
+  }
+  const first = words[0].startSeconds; const last = words[words.length - 1].endSeconds;
+  if (first > 3 || last < 7) throw new Error(`the words are timed between ${first.toFixed(1)} and ${last.toFixed(1)} s, but the speech runs from the start of the recording to nearly its end`);
+  return { words: words.length, share, text };
+}
+
+export interface MachineLimits { cpuLimit: number | null; memoryLimitBytes: number | null; cores: number; totalMemoryBytes: number; }
+
+/**
+ * How much of a processor a container may use, from the files of its control group (version 2: "cpu.max" holds "<quota> <period>" or
+ * "max <period>"; version 1: the quota and the period are in two files). null when there is no limit or nothing can be read.
+ */
+export function cpuLimitFrom(version2?: string, version1Quota?: string, version1Period?: string): number | null {
+  const parts = version2?.trim().split(/\s+/) ?? [];
+  if (parts[0]) {
+    if (parts[0] === 'max') return null;
+    const quota = Number(parts[0]); const period = Number(parts[1] ?? 100_000);
+    return quota > 0 && period > 0 ? quota / period : null;
+  }
+  const quota = Number(version1Quota?.trim()); const period = Number(version1Period?.trim());
+  return Number.isFinite(quota) && Number.isFinite(period) && quota > 0 && period > 0 ? quota / period : null;
+}
+
+/** The memory a container may use, in bytes: version 2 says "max" for no limit, version 1 says a number close to 2^63. */
+export function memoryLimitFrom(version2?: string, version1?: string): number | null {
+  for (const text of [version2, version1]) {
+    const value = text?.trim();
+    if (!value || value === 'max') continue;
+    const bytes = Number(value);
+    if (Number.isFinite(bytes) && bytes > 0 && bytes < 2 ** 50) return bytes;
+  }
+  return null;
+}
+
+export function describeMachine(limits: MachineLimits): string {
+  const mebibytes = (bytes: number) => `${Math.round(bytes / 1024 / 1024)} MiB`;
+  const processor = limits.cpuLimit === null ? `no limit on the processor share (${limits.cores} cores visible)` : `the processor share is limited to ${limits.cpuLimit.toFixed(2)} of one core (${limits.cores} cores visible)`;
+  const memory = limits.memoryLimitBytes === null ? `memory ${mebibytes(limits.totalMemoryBytes)}, with no limit of its own` : `memory limited to ${mebibytes(limits.memoryLimitBytes)}`;
+  return `${processor}; ${memory}`;
+}
+
+async function readMachineLimits(): Promise<MachineLimits> {
+  const read = (path: string) => readFile(path, 'utf8').catch(() => undefined);
+  const [version2Cpu, version1Quota, version1Period, version2Memory, version1Memory] = await Promise.all([
+    read('/sys/fs/cgroup/cpu.max'), read('/sys/fs/cgroup/cpu/cpu.cfs_quota_us'), read('/sys/fs/cgroup/cpu/cpu.cfs_period_us'), read('/sys/fs/cgroup/memory.max'), read('/sys/fs/cgroup/memory/memory.limit_in_bytes'),
+  ]);
+  return { cpuLimit: cpuLimitFrom(version2Cpu, version1Quota, version1Period), memoryLimitBytes: memoryLimitFrom(version2Memory, version1Memory), cores: availableParallelism(), totalMemoryBytes: totalmem() };
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------
 
 function describeFailure(error: unknown): string {
   if (error && typeof error === 'object') {
@@ -157,6 +263,41 @@ export async function checkToolchain(options: ToolchainCheckOptions): Promise<To
     }
   };
   const skip = (name: string, because: string) => { steps.push({ name, ok: false, ms: 0, detail: `not run: ${because}` }); };
+  const wantsRenderSample = options.realSamples === true && options.clipSize !== undefined;
+  const ffmpegSteps = ['test-video', 'captions', 'whole-picture', 'moving-window', ...(wantsRenderSample ? ['render-speed'] : []), ...(options.faceFollowing ? ['face-following'] : [])];
+
+  const seen: { machine?: MachineLimits } = {};
+  if (options.realSamples) {
+    // What the machine is like is only told, never judged: a machine whose limits cannot be read is not a machine that does not work.
+    await record('machine', async () => {
+      try { seen.machine = await (options.machine ?? readMachineLimits)(); return describeMachine(seen.machine); }
+      catch (error) { return `could not be found out (${describeFailure(error)})`; }
+    });
+  }
+
+  /** whisper.cpp listens to the recording that comes with the program, through the very code that listens to customers' videos. */
+  const listenToSample = async (whisper: { binaryPath: string; modelPath: string; threads?: number }, cpuLimit: number | null): Promise<string> => {
+    const recording = options.speechSamplePath ?? SPEECH_SAMPLE_PATH;
+    await access(recording, constants.R_OK).catch(() => { throw new Error('the recording of speech is not installed with the program'); });
+    const folder = await mkdtemp(join(options.workDirectory, 'speech-sample-'));
+    try {
+      // The recording is English, so it is listened to as English whatever language the service is set to: it is the program that is checked, not the setting.
+      const listen = async (threads: number | undefined) => {
+        const started = performance.now();
+        const segments = await new WhisperCppTranscriber(whisper.binaryPath, whisper.modelPath, 'en', Math.max(timeout, 300_000), threads).transcribe(recording, folder);
+        return { segments, seconds: (performance.now() - started) / 1000 };
+      };
+      const heard = await listen(whisper.threads);
+      const verdict = judgeSpeechSample(heard.segments);
+      let comparison = '';
+      // With less than one core to share, does one thread do better than several? That is measured here, so that it is known and not guessed.
+      if (whisper.threads === undefined && cpuLimit !== null && cpuLimit < 1) {
+        const single = await listen(1).catch(() => undefined);
+        if (single) comparison = `; with one thread: ${single.seconds.toFixed(1)} s`;
+      }
+      return `wrote ${verdict.words} words with their times, ${Math.round(verdict.share * 100)}% of those said ("${verdict.text.slice(0, 60)}${verdict.text.length > 60 ? '…' : ''}"); ${heard.seconds.toFixed(1)} s to listen to ${SPEECH_SAMPLE_SECONDS} s of speech${comparison}`;
+    } finally { await rm(folder, { recursive: true, force: true }).catch(() => undefined); }
+  };
 
   const ffmpegWorks = await record('ffmpeg', async () => {
     const version = versionOf(await text(options.ffmpegPath, ['-hide_banner', '-version']), 'ffmpeg');
@@ -202,7 +343,7 @@ export async function checkToolchain(options: ToolchainCheckOptions): Promise<To
 
   if (options.whisper) {
     const { binaryPath, modelPath } = options.whisper;
-    await record('speech-engine', async () => {
+    const speechEngineWorks = await record('speech-engine', async () => {
       await access(binaryPath, constants.X_OK).catch(() => { throw new Error('whisper.cpp is missing or not executable'); });
       const model = await stat(modelPath).catch(() => { throw new Error('the speech model file is missing'); });
       if (!model.isFile() || model.size < MIN_MODEL_BYTES) throw new Error(`the speech model file is only ${model.size} bytes, so its download did not finish`);
@@ -211,10 +352,14 @@ export async function checkToolchain(options: ToolchainCheckOptions): Promise<To
       if (!/usage/i.test(usage)) throw new Error('whisper.cpp started but did not print what a working copy prints');
       return `whisper.cpp runs, model ${Math.round(model.size / 1024 / 1024)} MB`;
     });
+    if (options.realSamples) {
+      if (speechEngineWorks) await record('speech-sample', () => listenToSample(options.whisper!, seen.machine?.cpuLimit ?? null));
+      else skip('speech-sample', 'the speech engine check failed');
+    }
   }
 
   if (!ffmpegWorks || !ffprobeWorks) {
-    for (const name of ['test-video', 'captions', 'whole-picture', 'moving-window', ...(options.faceFollowing ? ['face-following'] : [])]) skip(name, ffmpegWorks ? 'ffprobe does not work' : 'ffmpeg does not work');
+    for (const name of ffmpegSteps) skip(name, ffmpegWorks ? 'ffprobe does not work' : 'ffmpeg does not work');
     return { ok: false, steps };
   }
 
@@ -231,17 +376,17 @@ export async function checkToolchain(options: ToolchainCheckOptions): Promise<To
       ], { timeout, maxBuffer: 4 * 1024 * 1024 });
       return '320x180, 2 s, with sound';
     });
-    if (!made) { for (const name of ['captions', 'whole-picture', 'moving-window', ...(options.faceFollowing ? ['face-following'] : [])]) skip(name, 'the test video could not be made'); return { ok: false, steps }; }
+    if (!made) { for (const name of ffmpegSteps.slice(1)) skip(name, 'the test video could not be made'); return { ok: false, steps }; }
 
     // The clips are made by the real renderer, asked to log what libass decides (which font it picked).
     let log = '';
     const runner: FfmpegRunner = async (binary, args, runOptions) => { log = (await execFileAsync(binary, ['-loglevel', 'verbose', ...args], { ...runOptions, encoding: 'utf8' })).stderr; };
     const renderer = new FfmpegClipRenderer(options.ffmpegPath, options.videoCodec, options.audioCodec, options.crf, options.preset, SIZE.width, SIZE.height, runner, fontsDirectory);
-    const shape = async (video: string) => {
+    const shape = async (video: string, size: { width: number; height: number } = SIZE) => {
       const { stdout } = await execFileAsync(options.ffprobePath, ['-v', 'error', '-show_entries', 'stream=codec_type,codec_name,width,height', '-of', 'json', video], { timeout, maxBuffer: 1024 * 1024, encoding: 'utf8' });
       const streams = (JSON.parse(stdout) as { streams?: Array<{ codec_type?: string; codec_name?: string; width?: number; height?: number }> }).streams ?? [];
       const picture = streams.find((stream) => stream.codec_type === 'video');
-      if (!picture || picture.width !== SIZE.width || picture.height !== SIZE.height) throw new Error(`the clip should be ${SIZE.width}x${SIZE.height} but is ${picture?.width ?? '?'}x${picture?.height ?? '?'}`);
+      if (!picture || picture.width !== size.width || picture.height !== size.height) throw new Error(`the clip should be ${size.width}x${size.height} but is ${picture?.width ?? '?'}x${picture?.height ?? '?'}`);
       if (!streams.some((stream) => stream.codec_type === 'audio')) throw new Error('the clip has no sound');
       return picture.codec_name ?? '?';
     };
@@ -285,6 +430,40 @@ export async function checkToolchain(options: ToolchainCheckOptions): Promise<To
       if (atEnd >= DARK) throw new Error('the window did not move away from the left edge');
       return 'the window moves from the left edge to the right';
     });
+
+    if (wantsRenderSample) {
+      const { width, height } = options.clipSize!;
+      await record('render-speed', async () => {
+        // Three seconds of a busy picture (a test pattern, with sound) as large as the videos people upload, cut and captioned into a clip of the real size.
+        const picture = join(work, 'sample-source.mp4');
+        await execFileAsync(options.ffmpegPath, [
+          '-nostdin', '-y', '-f', 'lavfi', '-i', 'testsrc2=s=1920x1080:r=30:d=3', '-f', 'lavfi', '-i', 'sine=frequency=330:sample_rate=48000:duration=3',
+          '-t', '3', '-c:v', options.videoCodec, '-preset', 'ultrafast', '-crf', '28', '-pix_fmt', 'yuv420p', '-c:a', options.audioCodec, picture,
+        ], { timeout, maxBuffer: 4 * 1024 * 1024 });
+        const captions = join(work, 'sample-captions.ass');
+        const spoken = ['Counting', 'the', 'words', 'as', 'they', 'are', 'spoken'];
+        await writeAssCaptions(captions, [{ startSeconds: 0, endSeconds: 3, text: spoken.join(' '), words: spoken.map((text, index) => ({ text, startSeconds: (index * 3) / spoken.length, endSeconds: ((index + 1) * 3) / spoken.length })) }], 0, 3, 'highlight');
+        const render = async (threads?: number) => {
+          // `-threads` goes in front of the output file, where it is meant for the encoder.
+          const runner: FfmpegRunner = async (binary, args, runOptions) => { await execFileAsync(binary, threads ? [...args.slice(0, -1), '-threads', String(threads), args[args.length - 1]] : args, runOptions); };
+          const clip = new FfmpegClipRenderer(options.ffmpegPath, options.videoCodec, options.audioCodec, options.crf, options.preset, width, height, runner, fontsDirectory);
+          const started = performance.now();
+          await clip.render({ sourcePath: picture, startSeconds: 0, endSeconds: 3, outputPath: join(work, `sample-${threads ?? 'own'}.mp4`), captionPath: captions });
+          return (performance.now() - started) / 1000;
+        };
+        const seconds = await render();
+        // A speed is only worth telling for a clip that is what it was meant to be.
+        await shape(join(work, 'sample-own.mp4'), { width, height });
+        let comparison = '';
+        // With less than one core to share, does an encoder with one thread do better than one with many? Measured, so that it is known and not guessed.
+        const cpuLimit = seen.machine?.cpuLimit ?? null;
+        if (cpuLimit !== null && cpuLimit < 1) {
+          const single = await render(1).catch(() => undefined);
+          if (single !== undefined) comparison = `; with one thread for the encoder: ${single.toFixed(1)} s`;
+        }
+        return `3 s of ${width}x${height} with captions, from a busy 1920x1080 picture, took ${seconds.toFixed(1)} s with preset ${options.preset} (${(seconds / 3).toFixed(1)} times the length of the clip)${comparison}`;
+      });
+    }
 
     if (options.faceFollowing) {
       await record('face-following', async () => {

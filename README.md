@@ -93,9 +93,9 @@ Job stages you can see on the status page: `preparing_source`, `saving_source`, 
   it. There is no fencing between them.
 - **A resumed job starts again from the beginning.** Clips made by an interrupted attempt are thrown away rather than reused:
   that is simpler and cannot mix the output of two attempts, at the price of repeating work after every interruption. The
-  transcript is the exception: it is the longest stage and it is kept as soon as it exists, so what a restart repeats is the
-  rendering, not the listening (see [Not listening twice](#not-listening-twice); this holds for engines that can be cached and
-  while `TRANSCRIPT_CACHE_DAYS` is above 0).
+  transcript is the exception: listening takes time in proportion to the whole video, however little of it ends up in clips, and
+  the transcript is kept as soon as it exists, so what a restart repeats is the rendering, not the listening (see
+  [Not listening twice](#not-listening-twice); this holds for engines that can be cached and while `TRANSCRIPT_CACHE_DAYS` is above 0).
 - **A database that goes silent is not timed out.** node-postgres has no default timeout for connections or queries and none is
   configured here. A connection the database *closes* is handled (see point 7 above); one that is accepted and then never
   answered would stall the request or job that uses it.
@@ -112,7 +112,10 @@ limit (93%). Memory was about 80 MB before the job and about 187 MB for the 15 m
 starting level; whether a second job right after the first still fits has not been tested.
 
 This is one sample, not a benchmark, and it was a short video: longer, larger or higher-resolution videos, and back-to-back jobs,
-have not been tried. What it does show is that the free instance is good for demonstrations with short videos and not for
+have not been tried. It is also the time of the whole job. The stages were not timed one by one when it was measured (that came
+later), so how much of the ten minutes was listening to the speech and how much was making the clip is **not known**; on a machine
+with a tenth of a processor, making a 1080x1920 clip may well take most of it. The start-up samples (see "Start-up check of the
+video tools") are there to measure the two separately on the machine itself. What it does show is that the free instance is good for demonstrations with short videos and not for
 customers. Render's documentation (October 2026) lists these web service sizes: Starter 0.5 CPU / 512 MB, Standard 1 CPU / 2 GB,
 Pro 2 CPU / 4 GB. Starter has the same memory as the free plan, so it would not relieve the memory pressure; prices are on
 render.com/pricing.
@@ -168,7 +171,8 @@ use and with the 6 s-and-over route production uses); the database cutting a con
 CI runs the whole suite on every push and pull request.
 The face-following tests run the real detector and the real FFmpeg on videos made from one test photograph
 (`apps/api/test-assets`, with where it comes from).
-What the tests do **not** cover: the real R2 service (checked by the startup self-test instead), real whisper.cpp output,
+What the tests do **not** cover: the real R2 service (checked by the startup self-test instead), real whisper.cpp output (the
+start-up sample reads it on the live host and says in the log whether it came out right),
 large (hundreds of MB) videos on a 512 MB instance, whether Render really counts the keep-awake request as traffic, and face
 following on recordings of real people.
 
@@ -191,6 +195,7 @@ All configuration comes from environment variables; see [`.env.example`](.env.ex
 | `MAX_UPLOAD_BYTES` | Largest accepted upload (default 2 GiB). The upload page states the limit. |
 | `FFMPEG_PATH`, `FFPROBE_PATH` | Binary locations when not on `PATH`. |
 | `WHISPER_CPP_PATH`, `WHISPER_MODEL_PATH`, `TRANSCRIPTION_LANGUAGE`, `TRANSCRIPTION_TIMEOUT_MS` | whisper.cpp command, model, language code (default `en`) and time limit. |
+| `WHISPER_THREADS` | How many threads whisper.cpp may use (`-t`; 0–64, default `0`, which leaves it to whisper.cpp: it uses up to 4). To be set from what the start-up samples measure on the machine (see [Start-up check of the video tools](#start-up-check-of-the-video-tools)); more threads than the machine has processor share for may be slower, not faster. |
 | `TRANSCRIPTION_ENGINE` | `whisper_cpp` (default, runs on this machine) or `openai_compatible` (a hosted service, see [Faster speech recognition](#faster-speech-recognition-with-a-hosted-service-optional)). |
 | `TRANSCRIPTION_API_URL`, `TRANSCRIPTION_API_KEY`, `TRANSCRIPTION_API_MODEL` | Only for `openai_compatible`: the service's base address (ending in `/v1`), its key (never logged, never shown in a message) and the model (default `whisper-1`). The address and key are required when that engine is chosen. |
 | `TRANSCRIPTION_CHUNK_SECONDS`, `TRANSCRIPTION_API_CONCURRENCY`, `TRANSCRIPTION_API_TIMEOUT_MS` | Only for `openai_compatible`: about how many seconds of audio go in one request (default 600), how many requests run at once (default 3) and the time limit of one request (default 300000 ms). |
@@ -200,6 +205,7 @@ All configuration comes from environment variables; see [`.env.example`](.env.ex
 | `CLIP_VIDEO_CODEC`, `CLIP_AUDIO_CODEC`, `CLIP_CRF`, `CLIP_PRESET` | FFmpeg encoding (defaults `libx264`, `aac`, 23, `veryfast`). |
 | `FACE_FRAMING_ENABLED` | `false` removes the "Follow a face" choice from the upload page and makes every clip be cut from the middle (default `true`; a person still has to choose it per video). Anything other than a clear yes/no is rejected. See [Following a face](#following-a-face-beta-opt-in). |
 | `TOOLCHAIN_CHECK_ENABLED` | `false` switches off the start-up check of the video tools (default `true`). See [Start-up check of the video tools](#start-up-check-of-the-video-tools). Anything other than a clear yes/no is rejected. |
+| `TOOLCHAIN_REAL_SAMPLES` | `false` leaves the three real samples out of that check: the machine's limits, whisper.cpp listening to a recording of speech, and one clip of the real size made from a busy picture (default `true`; they take minutes on a very small instance, and a job waits while they run). Anything other than a clear yes/no is rejected. |
 | `HIGHLIGHT_MIN_DURATION_SECONDS`, `HIGHLIGHT_MAX_DURATION_SECONDS` | Candidate window bounds (20 and 60 s). |
 | `HIGHLIGHT_MAX_CANDIDATES`, `HIGHLIGHT_OVERLAP_THRESHOLD` | Ranked candidates kept and overlap suppression threshold (default 0.3: two clips may share at most 30 % of the shorter one, so the clips are different moments). |
 | `HIGHLIGHT_WEIGHT_*` | Non-negative scoring weights (density, emphasis, question, number, contrast, hook, completeness, standalone, continuity, length). |
@@ -364,8 +370,10 @@ supported yet.
 
 ### Faster speech recognition with a hosted service (optional)
 
-whisper.cpp on the free instance needs about 14 times the length of the video (measured once, above). A hosted service that speaks
-the OpenAI `audio/transcriptions` protocol (OpenAI, Groq and others that copy it) does the same work in seconds to minutes. It is
+On the free instance one whole job took about 14 times the length of the video (measured once, above; how much of that was
+whisper.cpp is not known yet). A hosted service that speaks the OpenAI `audio/transcriptions` protocol (OpenAI, Groq and others that
+copy it) does the listening on its own machines, in seconds to minutes for a long recording by the way these services are
+described (not measured here: see below). It is
 off by default; set `TRANSCRIPTION_ENGINE=openai_compatible` together with `TRANSCRIPTION_API_URL`, `TRANSCRIPTION_API_KEY` and
 `TRANSCRIPTION_API_MODEL` (for example `whisper-1`, or `whisper-large-v3-turbo` at Groq) to use it. Put the key in the host's
 environment settings, never in the repository. `TRANSCRIPTION_LANGUAGE=auto` lets the service detect the language, any other
@@ -395,8 +403,8 @@ and quality for real recordings are not proven.
 
 ### Not listening twice
 
-Recognising the speech is by far the longest stage on the free instance (about 14 times the length of the video, see above), so a
-video whose sound has been recognised before is not recognised again. After the audio is extracted, the program takes the
+Recognising the speech takes time in proportion to the whole video, whatever is cut from it afterwards (while the rendering is at
+most a few clips of a minute each), so a video whose sound has been recognised before is not recognised again. After the audio is extracted, the program takes the
 SHA-256 of the 16 kHz mono sound it is about to hand to speech recognition and looks it up, together with a key that names the engine
 and everything its answer depends on besides the sound: for whisper.cpp the model's file name and size and the language; for a hosted
 service its address, model, language and the piece length (never the key). The same sound with another model or language is another
@@ -488,6 +496,27 @@ running job could use up the memory of the 512 MB instance, so it looks again ev
   dark blurred copy; and a crop window planned to move from the left edge to the right does move.
 - When "Follow a face" is on offer: the real face follower watches a three-second video of a public-domain portrait (the one in
   `apps/api/test-assets`) crossing the picture, and has to follow it across.
+- The real samples (`TOOLCHAIN_REAL_SAMPLES`). The checks above say that the tools work, not how fast, and not how the machine is
+  limited; nothing shows that on the live host unless somebody uploads a video and reads the stage times. So the check also:
+  - reads what the machine may use (the share of a processor and the memory of its container, from the control group files) and says
+    it. This is only told, never judged: a machine whose limits cannot be read is not a machine that does not work.
+  - lets whisper.cpp listen to an 11-second recording of speech that ships with the program (the end of a public-domain speech, see
+    `apps/api/test-assets`), through the same code that listens to customers' videos, and judges what it wrote: at least three
+    quarters of the words said, in order; a time for every word, in order and spread from the start of the recording to nearly its
+    end. A run that fails any of these fails the check. It is the only thing that shows on the host that whisper.cpp's real output is
+    read correctly and that the captions can follow each spoken word. It also says how many seconds the listening took for the 11 seconds of speech.
+  - makes one clip of the real size (1080x1920 unless configured otherwise, captions with the spoken word lit, the preset and
+    quality the clips use) from three seconds of a busy full-HD test picture, and says how long that took.
+
+  When the machine has less than one whole processor to share and `WHISPER_THREADS` is not set, the listening and the clip are each
+  made a second time with a single thread (whisper.cpp `-t 1`, FFmpeg `-threads 1`) and both times are reported, because on a
+  fraction of a processor several threads may only get in each other's way. What is best is measured, not guessed. These are three
+  seconds of a test pattern and eleven seconds of one voice: they show the speed of the machine, not the speed or the accuracy on a
+  customer's recording.
+
+  They take real time on a small instance (minutes, on the free one), so the check holds a place for the heavy stages while it runs,
+  as a job does (`JOB_CONCURRENCY`). A video uploaded in the meantime waits, shown as "waiting for capacity", and is never worked on
+  at the same time as the check, which could use up the memory of a 512 MB instance.
 
 The log gets one line, `Toolchain check passed (…)` at info level with every step (what was found, how long it took), or
 `Toolchain check FAILED: <names>` at error level. `/api/health` shows only a summary, `toolchain: { state, checkedAt, failed }`,
@@ -498,8 +527,15 @@ would restart the service for ever, and a server whose captions are broken can s
 Evidence: every step is tested against the real FFmpeg and against stand-in programs that break exactly one thing (no caption
 filter, captions silently dropped, a wrong font folder, a crop window that never moves or starts in the wrong place, a whole picture
 cut instead of fitted, a program that is not FFmpeg, a truncated model, a portrait without a face...), and twenty-four deliberate
-breakages of the check itself were each caught by those tests. What the check says on the live service is shown in its log (see
-"What the free instance has actually done").
+breakages of the check itself were each caught by those tests. The real samples were tested the same way: whisper.cpp is a stand-in
+that writes JSON in the layout the program reads, or something wrong in one of seven ways; the machine is described by control group
+files of both versions; FFmpeg is a recorder that notes every call it is given. Seventy-seven deliberate breakages of the samples, of
+the thread setting and of the place the check holds were made one at a time (a threshold moved, a thread count in the wrong place, a
+comparison made at the wrong core count, a place never given back...). The tests caught seventy-five at once; the other two (a render
+sample tried without a clip size, one made with another preset than the clips use) led to two stronger tests, after which all
+seventy-seven were caught. That check was run by hand and is not part of the repository. What the check says on the live service is shown
+in its log (see "What the free instance has actually done"). The stand-in whisper.cpp is the reason the live sample matters: only the
+real program on the real host can show that its output is read correctly.
 
 ## Not implemented
 

@@ -27,6 +27,8 @@ const highlightOptions = { minDurationSeconds: 1, maxDurationSeconds: 10, maxCan
 const fastRuntime: PipelineRuntimeOptions = { concurrency: 1, staleAfterMs: 1000, heartbeatMs: 50, recheckMs: 100, watchdogMs: 60_000, maxAttempts: 3 };
 
 type Context = Awaited<ReturnType<typeof setup>>;
+/** Waits for `promise`, but not for ever: a test of a lock that is never given back must fail, not hang. */
+const within = <T>(promise: Promise<T>, ms: number, what: string) => Promise.race([promise, sleep(ms).then((): never => { throw new Error(what); })]);
 
 /** Wraps the database so that every call fails for as long as `isDown()` says so, like a real outage. */
 function unreachableWhile(isDown: () => boolean, db: StudioDatabase): StudioDatabase {
@@ -293,6 +295,50 @@ test('runs only as many jobs at once as allowed, yet every video is already safe
     assert.deepEqual(snapshot, { status: 'queued', stage: 'waiting_for_capacity', saved: true });
     assert.equal((await ctx.db.getJob('j-a'))?.status, 'completed');
     assert.equal((await ctx.db.getJob('j-b'))?.status, 'completed');
+  } finally { await ctx.cleanup(); }
+});
+
+test('work that holds a place for the heavy stages (a check of the machine) is never done at the same time as a job: the job waits for it, its video already safe, and goes on when the work is over', async () => {
+  let release!: () => void; const held = new Promise<void>((resolve) => { release = resolve; });
+  const order: string[] = [];
+  const listening: TranscriptionEngine = { transcribe: async () => { order.push('the job is listened to'); return [{ segmentIndex: 0, startSeconds: 0, endSeconds: 2, text: 'words' }]; } };
+  const ctx = await setup({ transcriber: listening });
+  try {
+    await addJob(ctx, 'j-held');
+    const work = ctx.pipeline.withCapacity(async () => { order.push('the work begins'); await held; order.push('the work ends'); return 'what the work found'; });
+    const running = ctx.pipeline.run('j-held');
+    await eventually('the job to say it is waiting for a place', async () => (await ctx.db.getJob('j-held'))?.stage, (stage) => stage === 'waiting_for_capacity');
+    await sleep(150);
+    const waiting = await ctx.db.getJob('j-held');
+    assert.deepEqual({ status: waiting?.status, stage: waiting?.stage, saved: (ctx.storage as MemoryStorage).objects.has('sources/j-held/source.mp4') }, { status: 'queued', stage: 'waiting_for_capacity', saved: true });
+    assert.deepEqual(order, ['the work begins'], 'the job was worked on while the place was held');
+    release();
+    assert.equal(await within(work, 5000, 'the work did not finish'), 'what the work found', 'what the work returns is passed on');
+    await within(running, 5000, 'the job never got the place after the work');
+    assert.deepEqual(order, ['the work begins', 'the work ends', 'the job is listened to']);
+    assert.equal((await ctx.db.getJob('j-held'))?.status, 'completed');
+  } finally { await ctx.cleanup(); }
+});
+
+test('work that needs a place waits for the job that has it, and a failure of the work is passed on and gives the place back', async () => {
+  let release!: () => void; const blocked = new Promise<void>((resolve) => { release = resolve; });
+  let listening = false; const order: string[] = [];
+  const slow: TranscriptionEngine = { transcribe: async () => { listening = true; await blocked; order.push('the job has listened'); return [{ segmentIndex: 0, startSeconds: 0, endSeconds: 2, text: 'words' }]; } };
+  const ctx = await setup({ transcriber: slow });
+  try {
+    await addJob(ctx, 'j-first'); await addJob(ctx, 'j-second');
+    const running = ctx.pipeline.run('j-first');
+    await eventually('the job to be listening', () => listening, (value) => value);
+    const work = ctx.pipeline.withCapacity(async () => { order.push('the work begins'); throw new Error('the check broke'); });
+    const outcome = assert.rejects(work, /the check broke/);
+    await sleep(150);
+    assert.deepEqual(order, [], 'the work began while a job had the place');
+    release();
+    await within(running, 5000, 'the job did not finish'); await within(outcome, 5000, 'the work never got the place after the job');
+    assert.deepEqual(order, ['the job has listened', 'the work begins']);
+    // The place was given back although the work failed: the next job is not kept waiting for ever.
+    await within(ctx.pipeline.run('j-second'), 5000, 'the place was never given back');
+    assert.equal((await ctx.db.getJob('j-second'))?.status, 'completed');
   } finally { await ctx.cleanup(); }
 });
 

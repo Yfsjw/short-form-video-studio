@@ -104,6 +104,16 @@ export class VideoPipeline {
   /** Jobs this process is working on right now, their final clean-up included (a job's status already reads "completed" a moment before this drops). */
   get activeJobCount() { return this.heartbeats.size; }
 
+  /**
+   * Runs `work` while holding one of the places for the heavy stages, exactly as a job does in those stages: a job that arrives in the
+   * meantime waits for it ("waiting for capacity") and is never worked on at the same time. For checks of the machine that are heavy
+   * enough to use up the memory of a small instance if they overlapped a job.
+   */
+  async withCapacity<T>(work: () => Promise<T>): Promise<T> {
+    await this.slots.acquire();
+    try { return await work(); } finally { this.slots.release(); }
+  }
+
   /** Starts processing in the background. Never throws and never leaves a rejected promise behind that could take the process down. */
   enqueue(jobId: string) {
     if (this.closed || this.heartbeats.has(jobId)) return;

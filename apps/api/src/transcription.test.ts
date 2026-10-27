@@ -110,6 +110,20 @@ ${HELLO_JSON}`);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
+test('the number of threads whisper.cpp may use is passed on when it is set, and left to whisper.cpp when it is not', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'studio-whisper-'));
+  try {
+    const program = await fakeWhisper(root, `printf '%s\\n' "$allargs" > "$base.args"\n${HELLO_JSON}`);
+    const audio = await audioIn(root);
+    await new WhisperCppTranscriber(program, '/models/base.bin', 'en', 30_000, 3).transcribe(audio, root);
+    assert.deepEqual((await readFile(join(root, 'audio.args'), 'utf8')).split('\n').filter(Boolean), ['-m', '/models/base.bin', '-f', audio, '-l', 'en', '-t', '3', '-ng', '-nfa', '-pp', '-ojf', '-of', join(root, 'audio')]);
+    for (const left of [undefined, 0]) {
+      await new WhisperCppTranscriber(program, '/models/base.bin', 'en', 30_000, left).transcribe(audio, root);
+      assert.ok(!(await readFile(join(root, 'audio.args'), 'utf8')).split('\n').includes('-t'), `${left}: whisper.cpp chooses`);
+    }
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test('the program output is read as full JSON, words included', async () => {
   const root = await mkdtemp(join(tmpdir(), 'studio-whisper-'));
   try {

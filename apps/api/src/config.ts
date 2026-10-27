@@ -47,6 +47,8 @@ const schema = z.object({
   // Whether the server checks, once after it starts and when it has nothing else to do, that FFmpeg, the caption font and whisper.cpp
   // really work on this machine (see toolchain.ts). It makes a few tiny clips, which takes a couple of seconds on a normal machine.
   TOOLCHAIN_CHECK_ENABLED: envFlag(true),
+  // true = the start-up check also lets whisper.cpp listen to a short recording of speech and renders a few seconds at the size of real clips, to learn what this machine really does.
+  TOOLCHAIN_REAL_SAMPLES: envFlag(true),
   /** One shared code that everybody must give to use the service. Unset (or blank) means the service is open. Never shown or logged. */
   ACCESS_CODE: z.string().optional().transform((value) => value?.trim() || undefined).refine((value) => value === undefined || value.length >= 8, { message: 'must be at least 8 characters long' }),
   CLIP_MAX_CANDIDATES: z.coerce.number().int().positive().default(3),
@@ -62,6 +64,8 @@ const schema = z.object({
   WHISPER_MODEL_PATH: z.string().default('../../.render/ggml-base.en.bin'),
   TRANSCRIPTION_LANGUAGE: z.string().min(2).max(12).default('en'),
   TRANSCRIPTION_TIMEOUT_MS: z.coerce.number().int().positive().default(3_600_000),
+  // How many threads whisper.cpp may use. 0 leaves it to whisper.cpp (it takes up to 4). A small shared processor can be slower with several threads than with one.
+  WHISPER_THREADS: z.coerce.number().int().min(0).max(64).default(0),
   // How many days the transcript of a sound is kept after it was last used, so the same video uploaded again (to try other choices) or a job
   // started over after a restart does not have its speech recognised twice. 0 keeps nothing.
   TRANSCRIPT_CACHE_DAYS: z.coerce.number().int().min(0).max(365).default(30),

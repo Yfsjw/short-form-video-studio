@@ -105,7 +105,8 @@ function trimDiagnostic(value: string): string {
 }
 
 export class WhisperCppTranscriber implements TranscriptionEngine {
-  constructor(private readonly executablePath: string, private readonly modelPath: string, private readonly language: string, private readonly timeoutMs: number) {}
+  /** `threads`: how many threads whisper.cpp may use (`-t`); left out, it chooses for itself. It changes how fast the transcript comes, not what it says. */
+  constructor(private readonly executablePath: string, private readonly modelPath: string, private readonly language: string, private readonly timeoutMs: number, private readonly threads?: number) {}
 
   /** The model is named by its file name and size, so a different model put in the same place is a different key. No readable model, no key. */
   get cacheKey(): string | undefined {
@@ -121,7 +122,7 @@ export class WhisperCppTranscriber implements TranscriptionEngine {
       // attempting GPU initialization, which makes the process fail before transcription.
       // `-pp` makes whisper.cpp report its percentage on stderr, which is what the progress bar follows.
       // `-ojf` writes the JSON with the pieces of every segment and their own times (that is what makes word-by-word captions possible).
-      const result = await runProgram(this.executablePath, ['-m', this.modelPath, '-f', audioPath, '-l', this.language, '-ng', '-nfa', '-pp', '-ojf', '-of', outputBase], { timeoutMs: this.timeoutMs, cwd: dirname(audioPath), onStderr: createProgressListener(onProgress) });
+      const result = await runProgram(this.executablePath, ['-m', this.modelPath, '-f', audioPath, '-l', this.language, ...(this.threads ? ['-t', String(this.threads)] : []), '-ng', '-nfa', '-pp', '-ojf', '-of', outputBase], { timeoutMs: this.timeoutMs, cwd: dirname(audioPath), onStderr: createProgressListener(onProgress) });
       stdout = result.stdout;
       stderr = result.stderr;
     } catch (error) {

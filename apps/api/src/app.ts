@@ -145,14 +145,16 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
   // out, so neither Render's own nor the keep-awake request below can make the server look busy all by itself.
   let requestsInFlight = 0;
   // The check of the video tools is started by whoever starts the server (server.ts), once it is listening: it waits for the server to be
-  // idle, because a memory spike on top of a running job could kill a small instance.
+  // idle, because a memory spike on top of a running job could kill a small instance. And once it runs it holds a place for the heavy
+  // stages, as a job does, so that a video uploaded meanwhile waits instead of being worked on at the same time as the check.
   const toolchain = new ToolchainMonitor({
-    check: overrides.toolchainCheck ?? (() => checkToolchain({
+    check: () => pipeline.withCapacity(overrides.toolchainCheck ?? (() => checkToolchain({
       ffmpegPath: config.FFMPEG_PATH, ffprobePath: config.FFPROBE_PATH, videoCodec: config.CLIP_VIDEO_CODEC, audioCodec: config.CLIP_AUDIO_CODEC, crf: config.CLIP_CRF, preset: config.CLIP_PRESET,
       workDirectory: config.TEMP_DIR,
-      whisper: config.TRANSCRIPTION_ENGINE === 'whisper_cpp' ? { binaryPath: config.WHISPER_CPP_PATH, modelPath: config.WHISPER_MODEL_PATH } : null,
+      whisper: config.TRANSCRIPTION_ENGINE === 'whisper_cpp' ? { binaryPath: config.WHISPER_CPP_PATH, modelPath: config.WHISPER_MODEL_PATH, ...(config.WHISPER_THREADS ? { threads: config.WHISPER_THREADS } : {}) } : null,
       faceFollowing: framer !== undefined,
-    })),
+      realSamples: config.TOOLCHAIN_REAL_SAMPLES, clipSize: { width: config.CLIP_VERTICAL_WIDTH, height: config.CLIP_VERTICAL_HEIGHT },
+    }))),
     isBusy: () => pipeline.activeJobCount > 0 || requestsInFlight > 0,
     logger,
     retryMs: overrides.toolchainRetryMs,

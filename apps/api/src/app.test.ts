@@ -14,7 +14,7 @@ import { loadConfig } from './config.js';
 import { StudioDatabase } from './database.js';
 import type { ClipFramer } from './face-track.js';
 import { NullStorage, type DurableStorage } from './storage.js';
-import { MemoryStorage, eventually, sleep } from './test-support.js';
+import { MemoryStorage, eventually, sleep, writeFakeWhisper } from './test-support.js';
 import type { ToolchainReport } from './toolchain.js';
 import type { TranscriptionEngine } from './transcription.js';
 
@@ -883,7 +883,8 @@ test('with the check switched off the health check says so and the server never 
 test('the real check, in the real server: a missing whisper.cpp is the one thing reported, and with it in place everything passes (both said in the log)', needsFfmpeg, async () => {
   const schema = schemaName('toolreal'); const lines: string[] = [];
   const whisperBinary = join(workspace, 'whisper-for-check'); const whisperModel = join(workspace, 'ggml-for-check.bin');
-  await writeFile(whisperBinary, '#!/bin/sh\necho "usage: ./whisper-cli [options] file0.wav"\n', { mode: 0o755 });
+  const whisperStarts = join(workspace, 'whisper-for-check.starts');
+  await writeFakeWhisper(whisperBinary, { argsLog: whisperStarts });   // says its usage, and writes what whisper.cpp writes for the recording of speech that comes with the program
   await writeFile(whisperModel, ''); await truncate(whisperModel, 12 * 1024 * 1024);
   const logging = { logLevel: 'info', logDestination: { write: (line: string) => { lines.push(line); } } };
 
@@ -891,18 +892,18 @@ test('the real check, in the real server: a missing whisper.cpp is the one thing
   try {
     const status = await missing.studio.toolchain.run();
     assert.equal(status.state, 'failed');
-    assert.deepEqual(status.failed, ['speech-engine'], 'FFmpeg, the fonts, the captions, the layouts and the face follower all work here, and only the missing program is named');
-    assert.deepEqual((await healthOf(missing.base)).toolchain.failed, ['speech-engine']);
+    assert.deepEqual(status.failed, ['speech-engine', 'speech-sample'], 'FFmpeg, the fonts, the captions, the layouts and the face follower all work here, and only the missing program is named (and the recording that needs it, not listened to)');
+    assert.deepEqual((await healthOf(missing.base)).toolchain.failed, ['speech-engine', 'speech-sample']);
   } finally { await missing.stop(); await dropSchema(schema); }
   const failedLine = lines.map((line) => JSON.parse(line) as { level: number; msg?: string; steps?: Array<{ name: string; ok: boolean }> }).find((entry) => entry.msg?.startsWith('Toolchain check FAILED'));
   assert.ok(failedLine, 'the failure is in the log');
   assert.equal(failedLine.level, 50, 'at error level, so that it is found');
-  assert.match(failedLine.msg ?? '', /^Toolchain check FAILED: speech-engine\./);
+  assert.match(failedLine.msg ?? '', /^Toolchain check FAILED: speech-engine, speech-sample\./);
   assert.ok(failedLine.steps?.some((step) => step.name === 'face-following' && step.ok), 'the follower was checked too, since it is on offer');
 
   lines.length = 0;
   const schema2 = schemaName('toolreal2');
-  const working = await start({ schema: schema2, env: { WHISPER_CPP_PATH: whisperBinary, WHISPER_MODEL_PATH: whisperModel }, extra: logging });
+  const working = await start({ schema: schema2, env: { WHISPER_CPP_PATH: whisperBinary, WHISPER_MODEL_PATH: whisperModel, WHISPER_THREADS: '2' }, extra: logging });
   try {
     const status = await working.studio.toolchain.run();
     assert.equal(status.state, 'passed', lines.join('\n').slice(-1500));
@@ -912,7 +913,12 @@ test('the real check, in the real server: a missing whisper.cpp is the one thing
   const passedLine = lines.map((line) => JSON.parse(line) as { level: number; msg?: string; steps?: Array<{ name: string; ok: boolean }> }).find((entry) => entry.msg?.startsWith('Toolchain check passed'));
   assert.ok(passedLine, 'the pass is in the log');
   assert.equal(passedLine.level, 30);
-  assert.deepEqual(passedLine.steps?.map((step) => step.name), ['ffmpeg', 'ffprobe', 'encoders', 'filters', 'fonts', 'speech-engine', 'test-video', 'captions', 'whole-picture', 'moving-window', 'face-following']);
+  assert.deepEqual(passedLine.steps?.map((step) => step.name), ['machine', 'ffmpeg', 'ffprobe', 'encoders', 'filters', 'fonts', 'speech-engine', 'speech-sample', 'test-video', 'captions', 'whole-picture', 'moving-window', 'render-speed', 'face-following'], 'what the machine is like, the recording of speech and a render at the size of real clips are part of the check unless they are switched off');
+  const detail = (name: string) => (passedLine.steps as unknown as Array<{ name: string; detail: string }>).find((step) => step.name === name)?.detail ?? '';
+  assert.match(detail('speech-sample'), /^wrote 22 words with their times, 100% of those said/, 'the real program, here a stand-in that writes what whisper.cpp writes, was listened to and understood');
+  assert.match(detail('render-speed'), /^3 s of 360x640 with captions/, 'at the size of clips this server is set to make');
+  const starts = (await readFile(whisperStarts, 'utf8')).split('\n').filter(Boolean);
+  assert.ok(starts.length >= 1 && starts.every((line) => / -l en -t 2 -ng /.test(line)), `WHISPER_THREADS reaches the program: ${starts.join(' | ')}`);
 });
 
 test('with a hosted speech service and face following switched off, the check leaves out what is not in use', needsFfmpeg, async () => {
@@ -922,8 +928,18 @@ test('with a hosted speech service and face following switched off, the check le
     assert.equal((await server.studio.toolchain.run()).state, 'passed');
   } finally { await server.stop(); await dropSchema(schema); }
   const entry = lines.map((line) => JSON.parse(line) as { msg?: string; steps?: Array<{ name: string }> }).find((candidate) => candidate.msg?.startsWith('Toolchain check passed'));
-  assert.deepEqual(entry?.steps?.map((step) => step.name), ['ffmpeg', 'ffprobe', 'encoders', 'filters', 'fonts', 'test-video', 'captions', 'whole-picture', 'moving-window']);
+  assert.deepEqual(entry?.steps?.map((step) => step.name), ['machine', 'ffmpeg', 'ffprobe', 'encoders', 'filters', 'fonts', 'test-video', 'captions', 'whole-picture', 'moving-window', 'render-speed'], 'no speech engine on this machine, so no recording to listen to');
   assert.ok(!lines.join('').includes('a-key-that-is-never-used'), 'the key of a hosted service is never in the logs');
+});
+
+test('with TOOLCHAIN_REAL_SAMPLES switched off the check is what it was: no recording of speech, no render sample, nothing about the machine', needsFfmpeg, async () => {
+  const schema = schemaName('toolsamples'); const lines: string[] = [];
+  const server = await start({ schema, env: { TRANSCRIPTION_ENGINE: 'openai_compatible', TRANSCRIPTION_API_URL: 'https://speech.example.test/v1', TRANSCRIPTION_API_KEY: 'a-key-that-is-never-used', FACE_FRAMING_ENABLED: 'false', TOOLCHAIN_REAL_SAMPLES: 'false' }, extra: { logLevel: 'info', logDestination: { write: (line: string) => { lines.push(line); } } } });
+  try {
+    assert.equal((await server.studio.toolchain.run()).state, 'passed');
+  } finally { await server.stop(); await dropSchema(schema); }
+  const entry = lines.map((line) => JSON.parse(line) as { msg?: string; steps?: Array<{ name: string }> }).find((candidate) => candidate.msg?.startsWith('Toolchain check passed'));
+  assert.deepEqual(entry?.steps?.map((step) => step.name), ['ffmpeg', 'ffprobe', 'encoders', 'filters', 'fonts', 'test-video', 'captions', 'whole-picture', 'moving-window']);
 });
 
 test('the check does not run while a job is being processed, and runs as soon as the work is done', needsFfmpeg, async () => {
@@ -946,6 +962,27 @@ test('the check does not run while a job is being processed, and runs as soon as
     assert.equal((await checking).state, 'passed');
     assert.equal(looked.length, 1, 'once, after the job');
   } finally { await server.stop(); await dropSchema(schema); }
+});
+
+test('the check holds a place for the heavy stages: a video uploaded while it runs waits for it and is worked on as soon as it is over', needsFfmpeg, async () => {
+  const schema = schemaName('toolhold'); let began = false;
+  let release!: () => void; const gate = new Promise<void>((resolve) => { release = resolve; });
+  const server = await start({ schema, extra: { toolchainCheck: async () => { began = true; await gate; return passedReport; }, toolchainRetryMs: 25 } });
+  try {
+    const checking = server.studio.toolchain.run();
+    await eventually('the check to begin', () => began, (value) => value);
+    const { job } = await (await upload(server.base, '/api/jobs', await readFile(sampleVideo))).json() as { job: { id: string } };
+    const viewOf = async () => (await (await fetch(`${server.base}/api/jobs/${job.id}`)).json() as JobView).job;
+    await eventually('the job to say it is waiting for a place', viewOf, (seen) => seen.stage === 'waiting_for_capacity');
+    await sleep(300);
+    assert.equal((await viewOf()).status, 'queued', 'a video must not be worked on at the same time as the check: on a small server both together could use up the memory');
+    assert.equal((await healthOf(server.base)).toolchain.state, 'running');
+    release();
+    const finished = await waitForJob(server.base, job.id);
+    assert.equal(finished.job.status, 'completed', finished.job.errorMessage ?? '');
+    assert.equal((await checking).state, 'passed');
+    await untilSettled(server);
+  } finally { release(); await server.stop(); await dropSchema(schema); }
 });
 
 test('the same video uploaded twice is listened to once, end to end, and TRANSCRIPT_CACHE_DAYS=0 switches that off', needsFfmpeg, async () => {
