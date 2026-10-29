@@ -2,12 +2,12 @@ import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, mkdtemp, readdir, readFile, rm, truncate, writeFile } from 'node:fs/promises';
-import { availableParallelism, tmpdir, totalmem } from 'node:os';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test, { after, before } from 'node:test';
 import { promisify } from 'node:util';
 import { BUNDLED_FONTS_DIRECTORY } from './clips.js';
-import { MIN_MODEL_BYTES, REQUIRED_FILTERS, SPEECH_SAMPLE_PATH, SPEECH_SAMPLE_TEXT, ToolchainMonitor, checkToolchain, countAtLeast, cpuLimitFrom, describeMachine, fontChosenIn, helpShowsEncoder, helpShowsFilter, isBundledFont, judgeSpeechSample, listsEncoder, listsFilter, memoryLimitFrom, pixelAt, shareOfWordsHeard, versionOf, type ToolchainCheckOptions, type ToolchainReport } from './toolchain.js';
+import { MIN_MODEL_BYTES, REQUIRED_FILTERS, SPEECH_SAMPLE_PATH, SPEECH_SAMPLE_TEXT, ToolchainMonitor, checkToolchain, countAtLeast, fontChosenIn, helpShowsEncoder, helpShowsFilter, isBundledFont, judgeSpeechSample, listsEncoder, listsFilter, pixelAt, shareOfWordsHeard, versionOf, type ToolchainCheckOptions, type ToolchainReport } from './toolchain.js';
 import type { TranscriptInput } from './transcription.js';
 import { sleep, speechSampleJson, writeFakeWhisper } from './test-support.js';
 
@@ -333,6 +333,21 @@ test('the face follower is checked on a face and fails with a reason when it can
   assert.match(stepOf(noFace, 'face-following').detail, /no face was found in a picture of a face/);
 });
 
+test('the face follower is started with the threads the clips are made with, and with none when no number is set', needsFfmpeg, async () => {
+  const ffmpeg = await recordingFfmpeg();
+  const report = await checkToolchain(await optionsFor({ ffmpegPath: ffmpeg.path, faceFollowing: true, clipThreads: 2 }));
+  assert.equal(stepOf(report, 'face-following').ok, true, stepOf(report, 'face-following').detail);
+  const looks = (await ffmpeg.calls()).filter((call) => call.includes('image2pipe'));
+  assert.equal(looks.length, 1, 'one look at the portrait');
+  assert.equal(looks[0][looks[0].indexOf('-filter_threads') + 1], '2', 'the filters of the follower');
+  assert.equal(looks[0][looks[0].indexOf('-threads') + 1], '2', 'and its decoder');
+
+  const free = await recordingFfmpeg();
+  assert.equal(stepOf(await checkToolchain(await optionsFor({ ffmpegPath: free.path, faceFollowing: true })), 'face-following').ok, true);
+  const freeLook = (await free.calls()).filter((call) => call.includes('image2pipe'))[0];
+  assert.ok(freeLook && !freeLook.includes('-threads') && !freeLook.includes('-filter_threads'), 'no number, no option');
+});
+
 test('whisper.cpp is checked without loading its model: missing, not runnable, truncated, silent and fine are all told apart', needsFfmpeg, async () => {
   const ffmpegPath = join(workspace, 'no-such-ffmpeg'); // the other checks are not what is looked at here, and stop early
   const speech = async (whisper: { binaryPath: string; modelPath: string }) => stepOf(await checkToolchain(await optionsFor({ ffmpegPath, whisper })), 'speech-engine');
@@ -500,28 +515,6 @@ test('how much of what was said was written is counted in words, in order, and i
   assert.ok(shareOfWordsHeard(SAID.split(' ').reverse().join(' '), SAID) < 0.5, 'the same words in the wrong order are not the speech');
 });
 
-test('the processor share of a container is read from its control group files, in both versions, and no limit is no number', () => {
-  assert.equal(cpuLimitFrom('max 100000\n'), null);
-  assert.equal(cpuLimitFrom('15000 100000\n'), 0.15);
-  assert.equal(cpuLimitFrom('200000 100000'), 2);
-  assert.equal(cpuLimitFrom('10000'), 0.1, 'a missing period is the usual 100 ms');
-  assert.equal(cpuLimitFrom(undefined, '50000\n', '100000\n'), 0.5, 'version 1 keeps the two numbers in two files');
-  assert.equal(cpuLimitFrom(undefined, '-1', '100000'), null, 'and says -1 for no limit');
-  for (const unreadable of [undefined, '', '  ', 'garbage', '0 100000', '-5 100000']) assert.equal(cpuLimitFrom(unreadable), null, String(unreadable));
-  assert.equal(cpuLimitFrom(undefined, 'x', '100000'), null);
-  assert.equal(cpuLimitFrom('max 100000', '50000', '100000'), null, 'version 2, when it is there, is the one believed');
-});
-
-test('the memory limit of a container is read the same way, and a machine is described in plain words', () => {
-  assert.equal(memoryLimitFrom('536870912\n'), 536_870_912);
-  assert.equal(memoryLimitFrom('max'), null);
-  assert.equal(memoryLimitFrom(undefined, '9223372036854771712'), null, 'version 1 says "no limit" with a number close to 2^63');
-  assert.equal(memoryLimitFrom('max', '268435456'), 268_435_456, 'version 1 is read when version 2 says nothing useful');
-  for (const unreadable of [undefined, '', '0', 'garbage', '-1']) assert.equal(memoryLimitFrom(unreadable), null, String(unreadable));
-  assert.equal(describeMachine({ cpuLimit: 0.15, memoryLimitBytes: 512 * 1024 * 1024, cores: 16, totalMemoryBytes: 64 * GIB }), 'the processor share is limited to 0.15 of one core (16 cores visible); memory limited to 512 MiB');
-  assert.equal(describeMachine({ cpuLimit: null, memoryLimitBytes: null, cores: 4, totalMemoryBytes: 8 * GIB }), 'no limit on the processor share (4 cores visible); memory 8192 MiB, with no limit of its own');
-});
-
 const spoken = SAID.split(' ');
 const goodSegments = (): TranscriptInput => [{ segmentIndex: 0, startSeconds: 0, endSeconds: 11, text: SAID, words: spoken.map((text, index) => ({ text, startSeconds: 0.2 + index * 0.48, endSeconds: 0.2 + (index + 1) * 0.48 })) }];
 
@@ -568,32 +561,36 @@ test('with real samples on, whisper.cpp listens to the recording that comes with
   const sample = stepOf(report, 'speech-sample');
   assert.equal(sample.ok, true, sample.detail);
   assert.ok(sample.detail.startsWith(`wrote 22 words with their times, 100% of those said ("${SAID.slice(0, 60)}…"); `), sample.detail);
-  assert.match(sample.detail, / \d+\.\d s to listen to 11 s of speech$/);
+  assert.match(sample.detail, / \d+\.\d s to listen to 11 s of speech, with the program's own choice of threads$/);
   const starts = await startsIn(log);
-  assert.equal(starts.length, 1, 'once: with no limit on the processor there is nothing to compare');
+  assert.equal(starts.length, 1, 'listened to once');
   assert.match(starts[0], new RegExp(`^-m ${fakeWhisper.modelPath} -f ${SPEECH_SAMPLE_PATH} -l en -ng -nfa -pp -ojf -of `));
   assert.deepEqual(await readdir(options.workDirectory), [], 'what the engine wrote is removed again');
 });
 
-test('on less than one core the recording is listened to a second time with one thread and both times are told; a thread count that is set is respected, and with a whole core nothing is compared', async () => {
-  const log = newLog();
-  const shared = await listening(await sampleWhisper({ argsLog: log }), { machine: sharing(0.15) });
-  assert.equal(stepOf(shared.report, 'machine').detail, 'the processor share is limited to 0.15 of one core (16 cores visible); memory limited to 512 MiB');
-  assert.match(stepOf(shared.report, 'speech-sample').detail, / \d+\.\d s to listen to 11 s of speech; with one thread: \d+\.\d s$/);
-  const starts = await startsIn(log);
-  assert.equal(starts.length, 2);
-  assert.ok(!/ -t /.test(starts[0]), 'first the way the program is set up');
-  assert.match(starts[1], / -l en -t 1 -ng /, 'then with one thread');
+test('the time told for the recording is the time the listening took, not the time the program has been running', async () => {
+  const whisper = await sampleWhisper({ body: `sleep 1.2\ncat > "$base.json" <<'JSON'\n${speechSampleJson()}\nJSON` });
+  const started = performance.now();
+  const { report } = await listening(whisper);
+  const wall = (performance.now() - started) / 1000;
+  const detail = stepOf(report, 'speech-sample').detail;
+  const seconds = Number(/ (\d+\.\d) s to listen to 11 s of speech/.exec(detail)?.[1]);
+  assert.ok(seconds >= 1.1 && seconds <= wall + 0.05, `${seconds} s is neither as long as the listening (1.2 s) nor within the ${wall.toFixed(2)} s the whole check took: ${detail}`);
+});
 
-  const setLog = newLog();
-  const set = await listening({ ...(await sampleWhisper({ argsLog: setLog })), threads: 2 }, { machine: sharing(0.15) });
-  assert.doesNotMatch(stepOf(set.report, 'speech-sample').detail, /with one thread/);
-  const setStarts = await startsIn(setLog);
-  assert.equal(setStarts.length, 1); assert.match(setStarts[0], / -l en -t 2 -ng /, 'the number that was asked for');
-
-  const wholeLog = newLog();
-  await listening(await sampleWhisper({ argsLog: wholeLog }), { machine: sharing(2) });
-  assert.equal((await startsIn(wholeLog)).length, 1, 'with two cores to use there is nothing to compare');
+test('the recording is listened to once, with the number of threads the jobs are started with: one that is set reaches whisper.cpp and is told, and without one the program chooses', async () => {
+  for (const [threads, flag, told] of [[1, / -l en -t 1 -ng /, 'with 1 thread'], [3, / -l en -t 3 -ng /, 'with 3 threads']] as const) {
+    const log = newLog();
+    const { report } = await listening({ ...(await sampleWhisper({ argsLog: log })), threads }, { machine: sharing(0.15) });
+    const starts = await startsIn(log);
+    assert.equal(starts.length, 1, 'listened to once, however small the share of a processor is: there is no second run to compare with any more');
+    assert.match(starts[0], flag);
+    assert.ok(stepOf(report, 'speech-sample').detail.endsWith(`s to listen to 11 s of speech, ${told}`) || stepOf(report, 'speech-sample').detail.endsWith(`, ${told}`), stepOf(report, 'speech-sample').detail);
+  }
+  const ownLog = newLog();
+  await listening(await sampleWhisper({ argsLog: ownLog }), { machine: sharing(0.15) });
+  const own = await startsIn(ownLog);
+  assert.equal(own.length, 1); assert.doesNotMatch(own[0], / -t /, 'without a number the program chooses');
 });
 
 test('a speech engine that does not write what a working one writes is a failed check, and each way of going wrong is named', async () => {
@@ -642,45 +639,48 @@ test('what limits the machine is only told, never judged: a machine whose limits
   assert.equal(stepOf(report, 'speech-sample').ok, true, 'and the speech sample is made as if there were no limit');
 });
 
-/** A stand-in `ffmpeg` that runs the real one and writes down the arguments of every call. */
-async function recordingFfmpeg() {
+/** A stand-in `ffmpeg` that runs the real one and writes down the arguments of every call; `slow` makes the calls that write a file with that name take `milliseconds` longer. */
+async function recordingFfmpeg(slow?: { endingWith: string; milliseconds: number }) {
   const path = join(workspace, `ffmpeg-${randomUUID().slice(0, 8)}`); const log = `${path}.log`;
   await writeFile(path, `#!${process.execPath}
 const { spawnSync } = require('node:child_process'); const { appendFileSync } = require('node:fs');
 appendFileSync(${JSON.stringify(log)}, JSON.stringify(process.argv.slice(2)) + '\\n');
+${slow ? `if (process.argv[process.argv.length - 1].endsWith(${JSON.stringify(slow.endingWith)})) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ${slow.milliseconds});` : ''}
 const result = spawnSync('ffmpeg', process.argv.slice(2), { stdio: 'inherit' });
 process.exitCode = result.status === null ? 1 : result.status;
 `, { mode: 0o755 });
   return { path, calls: async () => (await startsIn(log)).map((line) => JSON.parse(line) as string[]) };
 }
 
-test('the render sample makes three seconds of video at the size of real clips and says how long that took; on less than one core it is made again with one encoder thread', needsFfmpeg, async () => {
-  const ffmpeg = await recordingFfmpeg();
-  const options = await optionsFor({ ffmpegPath: ffmpeg.path, realSamples: true, clipSize: { width: 180, height: 320 }, machine: sharing(0.1), preset: 'veryfast', crf: 31 });
+test('the render sample makes three seconds of video at the size of real clips, by the renderer and with the settings of real clips, and says how long that took and with how many threads', needsFfmpeg, async () => {
+  const ffmpeg = await recordingFfmpeg({ endingWith: 'sample-clip.mp4', milliseconds: 1800 });   // slow, so that the seconds and the ratio are numbers that can be checked closely
+  const options = await optionsFor({ ffmpegPath: ffmpeg.path, realSamples: true, clipSize: { width: 180, height: 320 }, machine: sharing(0.1), preset: 'veryfast', crf: 31, clipThreads: 1 });
   const report = await checkToolchain(options);
   assert.deepEqual(failedIn(report), [], JSON.stringify(report.steps.filter((step) => !step.ok)));
   assert.deepEqual(report.steps.map((step) => step.name), ['machine', 'ffmpeg', 'ffprobe', 'encoders', 'filters', 'fonts', 'test-video', 'captions', 'whole-picture', 'moving-window', 'render-speed']);
   const told = stepOf(report, 'render-speed').detail;
-  assert.match(told, /^3 s of 180x320 with captions, from a busy 1920x1080 picture, took \d+\.\d s with preset veryfast \(\d+\.\d times the length of the clip\); with one thread for the encoder: \d+\.\d s$/);
+  assert.match(told, /^3 s of 180x320 with captions, from a busy 1920x1080 picture, took \d+\.\d s with preset veryfast and 1 thread \(\d+\.\d times the length of the clip\)$/);
   const [, took, times] = /took (\d+\.\d) s .*\((\d+\.\d) times/.exec(told)!;
-  assert.ok(Math.abs(Number(times) - Number(took) / 3) <= 0.1, `${times} times the length of a 3 s clip is not what ${took} s makes`);
+  assert.ok(Number(took) >= 1.8, `the time is the time of the render itself (it was made to take at least 1.8 s): ${took}`);
+  assert.ok(Math.abs(Number(times) - Number(took) / 3) <= 0.07, `${times} times the length of a 3 s clip is not what ${took} s makes`);
 
   const calls = await ffmpeg.calls();
-  const rendered = (name: string) => calls.find((call) => call[call.length - 1].endsWith(name));
-  const own = rendered('sample-own.mp4'); const single = rendered('sample-1.mp4');
-  assert.ok(own && single, 'a clip with the encoder as it comes and one with one thread');
-  assert.ok(!own.includes('-threads'), 'the first is made exactly as clips are made');
-  assert.equal(own[own.indexOf('-preset') + 1], 'veryfast', 'with the preset the clips are made with');
-  assert.equal(own[own.indexOf('-crf') + 1], '31', 'and their quality setting');
-  assert.ok(own.some((argument) => String(argument).includes('ass=')), 'with captions burned into the picture, as the real clips have');
-  assert.deepEqual(single.slice(-3, -1), ['-threads', '1'], 'the thread count is in front of the output file, where it is meant for the encoder');
-  assert.deepEqual(single.slice(0, -3), own.slice(0, -1), 'and nothing else is different');
+  const clips = calls.filter((call) => call[call.length - 1].endsWith('sample-clip.mp4'));
+  assert.equal(clips.length, 1, 'one clip, made once: there is no second run to compare with any more');
+  const [clip] = clips;
+  assert.equal(clip[clip.indexOf('-preset') + 1], 'veryfast', 'with the preset the clips are made with');
+  assert.equal(clip[clip.indexOf('-crf') + 1], '31', 'and their quality setting');
+  assert.ok(clip.some((argument) => String(argument).includes('ass=')), 'with captions burned into the picture, as the real clips have');
+  assert.deepEqual(clip.slice(-3, -1), ['-threads', '1'], 'the encoder is told, in front of the output file');
+  assert.equal(clip[clip.indexOf('-i') - 2], '-threads', 'and the decoder, in front of the input');
+  assert.equal(clip[clip.indexOf('-filter_threads') + 1], '1', 'and the filters');
   assert.ok(calls.some((call) => call.some((argument) => argument === 'testsrc2=s=1920x1080:r=30:d=3')), 'made from a picture as large as the videos people upload');
-  assert.deepEqual(await readdir(options.workDirectory), [], 'the sample clips are removed again');
+  assert.deepEqual(await readdir(options.workDirectory), [], 'the sample clip is removed again');
 
-  const whole = await optionsFor({ ffmpegPath: ffmpeg.path, realSamples: true, clipSize: { width: 144, height: 256 }, machine: unlimited });
-  const alone = await checkToolchain(whole);
-  assert.doesNotMatch(stepOf(alone, 'render-speed').detail, /with one thread/, 'with no limit on the processor there is nothing to compare');
+  const own = await checkToolchain(await optionsFor({ ffmpegPath: ffmpeg.path, realSamples: true, clipSize: { width: 144, height: 256 }, machine: unlimited }));
+  assert.match(stepOf(own, 'render-speed').detail, /with preset ultrafast and the program's own choice of threads \(/);
+  const ownClip = (await ffmpeg.calls()).filter((call) => call[call.length - 1].endsWith('sample-clip.mp4')).pop()!;
+  assert.ok(!ownClip.includes('-threads') && !ownClip.includes('-filter_threads'), 'no number, no option: FFmpeg chooses');
 });
 
 test('no render sample without a clip size, and one that cannot be made is a failed check, not a crash; and nothing is made when FFmpeg or the test video is not there', needsFfmpeg, async () => {
@@ -702,41 +702,15 @@ test('no render sample without a clip size, and one that cannot be made is a fai
 });
 
 test('with real samples on, everything is checked in order, the speech and the render at the end of the checks they belong to, and nothing is left behind', needsFfmpeg, async () => {
-  const options = await optionsFor({ whisper: await sampleWhisper(), faceFollowing: true, realSamples: true, clipSize: { width: 144, height: 256 }, machine: sharing(0.5) });
+  const options = await optionsFor({ whisper: { ...(await sampleWhisper()), threads: 1 }, faceFollowing: true, realSamples: true, clipSize: { width: 144, height: 256 }, machine: sharing(0.5), clipThreads: 1 });
   const report = await checkToolchain(options);
   assert.deepEqual(failedIn(report), [], JSON.stringify(report.steps.filter((step) => !step.ok)));
   assert.deepEqual(report.steps.map((step) => step.name), ['machine', 'ffmpeg', 'ffprobe', 'encoders', 'filters', 'fonts', 'speech-engine', 'speech-sample', 'test-video', 'captions', 'whole-picture', 'moving-window', 'render-speed', 'face-following']);
   assert.deepEqual(await readdir(options.workDirectory), []);
 });
 
-test('the second run with one thread is made only where less than one whole processor is shared, and a second run that fails costs the check nothing and is not made up', needsFfmpeg, async () => {
-  for (const [share, compared] of [[0.99, true], [1, false], [1.5, false]] as const) {
-    const log = newLog();
-    await listening(await sampleWhisper({ argsLog: log }), { machine: sharing(share) });
-    assert.equal((await startsIn(log)).length, compared ? 2 : 1, `listening, with a share of ${share}`);
-  }
-  const refusingThreads = await sampleWhisper({ argsLog: newLog(), body: `case " $args " in *" -t 1 "*) echo "refused" >&2; exit 3;; esac\ncat > "$base.json" <<'JSON'\n${speechSampleJson()}\nJSON` });
-  const heard = stepOf((await listening(refusingThreads, { machine: sharing(0.1) })).report, 'speech-sample');
-  assert.equal(heard.ok, true, heard.detail);
-  assert.doesNotMatch(heard.detail, /one thread/, 'a comparison that could not be made is left out');
-
-  const ffmpeg = await recordingFfmpeg();
-  const singles = async () => (await ffmpeg.calls()).filter((call) => call[call.length - 1].endsWith('sample-1.mp4')).length;
-  let seen = 0;
-  for (const [share, compared] of [[0.99, true], [1, false], [1.5, false]] as const) {
-    await checkToolchain(await optionsFor({ ffmpegPath: ffmpeg.path, realSamples: true, clipSize: { width: 144, height: 256 }, machine: sharing(share) }));
-    const now = await singles();
-    assert.equal(now - seen, compared ? 1 : 0, `making a clip, with a share of ${share}`);
-    seen = now;
-  }
-  const noThreadOption = await ffmpegThat({ args: String.raw`(args) => args.includes('-threads') ? ['-no-such-option', ...args] : args` });
-  const made = await checkToolchain(await optionsFor({ ffmpegPath: noThreadOption, realSamples: true, clipSize: { width: 144, height: 256 }, machine: sharing(0.1) }));
-  assert.deepEqual(failedIn(made), [], JSON.stringify(made.steps.filter((step) => !step.ok)));
-  assert.doesNotMatch(stepOf(made, 'render-speed').detail, /one thread/, 'a comparison that could not be made is left out');
-});
-
 test('the render sample is only told when the clip it made is the size of a real clip', needsFfmpeg, async () => {
-  const wrongSize = await ffmpegThat({ args: String.raw`(args) => { if (String(args[args.length - 1]).endsWith('sample-own.mp4')) { const at = args.indexOf('-vf'); args[at + 1] = args[at + 1].replace(/crop=\d+:\d+/, 'crop=100:100'); } return args; }` });
+  const wrongSize = await ffmpegThat({ args: String.raw`(args) => { if (String(args[args.length - 1]).endsWith('sample-clip.mp4')) { const at = args.indexOf('-vf'); args[at + 1] = args[at + 1].replace(/crop=\d+:\d+/, 'crop=100:100'); } return args; }` });
   const report = await checkToolchain(await optionsFor({ ffmpegPath: wrongSize, realSamples: true, clipSize: { width: 144, height: 256 }, machine: unlimited }));
   assert.deepEqual(failedIn(report), ['render-speed']);
   assert.match(stepOf(report, 'render-speed').detail, /the clip should be 144x256 but is 100x100/);
@@ -747,11 +721,4 @@ test('a recording of speech is given more time than the other steps get, since a
   const { report } = await listening(slow, { stepTimeoutMs: 150 });
   const sample = stepOf(report, 'speech-sample');
   assert.equal(sample.ok, true, sample.detail);
-});
-
-test('without a stand-in the machine is read from the real files of this machine, and what is told is plausible', async () => {
-  const { report } = await listening(await sampleWhisper(), { machine: undefined });
-  const told = stepOf(report, 'machine');
-  assert.equal(told.ok, true, told.detail);
-  assert.match(told.detail, new RegExp(`^(no limit on the processor share|the processor share is limited to \\d+\\.\\d\\d of one core) \\(${availableParallelism()} cores visible\\); memory (${Math.round(totalmem() / 1024 / 1024)} MiB, with no limit of its own|limited to \\d+ MiB)$`), told.detail);
 });

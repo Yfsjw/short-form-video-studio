@@ -35,6 +35,29 @@ test('FFmpeg renderer builds a 9:16 timestamped MP4 command with a mocked proces
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
+test('FFmpeg renderer is told how many threads to use for decoding, filtering and encoding, in the places FFmpeg means them for, and without a number leaves the command as it always was', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'studio-renderer-')); const outputPath = join(root, 'clip.mp4');
+  try {
+    const argumentsFor = async (threads?: number) => {
+      let given: string[] = [];
+      const renderer = new FfmpegClipRenderer('ffmpeg', 'libx264', 'aac', 23, 'veryfast', 1080, 1920, async (_binary, args) => { given = args; await writeFile(outputPath, 'mock mp4 bytes'); }, undefined, threads);
+      await renderer.render({ sourcePath: join(root, 'source.mp4'), startSeconds: 12.5, endSeconds: 18.25, outputPath });
+      return given;
+    };
+    const without = await argumentsFor(undefined);
+    assert.ok(!without.includes('-threads') && !without.includes('-filter_threads'), 'no number, no option');
+    const withThreads = await argumentsFor(2);
+    assert.deepEqual(withThreads.slice(0, 8), ['-nostdin', '-y', '-filter_threads', '2', '-ss', '12.500', '-threads', '2'], 'the filters, then the decoder (an input option, so in front of the input)');
+    assert.equal(withThreads[withThreads.indexOf('-i') - 2], '-threads');
+    assert.deepEqual(withThreads.slice(-3), ['-threads', '2', outputPath], 'and the encoder, in front of the output file');
+    assert.deepEqual(withThreads.filter((argument) => argument === '-threads').length, 2);
+    // Apart from the threads, the command is the same one.
+    const stripped = withThreads.filter((argument, index) => !(['-threads', '-filter_threads'].includes(argument) || ['-threads', '-filter_threads'].includes(withThreads[index - 1])));
+    assert.deepEqual(stripped, without);
+    assert.ok(!(await argumentsFor(0)).includes('-threads'), 'zero is no number');
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test('FFmpeg renderer cuts from the middle of the picture unless it is given a plan, and then follows the plan frame by frame', async () => {
   const root = await mkdtemp(join(tmpdir(), 'studio-renderer-framing-')); const outputPath = join(root, 'clip.mp4'); const calls: string[][] = [];
   try {

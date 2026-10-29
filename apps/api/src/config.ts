@@ -56,6 +56,8 @@ const schema = z.object({
   CLIP_AUDIO_CODEC: z.string().default('aac'),
   CLIP_CRF: z.coerce.number().int().min(0).max(51).default(23),
   CLIP_PRESET: z.string().default('veryfast'),
+  // How many threads FFmpeg may use when it makes a clip or looks for faces. 0 = automatic, as for WHISPER_THREADS.
+  CLIP_THREADS: z.coerce.number().int().min(0).max(64).default(0),
   CLIP_VERTICAL_WIDTH: z.coerce.number().int().positive().default(1080),
   CLIP_VERTICAL_HEIGHT: z.coerce.number().int().positive().default(1920),
   TRANSCRIPTION_ENGINE: z.enum(['whisper_cpp', 'openai_compatible']).default('whisper_cpp'),
@@ -64,7 +66,8 @@ const schema = z.object({
   WHISPER_MODEL_PATH: z.string().default('../../.render/ggml-base.en.bin'),
   TRANSCRIPTION_LANGUAGE: z.string().min(2).max(12).default('en'),
   TRANSCRIPTION_TIMEOUT_MS: z.coerce.number().int().positive().default(3_600_000),
-  // How many threads whisper.cpp may use. 0 leaves it to whisper.cpp (it takes up to 4). A small shared processor can be slower with several threads than with one.
+  // How many threads whisper.cpp may use. 0 = automatic: as many as the share of a processor the container may use allows (see machine.ts; on a
+  // machine that is not a container, whisper.cpp chooses). More threads than the share only wait for each other, and cost memory.
   WHISPER_THREADS: z.coerce.number().int().min(0).max(64).default(0),
   // How many days the transcript of a sound is kept after it was last used, so the same video uploaded again (to try other choices) or a job
   // started over after a restart does not have its speech recognised twice. 0 keeps nothing.

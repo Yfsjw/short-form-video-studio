@@ -72,6 +72,8 @@ export interface FaceFramerOptions {
   sceneCutDifference?: number; sceneCutHistogram?: number;
   /** FFmpeg is stopped after this long (default ten minutes: a small server is slow). */
   timeoutMs?: number;
+  /** How many threads FFmpeg may use to decode the video and make the pictures (left out: it chooses for itself, see machine.ts). */
+  threads?: number;
 }
 
 /**
@@ -108,7 +110,8 @@ export class FaceClipFramer implements ClipFramer {
   private async *pictures(sourcePath: string, startSeconds: number, clipSeconds: number, perSecond: number): AsyncGenerator<GrayPicture> {
     const filter = `fps=${Number(perSecond.toFixed(4))},scale=${this.options.pictureWidth ?? 480}:-2`;
     // Seeking before the input, as the renderer does, so that the pictures are counted from the start of the clip.
-    const args = ['-nostdin', '-v', 'error', '-ss', startSeconds.toFixed(3), '-t', clipSeconds.toFixed(3), '-i', sourcePath, '-an', '-vf', filter, '-pix_fmt', 'gray', '-c:v', 'pgm', '-f', 'image2pipe', 'pipe:1'];
+    const threads = this.options.threads ? ['-threads', String(this.options.threads)] : [];
+    const args = ['-nostdin', '-v', 'error', ...(this.options.threads ? ['-filter_threads', String(this.options.threads)] : []), '-ss', startSeconds.toFixed(3), '-t', clipSeconds.toFixed(3), ...threads, '-i', sourcePath, '-an', '-vf', filter, '-pix_fmt', 'gray', '-c:v', 'pgm', '-f', 'image2pipe', 'pipe:1'];
     const child = spawn(this.options.ffmpegPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
     let stderr = '';
     child.stderr.on('data', (text: Buffer) => { stderr = (stderr + text.toString('utf8')).slice(-4000); });

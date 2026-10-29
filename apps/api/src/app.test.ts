@@ -13,8 +13,9 @@ import { createApp, type AppOverrides } from './app.js';
 import { loadConfig } from './config.js';
 import { StudioDatabase } from './database.js';
 import type { ClipFramer } from './face-track.js';
+import type { MachineLimits } from './machine.js';
 import { NullStorage, type DurableStorage } from './storage.js';
-import { MemoryStorage, eventually, sleep, writeFakeWhisper } from './test-support.js';
+import { MemoryStorage, eventually, sleep, speechSampleJson, writeFakeWhisper } from './test-support.js';
 import type { ToolchainReport } from './toolchain.js';
 import type { TranscriptionEngine } from './transcription.js';
 
@@ -58,7 +59,7 @@ type Studio = Awaited<ReturnType<typeof createApp>>;
 interface RunningServer { base: string; root: string; dirs: { UPLOAD_DIR: string; TEMP_DIR: string; OUTPUT_DIR: string }; studio: Studio; storage: DurableStorage; stop: () => Promise<void> }
 
 /** Boots the real app on a free port, with its own empty upload/temp/output folders (like a freshly started container). */
-async function start(options: { schema: string; storage?: DurableStorage; transcriber?: TranscriptionEngine; env?: Record<string, string>; keepAwakeIntervalMs?: number; bootRecoveryWaitMs?: number; framer?: ClipFramer | null; extra?: AppOverrides }): Promise<RunningServer> {
+async function start(options: { schema: string; storage?: DurableStorage; transcriber?: TranscriptionEngine; /** Use the engine the configuration asks for (whisper.cpp, here a stand-in program) instead of the fixed text. */ realSpeechEngine?: boolean; env?: Record<string, string>; keepAwakeIntervalMs?: number; bootRecoveryWaitMs?: number; framer?: ClipFramer | null; extra?: AppOverrides }): Promise<RunningServer> {
   const root = await mkdtemp(join(workspace, 'server-'));
   const dirs = { UPLOAD_DIR: join(root, 'uploads'), TEMP_DIR: join(root, 'tmp'), OUTPUT_DIR: join(root, 'outputs') };
   const config = loadConfig({
@@ -69,7 +70,7 @@ async function start(options: { schema: string; storage?: DurableStorage; transc
     ...options.env,
   });
   const storage = options.storage ?? new MemoryStorage();
-  const studio = await createApp(config, { storage, transcriber: options.transcriber ?? talk, databaseSchema: options.schema, keepAwakeIntervalMs: options.keepAwakeIntervalMs, bootRecoveryWaitMs: options.bootRecoveryWaitMs, framer: options.framer, ...options.extra });
+  const studio = await createApp(config, { storage, transcriber: options.realSpeechEngine ? undefined : options.transcriber ?? talk, databaseSchema: options.schema, keepAwakeIntervalMs: options.keepAwakeIntervalMs, bootRecoveryWaitMs: options.bootRecoveryWaitMs, framer: options.framer, ...options.extra });
   const server = createServer(studio.app).listen(0, '127.0.0.1');
   await new Promise<void>((resolve) => server.once('listening', resolve));
   let stopped = false;
@@ -903,7 +904,7 @@ test('the real check, in the real server: a missing whisper.cpp is the one thing
 
   lines.length = 0;
   const schema2 = schemaName('toolreal2');
-  const working = await start({ schema: schema2, env: { WHISPER_CPP_PATH: whisperBinary, WHISPER_MODEL_PATH: whisperModel, WHISPER_THREADS: '2' }, extra: logging });
+  const working = await start({ schema: schema2, env: { WHISPER_CPP_PATH: whisperBinary, WHISPER_MODEL_PATH: whisperModel, WHISPER_THREADS: '2' }, extra: { ...logging, machine: smallInstance } });
   try {
     const status = await working.studio.toolchain.run();
     assert.equal(status.state, 'passed', lines.join('\n').slice(-1500));
@@ -917,8 +918,95 @@ test('the real check, in the real server: a missing whisper.cpp is the one thing
   const detail = (name: string) => (passedLine.steps as unknown as Array<{ name: string; detail: string }>).find((step) => step.name === name)?.detail ?? '';
   assert.match(detail('speech-sample'), /^wrote 22 words with their times, 100% of those said/, 'the real program, here a stand-in that writes what whisper.cpp writes, was listened to and understood');
   assert.match(detail('render-speed'), /^3 s of 360x640 with captions/, 'at the size of clips this server is set to make');
+  assert.equal(detail('machine'), 'the processor share is limited to 0.15 of one core (1 cores visible); memory limited to 512 MiB', 'what the machine may use, as far as it could be read');
+  assert.match(detail('speech-sample'), /; [\d.]+ s to listen to 11 s of speech, with 2 threads$/, 'the check says how many threads the speech program had: WHISPER_THREADS, which beats the machine\'s own share');
+  assert.match(detail('render-speed'), / with preset ultrafast and 1 thread \(/, 'and FFmpeg: one thread, for a machine that may use 0.15 of a processor');
   const starts = (await readFile(whisperStarts, 'utf8')).split('\n').filter(Boolean);
   assert.ok(starts.length >= 1 && starts.every((line) => / -l en -t 2 -ng /.test(line)), `WHISPER_THREADS reaches the program: ${starts.join(' | ')}`);
+});
+
+const MEBIBYTE = 1024 * 1024;
+/** What Render's free instance reports (measured on 27 October 2026): 0.15 of one core, 512 MiB. */
+const smallInstance = async (): Promise<MachineLimits> => ({ cpuLimit: 0.15, memoryLimitBytes: 512 * MEBIBYTE, cores: 1, totalMemoryBytes: 8192 * MEBIBYTE });
+
+/** A stand-in for FFmpeg that notes every start (one line each) and then runs the real FFmpeg: what the server asks of the program can be read afterwards. */
+const writeRecordingFfmpeg = (path: string, log: string) => writeFile(path, `#!/bin/sh\necho "$*" >> '${log}'\nexec ffmpeg "$@"\n`, { mode: 0o755 });
+
+/** A machine that may use 8 processors of the 16 it shows: whisper.cpp gets 4 threads (it gains nothing from more), FFmpeg 8. */
+const bigMachine = async (): Promise<MachineLimits> => ({ cpuLimit: 8, memoryLimitBytes: null, cores: 16, totalMemoryBytes: 64 * 1024 * MEBIBYTE });
+
+const countOf = (line: string, option: string) => line.split(' ').filter((word, index, words) => word === option.split(' ')[0] && words[index + 1] === option.split(' ')[1]).length;
+
+test('the threads follow what the machine may use: for every job the speech program and FFmpeg (the clips, and the follower of a face) are started with them, and what is set by hand wins', needsFfmpeg, async () => {
+  const sentence = 'Here is the first important point. But the second point is even better! That is why you must remember it.';
+  const noLimit = async (): Promise<MachineLimits> => ({ cpuLimit: null, memoryLimitBytes: null, cores: 16, totalMemoryBytes: 64 * 1024 * MEBIBYTE });
+  const unreadable = async (): Promise<MachineLimits> => { throw new Error('the control group files cannot be read here'); };
+  // `speech` and `ffmpeg`: the number of threads each program must be started with (null: no option at all, the program chooses).
+  const cases: Array<{ label: string; machine: () => Promise<MachineLimits>; env?: Record<string, string>; speech: number | null; ffmpeg: number | null }> = [
+    { label: 'a small instance (0.15 of a processor)', machine: smallInstance, speech: 1, ffmpeg: 1 },
+    { label: 'a machine that may use 8 processors: the speech program does not gain from more than 4, FFmpeg takes all 8', machine: bigMachine, speech: 4, ffmpeg: 8 },
+    { label: 'no limit known (not in a container): the programs choose for themselves', machine: noLimit, speech: null, ffmpeg: null },
+    { label: 'the limits cannot be read: the programs choose for themselves and the server still works', machine: unreadable, speech: null, ffmpeg: null },
+    { label: 'WHISPER_THREADS and CLIP_THREADS set by hand beat the machine', machine: smallInstance, env: { WHISPER_THREADS: '3', CLIP_THREADS: '2' }, speech: 3, ffmpeg: 2 },
+    { label: 'WHISPER_THREADS alone: FFmpeg stays automatic', machine: smallInstance, env: { WHISPER_THREADS: '3' }, speech: 3, ffmpeg: 1 },
+    { label: 'CLIP_THREADS alone: the speech program stays automatic', machine: bigMachine, env: { CLIP_THREADS: '2' }, speech: 4, ffmpeg: 2 },
+  ];
+  for (const [index, setting] of cases.entries()) {
+    const schema = schemaName('threads'); const speechLog = join(workspace, `threads-${index}.speech`); const ffmpegLog = join(workspace, `threads-${index}.ffmpeg`);
+    const whisperBinary = join(workspace, `threads-${index}-whisper`); const ffmpegBinary = join(workspace, `threads-${index}-ffmpeg`); const model = join(workspace, `threads-${index}-model.bin`);
+    await writeFakeWhisper(whisperBinary, { argsLog: speechLog, json: speechSampleJson({ text: sentence, from: 0.2, to: 7.8 }) });
+    await writeRecordingFfmpeg(ffmpegBinary, ffmpegLog); await writeFile(model, '');
+    const server = await start({ schema, realSpeechEngine: true, env: { WHISPER_CPP_PATH: whisperBinary, WHISPER_MODEL_PATH: model, FFMPEG_PATH: ffmpegBinary, ...setting.env }, extra: { machine: setting.machine } });
+    try {
+      const response = await uploadWith(server.base, '/api/jobs', await readFile(sampleVideo), { clipCount: '1', captionStyle: 'none', framing: 'face' });
+      assert.equal(response.status, 202, setting.label);
+      const { job } = await response.json() as { job: { id: string } };
+      const finished = await waitForJob(server.base, job.id);
+      assert.equal(finished.job.status, 'completed', `${setting.label}: ${finished.job.errorMessage ?? ''}`);
+      assert.equal(finished.clips.length, 1, setting.label);
+      await untilSettled(server);
+    } finally { await server.stop(); await dropSchema(schema); }
+
+    const listened = (await readFile(speechLog, 'utf8')).split('\n').filter(Boolean);
+    assert.equal(listened.length, 1, `${setting.label}: the speech was listened to once`);
+    assert.ok(listened[0].includes(setting.speech === null ? ' -l en -ng ' : ` -l en -t ${setting.speech} -ng `), `${setting.label}: the speech program was started as: ${listened[0]}`);
+
+    const starts = (await readFile(ffmpegLog, 'utf8')).split('\n').filter(Boolean);
+    const rendered = starts.filter((line) => line.includes('+faststart')); const looked = starts.filter((line) => line.includes('image2pipe'));
+    assert.equal(rendered.length, 1, `${setting.label}: one clip was cut`); assert.equal(looked.length, 1, `${setting.label}: one look for a face`);
+    for (const [what, line, threadOptions] of [['the clip', rendered[0], 2], ['the follower of a face', looked[0], 1]] as const) {
+      if (setting.ffmpeg === null) {
+        assert.ok(!/-threads|-filter_threads/.test(line), `${setting.label}: ${what} is cut with FFmpeg's own choice of threads: ${line}`);
+      } else {
+        assert.equal(countOf(line, `-filter_threads ${setting.ffmpeg}`), 1, `${setting.label}: the filters of ${what} use ${setting.ffmpeg} thread(s): ${line}`);
+        assert.equal(countOf(line, `-threads ${setting.ffmpeg}`), threadOptions, `${setting.label}: the decoder${threadOptions === 2 ? ' and the encoder' : ''} of ${what} use ${setting.ffmpeg} thread(s): ${line}`);
+        assert.equal(line.split(' ').filter((word) => word === '-threads' || word === '-filter_threads').length, threadOptions + 1, `${setting.label}: no other thread option: ${line}`);
+      }
+    }
+  }
+});
+
+test('the log says how many threads each program is started with, and why', async () => {
+  const lines: string[] = [];
+  const logging = { logLevel: 'info', logDestination: { write: (line: string) => { lines.push(line); } } };
+  for (const [machine, env] of [[smallInstance, {}], [bigMachine, {}], [async (): Promise<MachineLimits> => ({ cpuLimit: null, memoryLimitBytes: null, cores: 4, totalMemoryBytes: 8192 * MEBIBYTE }), { TRANSCRIPTION_ENGINE: 'openai_compatible', TRANSCRIPTION_API_URL: 'https://speech.example.test/v1', TRANSCRIPTION_API_KEY: 'a-key-that-is-never-logged' }]] as const) {
+    const schema = schemaName('threadlog'); lines.length = 0;
+    const server = await start({ schema, env, extra: { ...logging, machine } });
+    await server.stop(); await dropSchema(schema);
+    const entry = lines.map((line) => JSON.parse(line) as { msg?: string; processorShare?: number | null; whisperThreads?: number | null; clipThreads?: number | null }).find((candidate) => candidate.msg?.startsWith('Threads: '));
+    assert.ok(entry, `the line about threads is in the log: ${lines.join('\n').slice(0, 600)}`);
+    if (machine === smallInstance) {
+      assert.equal(entry.msg, 'Threads: whisper.cpp with 1 thread, FFmpeg with 1 thread (this machine may use 0.15 of a processor)');
+      assert.deepEqual({ share: entry.processorShare, whisper: entry.whisperThreads, clips: entry.clipThreads }, { share: 0.15, whisper: 1, clips: 1 });
+    } else if (machine === bigMachine) {
+      assert.equal(entry.msg, 'Threads: whisper.cpp with 4 threads, FFmpeg with 8 threads (this machine may use 8.00 of a processor)', 'each program is told its own number');
+      assert.deepEqual({ share: entry.processorShare, whisper: entry.whisperThreads, clips: entry.clipThreads }, { share: 8, whisper: 4, clips: 8 });
+    } else {
+      assert.equal(entry.msg, "Threads: FFmpeg with the program's own choice of threads", 'a hosted speech service has no threads to count');
+      assert.deepEqual({ share: entry.processorShare, whisper: entry.whisperThreads, clips: entry.clipThreads }, { share: null, whisper: null, clips: null });
+      assert.ok(!lines.join('').includes('a-key-that-is-never-logged'), 'the key of a hosted service is never in the logs');
+    }
+  }
 });
 
 test('with a hosted speech service and face following switched off, the check leaves out what is not in use', needsFfmpeg, async () => {

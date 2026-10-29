@@ -66,7 +66,7 @@ test('the start-up check of the video tools is on by default, can be switched of
   assert.throws(() => loadConfig({ TOOLCHAIN_CHECK_ENABLED: 'flase' }));
 });
 
-test('the real samples of the start-up check are on by default, can be switched off, and reject typos; the number of threads for whisper.cpp is 0 (its own choice) unless set, and stays sensible', () => {
+test('the real samples of the start-up check are on by default, can be switched off, and reject typos; the numbers of threads for whisper.cpp and for FFmpeg are 0 (automatic) unless set, and stay sensible', () => {
   assert.equal(loadConfig({}).TOOLCHAIN_REAL_SAMPLES, true);
   assert.equal(loadConfig({ TOOLCHAIN_REAL_SAMPLES: '' }).TOOLCHAIN_REAL_SAMPLES, true);
   for (const off of ['false', '0', 'no', 'off']) assert.equal(loadConfig({ TOOLCHAIN_REAL_SAMPLES: off }).TOOLCHAIN_REAL_SAMPLES, false, `"${off}" should switch it off`);
@@ -75,6 +75,10 @@ test('the real samples of the start-up check are on by default, can be switched 
   assert.equal(loadConfig({ WHISPER_THREADS: '1' }).WHISPER_THREADS, 1);
   assert.equal(loadConfig({ WHISPER_THREADS: '64' }).WHISPER_THREADS, 64);
   for (const unusable of ['-1', '65', '1.5', 'many']) assert.throws(() => loadConfig({ WHISPER_THREADS: unusable }), (error: unknown) => error instanceof Error, `"${unusable}" is not a number of threads`);
+  assert.equal(loadConfig({}).CLIP_THREADS, 0);
+  assert.equal(loadConfig({ CLIP_THREADS: '1' }).CLIP_THREADS, 1);
+  assert.equal(loadConfig({ CLIP_THREADS: '64' }).CLIP_THREADS, 64);
+  for (const unusable of ['-1', '65', '1.5', 'many']) assert.throws(() => loadConfig({ CLIP_THREADS: unusable }), (error: unknown) => error instanceof Error, `"${unusable}" is not a number of threads`);
 });
 
 test('the public address Render provides is used when valid, and a bad one never stops the server from starting', () => {

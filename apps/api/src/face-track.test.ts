@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test, { after, before } from 'node:test';
@@ -141,6 +141,29 @@ test('problems with the video or with FFmpeg are reported, not hidden', async ()
   await assert.rejects(new FaceClipFramer({ ffmpegPath: join(directory, 'no-such-ffmpeg'), outputAspect: 9 / 16 }).frame({ sourcePath: video('walker.mp4'), startSeconds: 0, endSeconds: 5 }), /ENOENT/);
   await assert.rejects(framer().frame({ sourcePath: video('walker.mp4'), startSeconds: 5, endSeconds: 5 }), /positive length/);
   await assert.rejects(framer().frame({ sourcePath: video('walker.mp4'), startSeconds: 50, endSeconds: 55 }), /No picture could be taken/);
+});
+
+test('FFmpeg is told how many threads to use for the pictures, in the places FFmpeg means them for, and the face is followed all the same; without a number it is told nothing', async () => {
+  const log = video('recorded-calls.log');
+  const recorder = video('recording-ffmpeg');
+  await writeFile(recorder, `#!${process.execPath}
+const { spawnSync } = require('node:child_process'); const { appendFileSync } = require('node:fs');
+appendFileSync(${JSON.stringify(log)}, JSON.stringify(process.argv.slice(2)) + '\\n');
+const result = spawnSync('ffmpeg', process.argv.slice(2), { stdio: 'inherit' });
+process.exitCode = result.status === null ? 1 : result.status;
+`, { mode: 0o755 });
+  const calls = async () => (await readFile(log, 'utf8').catch(() => '')).split('\n').filter(Boolean).map((line) => JSON.parse(line) as string[]);
+  const result = await new FaceClipFramer({ ffmpegPath: recorder, outputAspect: 9 / 16, threads: 2 }).frame({ sourcePath: video('walker.mp4'), startSeconds: 0, endSeconds: 10 });
+  assert.ok(result.followed, result.note);
+  assert.ok(result.seenShare >= 0.9, `${result.seenShare}`);
+  const [given] = await calls();
+  assert.equal(given[given.indexOf('-filter_threads') + 1], '2', 'the filters');
+  assert.deepEqual(given.slice(given.indexOf('-i') - 2, given.indexOf('-i')), ['-threads', '2'], 'the decoder: an input option, so in front of the input');
+  assert.equal(given.filter((argument) => argument === '-threads').length, 1);
+  await new FaceClipFramer({ ffmpegPath: recorder, outputAspect: 9 / 16 }).frame({ sourcePath: video('walker.mp4'), startSeconds: 0, endSeconds: 10 });
+  const all = await calls();
+  assert.equal(all.length, 2);
+  assert.ok(!all[1].includes('-threads') && !all[1].includes('-filter_threads'), 'no number, no option');
 });
 
 test('FFmpeg is stopped when it takes too long', async () => {

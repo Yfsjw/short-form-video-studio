@@ -113,10 +113,11 @@ starting level; whether a second job right after the first still fits has not be
 
 This is one sample, not a benchmark, and it was a short video: longer, larger or higher-resolution videos, and back-to-back jobs,
 have not been tried. It is also the time of the whole job. The stages were not timed one by one when it was measured (that came
-later), so how much of the ten minutes was listening to the speech and how much was making the clip is **not known**; on a machine
-with a tenth of a processor, making a 1080x1920 clip may well take most of it. The start-up samples (see "Start-up check of the
-video tools") are there to measure the two separately on the machine itself. What it does show is that the free instance is good for demonstrations with short videos and not for
-customers. Render's documentation (October 2026) lists these web service sizes: Starter 0.5 CPU / 512 MB, Standard 1 CPU / 2 GB,
+later), so how much of the ten minutes was listening to the speech and how much was making the clip was not measured, and the start-up
+samples cannot settle it: whisper.cpp always works on windows of 30 seconds, so the 11-second recording costs about what each 30 seconds
+of a video cost (a 45-second video is two windows), not what 11 seconds would cost at a steady rate. What a job really spends in each
+stage is shown on its page (see "Progress and timings"); one real job on the current version will answer it. What the job does show is
+that the free instance is good for demonstrations with short videos and not for customers. Render's documentation (October 2026) lists these web service sizes: Starter 0.5 CPU / 512 MB, Standard 1 CPU / 2 GB,
 Pro 2 CPU / 4 GB. Starter has the same memory as the free plan, so it would not relieve the memory pressure; prices are on
 render.com/pricing.
 
@@ -127,6 +128,12 @@ clips showing that captions are drawn (160 bright points), that the whole-pictur
 moves, and that the face follower follows the portrait of the test video across the picture (seen in 100% of the moments checked). That
 shows the tools the clips need exist and behave on that host, on three-second test clips. It says nothing about how fast a customer's
 video is made there (see above).
+
+The same check, now with the real samples, ran on 27 October 2026 and passed all 14 of its checks in 190.5 seconds (more than two minutes
+of it spent on whisper.cpp listening twice to the 11-second recording that comes with the program, with its own choice of threads and with
+one). It showed on the live host, for the first time, that the real whisper.cpp's output is read correctly: 22 words, each with its
+time, 100% of the words said. The machine it reported: 0.15 of one processor, 512 MiB. The speeds, and what they led to, are under
+[Threads on a small machine](#threads-on-a-small-machine).
 
 ## Prerequisites
 
@@ -195,7 +202,8 @@ All configuration comes from environment variables; see [`.env.example`](.env.ex
 | `MAX_UPLOAD_BYTES` | Largest accepted upload (default 2 GiB). The upload page states the limit. |
 | `FFMPEG_PATH`, `FFPROBE_PATH` | Binary locations when not on `PATH`. |
 | `WHISPER_CPP_PATH`, `WHISPER_MODEL_PATH`, `TRANSCRIPTION_LANGUAGE`, `TRANSCRIPTION_TIMEOUT_MS` | whisper.cpp command, model, language code (default `en`) and time limit. |
-| `WHISPER_THREADS` | How many threads whisper.cpp may use (`-t`; 0–64, default `0`, which leaves it to whisper.cpp: it uses up to 4). To be set from what the start-up samples measure on the machine (see [Start-up check of the video tools](#start-up-check-of-the-video-tools)); more threads than the machine has processor share for may be slower, not faster. |
+| `WHISPER_THREADS` | How many threads whisper.cpp is started with (`-t`; 0–64). `0`, the default, is automatic: on a machine that may use only a share of its processors (a container, such as Render's instances) as many as that share allows, rounded to a whole number, at least 1 and at most 4; on a machine with no such limit the choice is left to whisper.cpp. See [Threads on a small machine](#threads-on-a-small-machine). |
+| `CLIP_THREADS` | The same for FFmpeg when it makes a clip or looks for a face to follow (`-threads` for decoding and encoding, `-filter_threads` for the filters; 0–64, default `0` = automatic: as many as the share allows, at least 1 and at most 16; with no limit known FFmpeg chooses). |
 | `TRANSCRIPTION_ENGINE` | `whisper_cpp` (default, runs on this machine) or `openai_compatible` (a hosted service, see [Faster speech recognition](#faster-speech-recognition-with-a-hosted-service-optional)). |
 | `TRANSCRIPTION_API_URL`, `TRANSCRIPTION_API_KEY`, `TRANSCRIPTION_API_MODEL` | Only for `openai_compatible`: the service's base address (ending in `/v1`), its key (never logged, never shown in a message) and the model (default `whisper-1`). The address and key are required when that engine is chosen. |
 | `TRANSCRIPTION_CHUNK_SECONDS`, `TRANSCRIPTION_API_CONCURRENCY`, `TRANSCRIPTION_API_TIMEOUT_MS` | Only for `openai_compatible`: about how many seconds of audio go in one request (default 600), how many requests run at once (default 3) and the time limit of one request (default 300000 ms). |
@@ -508,11 +516,10 @@ running job could use up the memory of the 512 MB instance, so it looks again ev
   - makes one clip of the real size (1080x1920 unless configured otherwise, captions with the spoken word lit, the preset and
     quality the clips use) from three seconds of a busy full-HD test picture, and says how long that took.
 
-  When the machine has less than one whole processor to share and `WHISPER_THREADS` is not set, the listening and the clip are each
-  made a second time with a single thread (whisper.cpp `-t 1`, FFmpeg `-threads 1`) and both times are reported, because on a
-  fraction of a processor several threads may only get in each other's way. What is best is measured, not guessed. These are three
-  seconds of a test pattern and eleven seconds of one voice: they show the speed of the machine, not the speed or the accuracy on a
-  customer's recording.
+  The listening and the clip are made once each, with the number of threads the customers' jobs are started with (see
+  [Threads on a small machine](#threads-on-a-small-machine)), and the check says how many that was, so that the times are the times a
+  job gets. These are three seconds of a test pattern and eleven seconds of one voice: they show the speed of the machine, not the
+  speed or the accuracy on a customer's recording.
 
   They take real time on a small instance (minutes, on the free one), so the check holds a place for the heavy stages while it runs,
   as a job does (`JOB_CONCURRENCY`). A video uploaded in the meantime waits, shown as "waiting for capacity", and is never worked on
@@ -529,13 +536,40 @@ filter, captions silently dropped, a wrong font folder, a crop window that never
 cut instead of fitted, a program that is not FFmpeg, a truncated model, a portrait without a face...), and twenty-four deliberate
 breakages of the check itself were each caught by those tests. The real samples were tested the same way: whisper.cpp is a stand-in
 that writes JSON in the layout the program reads, or something wrong in one of seven ways; the machine is described by control group
-files of both versions; FFmpeg is a recorder that notes every call it is given. Seventy-seven deliberate breakages of the samples, of
-the thread setting and of the place the check holds were made one at a time (a threshold moved, a thread count in the wrong place, a
-comparison made at the wrong core count, a place never given back...). The tests caught seventy-five at once; the other two (a render
-sample tried without a clip size, one made with another preset than the clips use) led to two stronger tests, after which all
-seventy-seven were caught. That check was run by hand and is not part of the repository. What the check says on the live service is shown
+files of both versions; FFmpeg is a recorder that notes every call it is given. Deliberate breakages of the samples, of the thread
+settings and of the place the check holds were made one at a time (a threshold moved, a thread count in the wrong place, a number of
+threads taken from the wrong setting, a place never given back...): 77 for the first version of the samples, and 118 for the code as it is
+since the threads are chosen automatically (the earlier ones that still apply, and new ones). The tests caught 113 of the 118 at once; the
+other five (the log giving one program the other's number of threads, the threads of the face follower in the check, the time told for
+the listening, the ratio told for the clip) led to stronger tests, after which all 118 were caught. These checks were run by hand and are
+not part of the repository. What the check says on the live service is shown
 in its log (see "What the free instance has actually done"). The stand-in whisper.cpp is the reason the live sample matters: only the
 real program on the real host can show that its output is read correctly.
+
+### Threads on a small machine
+
+whisper.cpp and FFmpeg choose how many threads to use from the number of processors they can see. A container sees the processors of the
+host it runs on, not the share of them it may use: Render's free instance may use 0.15 of one processor (the `machine` step of the
+start-up check reads that from the container's own limits: "the processor share is limited to 0.15 of one core (1 cores visible);
+memory limited to 512 MiB"), and the programs still choose as for a whole machine. Threads beyond the share do not run side by side:
+they take turns on the same fraction of a processor, and each needs memory of its own.
+
+What the live service measured on 27 October 2026, in the start-up check of the version before this setting existed (read from Render's
+log of that check and from Render's processor and memory graphs: one run on the real host, not a benchmark):
+
+| | the programs' own choice of threads | one thread |
+|---|---|---|
+| whisper.cpp listening to 11 s of speech | 92.6 s, memory up to about 437 MB | 39.6 s (2.3 times faster), memory about 301 MB in a reading taken during that run |
+| 3 s of 720x1280 clip with captions (FFmpeg) | 14.0 s | 11.0 s (encoder with one thread) |
+
+The idle server was at about 190 MB of the 512 MB, and the processor was at 0.14 to 0.15 of its 0.15 limit during nearly the whole of the check.
+
+So the server starts the programs with as many threads as its share of a processor allows: the share rounded to the nearest whole
+number, at least one, for whisper.cpp at most 4 and for FFmpeg at most 16, and never more than the processors that are visible. On the free
+instance that is one thread each. Where no share is known (a laptop, a virtual machine) nothing is chosen and the programs decide as
+before. `WHISPER_THREADS` and `CLIP_THREADS`, when they are not 0, beat all of this. The log says what was chosen, once at start-up
+(`Threads: whisper.cpp with 1 thread, FFmpeg with 1 thread (this machine may use 0.15 of a processor)`), and the start-up check says how
+many threads each of its two samples had, next to the time it took.
 
 ## Not implemented
 

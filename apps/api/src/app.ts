@@ -16,6 +16,7 @@ import { VideoPipeline } from './pipeline.js';
 import { createTranscriptionEngine } from './engines.js';
 import { FaceClipFramer, type ClipFramer } from './face-track.js';
 import { ToolchainMonitor, checkToolchain, type ToolchainReport } from './toolchain.js';
+import { automaticThreads, describeThreads, readMachineLimits, type MachineLimits } from './machine.js';
 import type { TranscriptionEngine } from './transcription.js';
 import { DeterministicHighlightDetector, type HighlightOptions } from './highlights.js';
 import { FfmpegClipRenderer, isSafeClipIdentifier, resolveClipOutputPath } from './clips.js';
@@ -62,6 +63,8 @@ export interface AppOverrides {
   /** What the check of the video tools does (a stand-in for tests; production passes nothing and gets the real check) and how often it looks whether the server is idle yet. */
   toolchainCheck?: () => Promise<ToolchainReport>;
   toolchainRetryMs?: number;
+  /** What limits the machine (default: the control group files of the container). It decides how many threads the programs are started with, and is what the start-up check reports. */
+  machine?: () => Promise<MachineLimits>;
 }
 
 const DEFAULT_BOOT_RECOVERY_WAIT_MS = 30_000;
@@ -81,12 +84,19 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
   if (accessGate.enabled) logger.info('An access code is required for every page and every call except /api/health');
   else logger.warn('No ACCESS_CODE is set: anyone who can reach this address can upload videos and see every job. Set ACCESS_CODE (at least 8 characters) before sharing the address.');
   const db = await StudioDatabase.connect(config.DATABASE_URL, overrides.databaseSchema, logger);
-  const transcriber = overrides.transcriber ?? createTranscriptionEngine(config);
+  // How much of the machine this process may really use decides how many threads the programs are started with: they count the processors of the
+  // host, not the share of them this container has, and threads beyond the share only wait for each other (see machine.ts for what was measured).
+  const machineLimits = await (overrides.machine ?? readMachineLimits)().catch(() => undefined);
+  const automatic = (most?: number) => (machineLimits ? automaticThreads(machineLimits, most) : undefined);
+  const whisperThreads = config.WHISPER_THREADS || automatic(4);
+  const clipThreads = config.CLIP_THREADS || automatic();
+  logger.info({ processorShare: machineLimits?.cpuLimit ?? null, whisperThreads: whisperThreads ?? null, clipThreads: clipThreads ?? null }, `Threads: ${config.TRANSCRIPTION_ENGINE === 'whisper_cpp' ? `whisper.cpp with ${describeThreads(whisperThreads)}, ` : ''}FFmpeg with ${describeThreads(clipThreads)}${machineLimits?.cpuLimit != null ? ` (this machine may use ${machineLimits.cpuLimit.toFixed(2)} of a processor)` : ''}`);
+  const transcriber = overrides.transcriber ?? createTranscriptionEngine(config, whisperThreads);
   const highlightOptions: HighlightOptions = { minDurationSeconds: config.HIGHLIGHT_MIN_DURATION_SECONDS, maxDurationSeconds: config.HIGHLIGHT_MAX_DURATION_SECONDS, maxCandidates: config.HIGHLIGHT_MAX_CANDIDATES, overlapThreshold: config.HIGHLIGHT_OVERLAP_THRESHOLD, weights: { density: config.HIGHLIGHT_WEIGHT_DENSITY, emphasis: config.HIGHLIGHT_WEIGHT_EMPHASIS, question: config.HIGHLIGHT_WEIGHT_QUESTION, number: config.HIGHLIGHT_WEIGHT_NUMBER, contrast: config.HIGHLIGHT_WEIGHT_CONTRAST, hook: config.HIGHLIGHT_WEIGHT_HOOK, completeness: config.HIGHLIGHT_WEIGHT_COMPLETENESS, standalone: config.HIGHLIGHT_WEIGHT_STANDALONE, continuity: config.HIGHLIGHT_WEIGHT_CONTINUITY, length: config.HIGHLIGHT_WEIGHT_LENGTH } };
   const framer: ClipFramer | undefined = overrides.framer === undefined
-    ? (config.FACE_FRAMING_ENABLED ? new FaceClipFramer({ ffmpegPath: config.FFMPEG_PATH, outputAspect: config.CLIP_VERTICAL_WIDTH / config.CLIP_VERTICAL_HEIGHT }) : undefined)
+    ? (config.FACE_FRAMING_ENABLED ? new FaceClipFramer({ ffmpegPath: config.FFMPEG_PATH, outputAspect: config.CLIP_VERTICAL_WIDTH / config.CLIP_VERTICAL_HEIGHT, threads: clipThreads }) : undefined)
     : overrides.framer ?? undefined;
-  const renderer = new FfmpegClipRenderer(config.FFMPEG_PATH, config.CLIP_VIDEO_CODEC, config.CLIP_AUDIO_CODEC, config.CLIP_CRF, config.CLIP_PRESET, config.CLIP_VERTICAL_WIDTH, config.CLIP_VERTICAL_HEIGHT);
+  const renderer = new FfmpegClipRenderer(config.FFMPEG_PATH, config.CLIP_VIDEO_CODEC, config.CLIP_AUDIO_CODEC, config.CLIP_CRF, config.CLIP_PRESET, config.CLIP_VERTICAL_WIDTH, config.CLIP_VERTICAL_HEIGHT, undefined, undefined, clipThreads);
   const pipeline = new VideoPipeline(db, new FfmpegAdapter(config.FFPROBE_PATH, config.FFMPEG_PATH), transcriber, new DeterministicHighlightDetector(), highlightOptions, renderer, config.CLIP_MAX_CANDIDATES, config.UPLOAD_DIR, config.TEMP_DIR, config.OUTPUT_DIR, logger, durableStorage, {
     concurrency: config.JOB_CONCURRENCY,
     maxAttempts: config.JOB_MAX_ATTEMPTS,
@@ -151,9 +161,10 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
     check: () => pipeline.withCapacity(overrides.toolchainCheck ?? (() => checkToolchain({
       ffmpegPath: config.FFMPEG_PATH, ffprobePath: config.FFPROBE_PATH, videoCodec: config.CLIP_VIDEO_CODEC, audioCodec: config.CLIP_AUDIO_CODEC, crf: config.CLIP_CRF, preset: config.CLIP_PRESET,
       workDirectory: config.TEMP_DIR,
-      whisper: config.TRANSCRIPTION_ENGINE === 'whisper_cpp' ? { binaryPath: config.WHISPER_CPP_PATH, modelPath: config.WHISPER_MODEL_PATH, ...(config.WHISPER_THREADS ? { threads: config.WHISPER_THREADS } : {}) } : null,
+      whisper: config.TRANSCRIPTION_ENGINE === 'whisper_cpp' ? { binaryPath: config.WHISPER_CPP_PATH, modelPath: config.WHISPER_MODEL_PATH, ...(whisperThreads ? { threads: whisperThreads } : {}) } : null,
       faceFollowing: framer !== undefined,
       realSamples: config.TOOLCHAIN_REAL_SAMPLES, clipSize: { width: config.CLIP_VERTICAL_WIDTH, height: config.CLIP_VERTICAL_HEIGHT },
+      clipThreads, machine: overrides.machine,
     }))),
     isBusy: () => pipeline.activeJobCount > 0 || requestsInFlight > 0,
     logger,

@@ -42,6 +42,11 @@ export class FfmpegClipRenderer implements ClipRenderer {
     private readonly verticalHeight: number,
     private readonly runner: FfmpegRunner = async (binary, arguments_, options) => { await execFileAsync(binary, arguments_, options); },
     private readonly fontsDirectory: string = BUNDLED_FONTS_DIRECTORY,
+    /**
+     * How many threads FFmpeg may use, for decoding, for the filters and for encoding (left out: it chooses for itself, counting the processors
+     * of the host, which on a container with a small share of them means threads that only wait for each other, see machine.ts).
+     */
+    private readonly threads?: number,
   ) {}
 
   async render(request: ClipRenderRequest): Promise<RenderedClip> {
@@ -55,12 +60,12 @@ export class FfmpegClipRenderer implements ClipRenderer {
       // its captions at 40 s onwards while ours are counted from the start of the clip, and they would never show up or show at the wrong
       // moment). Placed before it, the seek is still frame-accurate, the clip's own timeline starts at 0, and a clip deep inside a long video
       // no longer costs the time of decoding everything before it.
-      '-nostdin', '-y', '-ss', request.startSeconds.toFixed(3), '-i', request.sourcePath,
+      '-nostdin', '-y', ...this.filterThreadOptions(), '-ss', request.startSeconds.toFixed(3), ...this.threadOptions(), '-i', request.sourcePath,
       '-t', durationSeconds.toFixed(3),
       '-map', '0:v:0', '-map', '0:a?',
       '-vf', videoFilter,
       '-c:v', this.videoCodec, '-preset', this.preset, '-crf', String(this.crf),
-      '-c:a', this.audioCodec, '-movflags', '+faststart', request.outputPath,
+      '-c:a', this.audioCodec, '-movflags', '+faststart', ...this.threadOptions(), request.outputPath,
     ];
     try {
       await this.runner(this.ffmpegPath, args, { maxBuffer: 4 * 1024 * 1024, timeout: 30 * 60_000, cwd: dirname(request.outputPath) });
@@ -74,6 +79,11 @@ export class FfmpegClipRenderer implements ClipRenderer {
       throw new Error(`Clip extraction failed: ${detail}${stderr ? `; ffmpeg: ${stderr}` : ''}`);
     }
   }
+
+  /** `-threads`: in front of an input it is for the decoder, in front of an output for the encoder. */
+  private threadOptions(): string[] { return this.threads ? ['-threads', String(this.threads)] : []; }
+  /** `-filter_threads` is a global option: how many threads the filters (scaling, blurring, captions) may use. */
+  private filterThreadOptions(): string[] { return this.threads ? ['-filter_threads', String(this.threads)] : []; }
 
   private buildVideoFilter(captionPath: string | null | undefined, size: { width: number; height: number }, framing?: FramingPlan | null, layout: 'fill' | 'fit' = 'fill') {
     // `fill`: the picture is enlarged until it covers the clip, and the clip is cut out of it: from the middle, unless a plan says where the window
