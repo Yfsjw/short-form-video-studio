@@ -26,9 +26,17 @@ import { FailedAttemptLimiter, createAccessGate } from './access.js';
 import { installAccessGate } from './access-http.js';
 import { parseJobOptions } from './options.js';
 import { escapeHtml, renderJobPage, renderMessagePage, renderUploadPage } from './pages.js';
+import { PlainFailure, onlyVideos, plainWords } from './failures.js';
 
 const acceptedExtensions = new Set(['.mp4', '.mov', '.mkv', '.webm', '.avi', '.m4v']);
 const acceptedMimeTypes = new Set(['video/mp4', 'video/quicktime', 'video/x-matroska', 'video/webm', 'video/x-msvideo', 'video/x-m4v']);
+
+/** What a person is told about an upload that the upload library refused. Its own short words are not repeated: they are not written for people. */
+function uploadRefusal(error: multer.MulterError): string {
+  if (error.code === 'LIMIT_UNEXPECTED_FILE') return 'Attach one video file using the “video” field.';
+  if (error.code === 'LIMIT_FILE_COUNT') return 'Only one video can be uploaded at a time.';
+  return 'The upload could not be understood.';
+}
 
 /** What the API shows about a job: the internal storage key stays on the server. */
 function toPublicJob(job: VideoJob): Omit<VideoJob, 'sourceStorageKey'> {
@@ -146,7 +154,7 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
   const storage = multer.diskStorage({ destination: config.UPLOAD_DIR, filename: (_req, file, cb) => cb(null, `${randomUUID()}${extname(file.originalname).toLowerCase()}`) });
   const upload = multer({ storage, limits: { fileSize: config.MAX_UPLOAD_BYTES, files: 1 }, fileFilter: (_req, file, cb) => {
     const ext = extname(file.originalname).toLowerCase();
-    if (!acceptedExtensions.has(ext) || (file.mimetype && !acceptedMimeTypes.has(file.mimetype))) return cb(new Error('Only MP4, MOV, MKV, WebM, AVI, and M4V video files are accepted.'));
+    if (!acceptedExtensions.has(ext) || (file.mimetype && !acceptedMimeTypes.has(file.mimetype))) return cb(new PlainFailure(onlyVideos, { code: 'INVALID_UPLOAD' }));
     cb(null, true);
   }});
   /** An upload that never became a job (the database was unreachable, say) must not sit on the disk for nothing. */
@@ -202,11 +210,12 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
   app.post('/test-upload', (req, res, next) => {
     upload.single('video')(req, res, async (error?: unknown) => {
       if (error) {
-        const message = error instanceof multer.MulterError && error.code === 'LIMIT_FILE_SIZE'
-          ? `This video is larger than the ${maxUploadMb} MB limit.`
-          : error instanceof Error ? error.message : 'Upload failed unexpectedly.';
+        // What is wrong with the upload is told in words meant for a person; anything else (the disk, say) is the server's business and stays in the log.
+        const known = error instanceof multer.MulterError || error instanceof PlainFailure;
+        const message = error instanceof multer.MulterError ? (error.code === 'LIMIT_FILE_SIZE' ? `This video is larger than the ${maxUploadMb} MB limit.` : uploadRefusal(error))
+          : error instanceof PlainFailure ? error.message : plainWords.server;
         req.log.error({ err: error }, 'Upload failed');
-        return res.status(400).type('html').send(renderMessagePage('Upload failed', message));
+        return res.status(known ? 400 : 500).type('html').send(renderMessagePage('Upload failed', message));
       }
       try {
         if (!req.file) return res.status(400).type('html').send(renderMessagePage('Upload failed', 'No video file was received.'));
@@ -219,7 +228,9 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
         // Straight to the page that follows the job, instead of a confirmation page with a link to tap.
         res.redirect(303, `/jobs/${job.id}`);
       } catch (error) {
-        next(error);
+        // A person at a form is shown a page, not the JSON of an API (and not what the database said).
+        req.log.error({ err: error }, 'Upload failed');
+        res.status(500).type('html').send(renderMessagePage('Upload failed', plainWords.server));
       }
     });
   });
@@ -297,8 +308,14 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
   app.use((_req, res) => res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Route not found.' } }));
   app.use((error: Error, req: Request, res: Response, _next: NextFunction) => {
     req.log.error({ err: error }, 'Request failed');
-    const uploadCode = error instanceof multer.MulterError ? error.code : undefined;
-    res.status(uploadCode || error.message.startsWith('Only ') ? 400 : 500).json({ error: { code: uploadCode ? 'INVALID_UPLOAD' : 'INTERNAL_ERROR', message: uploadCode === 'LIMIT_FILE_SIZE' ? `Video exceeds the ${maxUploadMb} MB upload limit.` : error.message || 'Unexpected server error.' } });
+    // What is told is what is wrong with the request, in words written to be read. Whatever else went wrong (the database, the disk, a program, a
+    // service) can carry addresses, paths and names that are nobody's business but the operator's, so it is answered in general words and the log has the rest.
+    if (error instanceof multer.MulterError) return res.status(400).json({ error: { code: 'INVALID_UPLOAD', message: error.code === 'LIMIT_FILE_SIZE' ? `Video exceeds the ${maxUploadMb} MB upload limit.` : uploadRefusal(error) } });
+    if (error instanceof PlainFailure) return res.status(error.status).json({ error: { code: error.code, message: error.message } });
+    // A request the parser could not read (broken JSON, a body too large, an encoding it does not know) carries its own status, never to be echoed with its own words.
+    const status = (error as { status?: unknown }).status;
+    if (typeof status === 'number' && status >= 400 && status < 500) return res.status(status).json({ error: { code: 'INVALID_REQUEST', message: status === 413 ? 'The request is too large.' : 'The request could not be understood.' } });
+    res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: plainWords.server } });
   });
 
   // A free Render instance is spun down after 15 minutes without visitors, and a job running for longer than that

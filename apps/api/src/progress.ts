@@ -56,6 +56,8 @@ export class StageClock {
     this.finished[this.current.stage] = (this.finished[this.current.stage] ?? 0) + Math.max(0, this.now() - this.current.since);
     this.current = undefined;
   }
+  /** The stage that is running now (none before the first and after `finish`). */
+  get currentStage(): string | undefined { return this.current?.stage; }
   /** The stages that have finished so far. */
   snapshot(): Record<string, number> { return { ...this.finished }; }
   /** Closes the stage that is running and returns everything. */

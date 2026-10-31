@@ -4,6 +4,7 @@ import { access, readFile } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 import type { TranscriptSegment } from './domain.js';
 import { wordsFromTokens, type RawToken } from './words.js';
+import { PlainFailure, describeTimeLimit } from './failures.js';
 
 export type TranscriptInput = Array<Omit<TranscriptSegment, 'id' | 'jobId' | 'createdAt'>>;
 export interface TranscriptionEngine {
@@ -58,7 +59,7 @@ const KEPT_OUTPUT_CHARS = 64 * 1024;
 /**
  * Runs a program and hands everything it prints on stderr to `onStderr` as it happens (so progress can be followed),
  * keeping only the tail of both outputs. Unlike execFile with a size limit, a program that prints a lot is not killed for it.
- * A failure carries `stdout` and `stderr`, like execFile's.
+ * A failure carries `stdout` and `stderr`, like execFile's, `timedOut` (the time limit is what stopped the program) and, when a signal ended it, `signal`.
  */
 export function runProgram(executable: string, args: string[], options: { cwd: string; timeoutMs: number; onStderr?: (text: string) => void }): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
@@ -69,12 +70,12 @@ export function runProgram(executable: string, args: string[], options: { cwd: s
     child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
     child.stdout.on('data', (text: string) => { stdout = keepTail(stdout, text); });
     child.stderr.on('data', (text: string) => { stderr = keepTail(stderr, text); try { options.onStderr?.(text); } catch { /* a listener must never break the run */ } });
-    const fail = (message: string) => { if (finished) return; finished = true; clearTimeout(timer); reject(Object.assign(new Error(message), { stdout, stderr })); };
+    const fail = (message: string, extra: { signal?: string } = {}) => { if (finished) return; finished = true; clearTimeout(timer); reject(Object.assign(new Error(message), { stdout, stderr, timedOut, ...extra })); };
     child.on('error', (error) => fail(`Could not start ${executable}: ${error.message}`));
     child.on('close', (code, signal) => {
       if (finished) return;
       if (timedOut) return fail(`${basename(executable)} was stopped after the ${Math.round(options.timeoutMs / 1000)} s time limit`);
-      if (code !== 0) return fail(`Command failed: ${basename(executable)} (${signal ? `signal ${signal}` : `exit code ${code}`})`);
+      if (code !== 0) return fail(`Command failed: ${basename(executable)} (${signal ? `signal ${signal}` : `exit code ${code}`})`, signal ? { signal } : {});
       finished = true; clearTimeout(timer); resolve({ stdout, stderr });
     });
   });
@@ -126,11 +127,16 @@ export class WhisperCppTranscriber implements TranscriptionEngine {
       stdout = result.stdout;
       stderr = result.stderr;
     } catch (error) {
-      const execError = error as { message?: string; stdout?: string; stderr?: string };
+      const execError = error as { message?: string; stdout?: string; stderr?: string; timedOut?: boolean; signal?: string };
       stdout = typeof execError.stdout === 'string' ? execError.stdout : '';
       stderr = typeof execError.stderr === 'string' ? execError.stderr : '';
       const detail = execError.message ?? 'Unknown whisper.cpp execution failure';
-      throw new Error(`Local whisper.cpp transcription failed: ${detail}\nwhisper stdout:\n${trimDiagnostic(stdout)}\nwhisper stderr:\n${trimDiagnostic(stderr)}`);
+      const failure = new Error(`Local whisper.cpp transcription failed: ${detail}\nwhisper stdout:\n${trimDiagnostic(stdout)}\nwhisper stderr:\n${trimDiagnostic(stderr)}`);
+      // Two causes are worth telling the person, because a shorter video is the way out of both: the time limit, and the program being killed
+      // (on a small server that is nearly always the system stopping it for using too much memory). The rest is the server's business.
+      if (execError.timedOut) throw new PlainFailure(`Listening to the speech took longer than the ${describeTimeLimit(this.timeoutMs)} allowed, so it was stopped. A shorter video will be faster.`, { cause: failure });
+      if (execError.signal === 'SIGKILL') throw new PlainFailure('The speech recognition was stopped by the server, most likely because it ran out of memory. A shorter video may work.', { cause: failure });
+      throw failure;
     }
 
     try {

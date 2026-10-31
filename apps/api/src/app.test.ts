@@ -16,6 +16,7 @@ import type { ClipFramer } from './face-track.js';
 import type { MachineLimits } from './machine.js';
 import { NullStorage, type DurableStorage } from './storage.js';
 import { MemoryStorage, eventually, sleep, speechSampleJson, writeFakeWhisper } from './test-support.js';
+import { onlyVideos, plainWords } from './failures.js';
 import type { ToolchainReport } from './toolchain.js';
 import type { TranscriptionEngine } from './transcription.js';
 
@@ -38,6 +39,10 @@ after(async () => { await admin.end(); await rm(workspace, { recursive: true, fo
 /** A genuine 8-second H.264/AAC video with sound (320x240), small enough to process in about a second. */
 const sampleVideo = join(workspace, 'sample.mp4');
 if (hasFfmpeg) await run('ffmpeg', ['-nostdin', '-y', '-f', 'lavfi', '-i', 'testsrc=duration=8:size=320x240:rate=15', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=8', '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-shortest', '-movflags', '+faststart', sampleVideo]);
+
+/** A genuine 2-second video with no sound track at all. */
+const silentVideo = join(workspace, 'silent.mp4');
+if (hasFfmpeg) await run('ffmpeg', ['-nostdin', '-y', '-f', 'lavfi', '-i', 'testsrc=duration=2:size=160x120:rate=10', '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', silentVideo]);
 
 /** The same video followed by a valid MP4 "free" (padding) box, so it is still a real, playable video but megabytes larger. */
 async function paddedVideo(megabytes: number) {
@@ -298,7 +303,7 @@ test('a video over the configured limit is refused with a clear message and leav
     assert.match(await response.text(), /larger than the 1 MB limit/);
     const api = await upload(server.base, '/api/jobs', Buffer.alloc(2 * 1024 * 1024, 1));
     assert.equal(api.status, 400);
-    assert.equal(((await api.json()) as { error: { code: string } }).error.code, 'INVALID_UPLOAD');
+    assert.deepEqual(((await api.json()) as { error: unknown }).error, { code: 'INVALID_UPLOAD', message: 'Video exceeds the 1 MB upload limit.' });
     assert.deepEqual(await readdir(server.dirs.UPLOAD_DIR), []);
     assert.equal((await server.studio.db.listUnfinishedJobs()).length, 0);
   } finally { await server.stop(); await dropSchema(schema); }
@@ -1114,4 +1119,194 @@ test('start-up forgets the transcripts nobody has needed for as many days as are
       await eventually('switching the cache off to clear it', () => raw.query('SELECT count(*)::int AS n FROM transcript_cache').then((result) => result.rows[0].n as number), (count) => count === 0);
     } finally { await third.stop(); }
   } finally { await raw.end(); await dropSchema(schema); }
+});
+
+// ---- what a person is told when something goes wrong: words that were written to be read, never the inside of the server ------------------------
+
+/** Something a server's own failure looks like: a program's name, a folder, an address with a password. */
+const INSIDE = 'spawn /opt/render/project/src/.render/whisper-cli ENOENT; connect ECONNREFUSED 10.1.2.3:5432 postgres://user:hunter2@db.example.test/prod';
+const nothingInside = (text: string, what: string) => assert.doesNotMatch(text, /\/opt\/|whisper-cli|ECONNREFUSED|10\.1\.2\.3|hunter2|postgres:|db\.example|ENOENT|moov atom|ffprobe|Command failed/i, `${what} must not show the inside of the server: ${text.slice(0, 300)}`);
+const logLines = (lines: string[]) => lines.map((line) => JSON.parse(line) as { level: number; msg?: string; err?: { message?: string } });
+
+test('a file that is not a video is refused in plain words by the form and by the API, and nothing is left behind', async () => {
+  const schema = schemaName('notvideo'); const server = await start({ schema });
+  try {
+    const form = await upload(server.base, '/test-upload', Buffer.from('just some notes'), 'notes.txt');
+    assert.equal(form.status, 400);
+    const page = await form.text();
+    assert.ok(page.includes(onlyVideos), 'the page says which files are taken');
+    nothingInside(page, 'the page');
+
+    const api = await upload(server.base, '/api/jobs', Buffer.from('just some notes'), 'notes.txt');
+    assert.equal(api.status, 400);
+    assert.deepEqual(((await api.json()) as { error: unknown }).error, { code: 'INVALID_UPLOAD', message: onlyVideos });
+    assert.deepEqual(await readdir(server.dirs.UPLOAD_DIR), []);
+    assert.equal((await server.studio.db.listUnfinishedJobs()).length, 0);
+  } finally { await server.stop(); await dropSchema(schema); }
+});
+
+test('when the server itself fails (here the database), the person is told in general words, by the form as a page and by the API as JSON, and the log has the real cause', async () => {
+  const schema = schemaName('inside'); const lines: string[] = [];
+  const server = await start({ schema, extra: { logLevel: 'info', logDestination: { write: (line: string) => { lines.push(line); } } } });
+  try {
+    server.studio.db.createJob = async () => { throw new Error(INSIDE); };
+    const api = await upload(server.base, '/api/jobs', await readFile(sampleVideo));
+    assert.equal(api.status, 500);
+    const body = await api.json() as { error: { code: string; message: string } };
+    assert.deepEqual(body.error, { code: 'INTERNAL_ERROR', message: plainWords.server });
+    nothingInside(JSON.stringify(body), 'the answer of the API');
+
+    const form = await upload(server.base, '/test-upload', await readFile(sampleVideo));
+    assert.equal(form.status, 500);
+    assert.match(form.headers.get('content-type') ?? '', /text\/html/, 'a person at the form is shown a page');
+    const page = await form.text();
+    assert.ok(page.includes(plainWords.server) && page.includes('Upload failed'));
+    nothingInside(page, 'the page');
+    assert.deepEqual(await readdir(server.dirs.UPLOAD_DIR), [], 'the video that could not become a job is not kept');
+    const real = logLines(lines).filter((entry) => entry.level === 50 && entry.err?.message?.includes('ECONNREFUSED'));
+    assert.deepEqual(real.map((entry) => entry.msg).sort(), ['Request failed', 'Upload failed'], 'the log has what really happened, once for the call to the API and once for the form');
+  } finally { await server.stop(); await dropSchema(schema); }
+});
+
+test('a request the parser cannot read is a bad request in general words, and the words of the parser are not repeated', async () => {
+  const schema = schemaName('badjson'); const server = await start({ schema, env: { COBALT_API_URL: 'http://127.0.0.1:9' } });
+  try {
+    const broken = await fetch(`${server.base}/api/youtube`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"url": ' });
+    assert.equal(broken.status, 400);
+    assert.deepEqual(((await broken.json()) as { error: unknown }).error, { code: 'INVALID_REQUEST', message: 'The request could not be understood.' });
+    const huge = await fetch(`${server.base}/api/youtube`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ url: 'x'.repeat(40_000) }) });
+    assert.equal(huge.status, 413);
+    assert.deepEqual(((await huge.json()) as { error: unknown }).error, { code: 'INVALID_REQUEST', message: 'The request is too large.' });
+  } finally { await server.stop(); await dropSchema(schema); }
+});
+
+test('the YouTube route says what is wrong with an address in plain words, passes on only a short reason from the download service, and keeps the rest to the log', async () => {
+  const oddCodes: Record<string, unknown> = { longest: 'a'.repeat(80), toolong: 'a'.repeat(81), nothing: '', joined: 'rate_limit-exceeded.v2', numeric: 12345 };
+  const cobalt = createServer((request, response) => {
+    let body = ''; request.on('data', (chunk) => { body += String(chunk); });
+    request.on('end', () => {
+      const asked = JSON.parse(body) as { url: string };
+      response.setHeader('content-type', 'application/json');
+      if (asked.url.includes('unavailable')) return void response.end(JSON.stringify({ status: 'error', error: { code: 'error.api.content.video.unavailable' } }));
+      if (asked.url.includes('strange')) return void response.end(JSON.stringify({ status: 'error', error: { code: '<script>alert(1)</script> /srv/cobalt/secret' } }));
+      for (const [word, code] of Object.entries(oddCodes)) if (asked.url.includes(word)) return void response.end(JSON.stringify({ status: 'error', error: { code } }));
+      response.statusCode = 500; response.end(`internal failure at /srv/cobalt/app.js line 12 with key hunter2`);
+    });
+  }).listen(0, '127.0.0.1');
+  await new Promise<void>((resolve) => cobalt.once('listening', resolve));
+  const schema = schemaName('youtube'); const lines: string[] = [];
+  const server = await start({ schema, env: { COBALT_API_URL: `http://127.0.0.1:${(cobalt.address() as AddressInfo).port}` }, extra: { logLevel: 'info', logDestination: { write: (line: string) => { lines.push(line); } } } });
+  const ask = async (url: string) => { const response = await fetch(`${server.base}/api/youtube`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ url }) }); return { status: response.status, error: ((await response.json()) as { error: { code: string; message: string } }).error }; };
+  try {
+    assert.deepEqual(await ask('https://example.com/watch?v=1'), { status: 400, error: { code: 'INVALID_YOUTUBE_URL', message: 'Only YouTube addresses are accepted.' } });
+    assert.deepEqual(await ask('not an address'), { status: 400, error: { code: 'INVALID_YOUTUBE_URL', message: 'That is not a web address. Paste the address of a YouTube video.' } });
+    assert.deepEqual(await ask('https://www.youtube.com/watch?v=unavailable'), { status: 502, error: { code: 'DOWNLOAD_FAILED', message: 'The video could not be downloaded from YouTube (the reason given: error.api.content.video.unavailable).' } });
+    const strange = await ask('https://www.youtube.com/watch?v=strange');
+    assert.deepEqual(strange, { status: 502, error: { code: 'DOWNLOAD_FAILED', message: 'The video could not be downloaded from YouTube (the reason given: unknown).' } }, 'a reason that is not a short code is not passed on');
+    assert.ok(logLines(lines).some((entry) => entry.err?.message?.includes('Cobalt error: <script>alert(1)</script>')), 'the log has the whole of what the service gave, as what the failure was made from');
+    const reasonFor = async (word: string) => (await ask(`https://www.youtube.com/watch?v=${word}`)).error.message.match(/\(the reason given: (.*)\)\.$/)?.[1];
+    assert.equal(await reasonFor('longest'), 'a'.repeat(80), 'a code of the longest length that is passed on');
+    assert.equal(await reasonFor('toolong'), 'unknown', 'one that is longer is not');
+    assert.equal(await reasonFor('nothing'), 'unknown', 'an empty one is not');
+    assert.equal(await reasonFor('numeric'), 'unknown', 'a number is not a code');
+    assert.equal(await reasonFor('joined'), 'rate_limit-exceeded.v2', 'dots, hyphens and underscores belong to a code');
+    const broken = await ask('https://www.youtube.com/watch?v=1');
+    assert.deepEqual(broken, { status: 500, error: { code: 'INTERNAL_ERROR', message: plainWords.server } }, 'what the service answered with is not repeated');
+    assert.ok(logLines(lines).some((entry) => entry.err?.message?.includes('Cobalt HTTP 500') && entry.err.message.includes('/srv/cobalt/app.js')), 'but the log has it');
+    assert.deepEqual(await readdir(server.dirs.UPLOAD_DIR), []);
+  } finally { await server.stop(); await dropSchema(schema); await new Promise<void>((resolve) => cobalt.close(() => resolve())); }
+});
+
+test('a video with no sound fails at once with words that say so, a file that is not a video says so too, and neither shows anything of the server', needsFfmpeg, async () => {
+  const schema = schemaName('nosound'); let listened = 0;
+  const server = await start({ schema, transcriber: { transcribe: async (audioPath, workDir) => { listened += 1; return talk.transcribe(audioPath, workDir); } } });
+  try {
+    const silent = await (await upload(server.base, '/api/jobs', await readFile(silentVideo))).json() as { job: { id: string } };
+    const failed = await waitForJob(server.base, silent.job.id);
+    assert.equal(failed.job.status, 'failed');
+    assert.equal(failed.job.errorMessage, plainWords.noSound);
+    assert.equal(listened, 0, 'nothing was listened to');
+    const page = await (await fetch(`${server.base}/jobs/${silent.job.id}`)).text();
+    assert.ok(page.includes('This video has no sound'), 'the page says it');
+    nothingInside(page, 'the page of the job');
+
+    const notVideo = await (await upload(server.base, '/api/jobs', Buffer.alloc(64 * 1024, 3))).json() as { job: { id: string } };
+    const unreadable = await waitForJob(server.base, notVideo.job.id);
+    assert.equal(unreadable.job.status, 'failed');
+    assert.equal(unreadable.job.errorMessage, plainWords.unreadableVideo);
+    nothingInside(await (await fetch(`${server.base}/jobs/${notVideo.job.id}`)).text(), 'the page of the job');
+    nothingInside(JSON.stringify(unreadable), 'the answer of the API about the job');
+    await untilSettled(server);
+    assert.deepEqual(await readdir(server.dirs.UPLOAD_DIR), []);
+    assert.equal((server.storage as MemoryStorage).objects.size, 0, 'and neither video is kept in storage');
+  } finally { await server.stop(); await dropSchema(schema); }
+});
+
+test('an upload that the upload library refuses for its shape is answered in the words of the app, never in the library\'s own', async () => {
+  const schema = schemaName('shape'); const server = await start({ schema });
+  try {
+    const part = () => new Blob([new Uint8Array(Buffer.from('not a video, but that is not what is looked at here'))], { type: 'video/mp4' });
+    const wrongField = () => { const form = new FormData(); form.append('movie', part(), 'match.mp4'); return form; };
+    const twoVideos = () => { const form = new FormData(); form.append('video', part(), 'one.mp4'); form.append('video', part(), 'two.mp4'); return form; };
+    const hugeValue = () => { const form = new FormData(); form.append('title', 'x'.repeat(1_100_000)); form.append('video', part(), 'match.mp4'); return form; };
+    const cases: Array<[string, () => FormData, string]> = [
+      ['a file in a field that is not \u201cvideo\u201d', wrongField, 'Attach one video file using the \u201cvideo\u201d field.'],
+      ['two videos at once', twoVideos, 'Only one video can be uploaded at a time.'],
+      ['a field with far more in it than any field has', hugeValue, 'The upload could not be understood.'],
+    ];
+    for (const [what, form, words] of cases) {
+      const api = await fetch(`${server.base}/api/jobs`, { method: 'POST', body: form() });
+      assert.equal(api.status, 400, what);
+      assert.deepEqual(((await api.json()) as { error: unknown }).error, { code: 'INVALID_UPLOAD', message: words }, what);
+      const page = await fetch(`${server.base}/test-upload`, { method: 'POST', body: form() });
+      assert.equal(page.status, 400, what);
+      const html = await page.text();
+      assert.ok(html.includes(words), `${what}: the page says it`);
+      assert.doesNotMatch(html, /Unexpected field|Too many files|Field value too long/, `${what}: the words of the library are not repeated`);
+    }
+    assert.deepEqual(await readdir(server.dirs.UPLOAD_DIR), []);
+    assert.equal((await server.studio.db.listUnfinishedJobs()).length, 0);
+  } finally { await server.stop(); await dropSchema(schema); }
+});
+
+test('when the server cannot keep an upload (here its folder is gone), the person is told in general words with no folder in them, by the form and by the API, and the log has the real cause', async () => {
+  const schema = schemaName('nofolder'); const lines: string[] = [];
+  const server = await start({ schema, extra: { logLevel: 'info', logDestination: { write: (line: string) => { lines.push(line); } } } });
+  try {
+    await rm(server.dirs.UPLOAD_DIR, { recursive: true, force: true });
+    const bytes = Buffer.from('a video, as far as the server can tell');
+    const api = await upload(server.base, '/api/jobs', bytes);
+    assert.equal(api.status, 500);
+    const body = await api.json() as { error: { code: string; message: string } };
+    assert.deepEqual(body.error, { code: 'INTERNAL_ERROR', message: plainWords.server });
+    nothingInside(JSON.stringify(body), 'the answer of the API');
+    assert.ok(!JSON.stringify(body).includes(server.root), 'no folder of the server');
+
+    const form = await upload(server.base, '/test-upload', bytes);
+    assert.equal(form.status, 500);
+    const page = await form.text();
+    assert.ok(page.includes(plainWords.server) && page.includes('Upload failed'));
+    nothingInside(page, 'the page');
+    assert.ok(!page.includes(server.root), 'no folder of the server');
+    const real = logLines(lines).filter((entry) => entry.level === 50 && entry.err?.message?.includes('ENOENT'));
+    assert.deepEqual(real.map((entry) => entry.msg).sort(), ['Request failed', 'Upload failed'], 'the log has what really happened, once for the call to the API and once for the form');
+    assert.equal((await server.studio.db.listUnfinishedJobs()).length, 0);
+  } finally { await server.stop(); await dropSchema(schema); }
+});
+
+test('an error that carries a status of its own is taken for a bad request only when that status is a client error, and what it says is never repeated', async () => {
+  const schema = schemaName('statuses'); const server = await start({ schema });
+  try {
+    const ask = () => upload(server.base, '/api/jobs', Buffer.from('a video, as far as the server can tell'));
+    for (const status of [399, 500, 503, '404']) {
+      server.studio.db.createJob = async () => { throw Object.assign(new Error(INSIDE), { status }); };
+      const answer = await ask();
+      assert.equal(answer.status, 500, `an error with the status ${String(status)}`);
+      assert.deepEqual(((await answer.json()) as { error: unknown }).error, { code: 'INTERNAL_ERROR', message: plainWords.server }, String(status));
+    }
+    server.studio.db.createJob = async () => { throw Object.assign(new Error(INSIDE), { status: 422 }); };
+    const refused = await ask();
+    assert.equal(refused.status, 422);
+    assert.deepEqual(((await refused.json()) as { error: unknown }).error, { code: 'INVALID_REQUEST', message: 'The request could not be understood.' });
+  } finally { await server.stop(); await dropSchema(schema); }
 });

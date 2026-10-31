@@ -16,6 +16,7 @@ import { paddedRange } from './ranges.js';
 import { aspectRatios, highlightOptionsFor } from './options.js';
 import { StageClock, stageProgress, totalMilliseconds } from './progress.js';
 import { sourceKeyFor, StoredObjectMissingError, type DurableStorage } from './storage.js';
+import { PlainFailure, failureMessage, plainWords } from './failures.js';
 
 type PipelineStore = Pick<StudioDatabase, 'getJob' | 'updateJob' | 'replaceTranscript' | 'listTranscript' | 'replaceHighlights' | 'listHighlights' | 'createClip' | 'updateClip' | 'beginAttempt' | 'touchJob' | 'listUnfinishedJobs' | 'listFinishedJobsHoldingSource' | 'claimJobForRecovery' | 'failStaleJob' | 'deleteClipsForJob' | 'findCachedTranscript' | 'storeCachedTranscript' | 'pruneTranscriptCache'>;
 type MediaProcessor = Pick<FfmpegAdapter, 'probe' | 'extractAudio'>;
@@ -249,8 +250,10 @@ export class VideoPipeline {
         this.logger.error({ err: error, jobId, attempt }, 'Could not read the uploaded video back from durable storage; the job will be tried again later');
         await this.db.updateJob(jobId, { stage: 'waiting_to_retry', stageTimings: clock.finish() });
       } else {
-        const message = error instanceof Error ? error.message : 'Unexpected processing failure';
-        this.logger.error({ err: error, jobId }, 'Video processing failed');
+        // What the person reads says what is wrong with the video, in plain words; what really happened (paths, programs, services) is for the log.
+        const stage = clock.currentStage;
+        const message = failureMessage(error, stage);
+        this.logger.error({ err: error, jobId, stage }, 'Video processing failed');
         await this.progressWrites.get(jobId)?.catch(() => undefined);
         await this.db.updateJob(jobId, { status: 'failed', stage: 'failed', errorMessage: message, stageTimings: clock.finish() });
         reachedFinalState = true;
@@ -339,7 +342,7 @@ export class VideoPipeline {
   private async prepareSource(job: VideoJob, sourcePath: string) {
     const haveLocal = await isFile(sourcePath);
     if (!this.storage.isDurable) {
-      if (!haveLocal) throw new Error('The uploaded video is no longer on the server, and durable storage is not configured to restore it from.');
+      if (!haveLocal) throw new PlainFailure('The uploaded video is no longer on the server. Please upload it again.');
       return;
     }
     if (job.sourceStorageKey) {
@@ -349,7 +352,7 @@ export class VideoPipeline {
         await this.storage.download(job.sourceStorageKey, sourcePath);
       } catch (error) {
         // An object that is gone is gone; anything else (the store not answering, a transfer that keeps breaking) may well pass.
-        if (error instanceof StoredObjectMissingError) throw new Error('The saved copy of the uploaded video no longer exists in durable storage, so processing cannot be resumed. Please upload the video again.');
+        if (error instanceof StoredObjectMissingError) throw new PlainFailure('The saved copy of this video is gone, so processing could not be resumed. Please upload the video again.', { cause: error });
         throw new SourceUnavailableForNow(`The uploaded video could not be read back from durable storage: ${error instanceof Error ? error.message : String(error)}`);
       }
       const restoredBytes = (await stat(sourcePath)).size;
@@ -360,7 +363,7 @@ export class VideoPipeline {
       this.logger.info({ jobId: job.id, key: job.sourceStorageKey }, 'Restored the uploaded video from durable storage');
       return;
     }
-    if (!haveLocal) throw new Error('The uploaded video is no longer on the server and was never saved to durable storage. Please upload it again.');
+    if (!haveLocal) throw new PlainFailure('The uploaded video is no longer on the server and was never saved. Please upload it again.');
     await this.enterStage(job.id, 'saving_source');
     const key = sourceKeyFor(job.id, job.storedFilename);
     await this.storage.upload(sourcePath, key, job.mimeType || 'application/octet-stream');
@@ -446,8 +449,9 @@ export class VideoPipeline {
   private async renderClips(job: VideoJob, sourcePath: string, jobOutputDir: string) {
     const jobId = job.id;
     await this.discardPreviousClips(jobId, jobOutputDir);
-    const metadata = await this.ffmpeg.probe(sourcePath);
+    const { hasAudio, ...metadata } = await this.ffmpeg.probe(sourcePath);
     await this.enterStage(jobId, 'extracting_audio', { ...metadata });
+    if (hasAudio === false) throw new PlainFailure(plainWords.noSound);   // nothing to listen to: say so now, not after a failed extraction
     const workDir = await mkdtemp(join(this.tempDir, `${jobId}-`));
     try {
       const audioPath = join(workDir, 'audio.wav');
@@ -460,7 +464,7 @@ export class VideoPipeline {
       const highlights = this.highlightDetector.detect({ segments: transcript, durationSeconds: metadata.durationSeconds, metadata: { width: metadata.width, height: metadata.height }, options: highlightOptionsFor(this.highlightOptions, options) });
       await this.db.replaceHighlights(jobId, highlights);
       const candidates = (await this.db.listHighlights(jobId)).slice(0, options.clipCount ?? this.maxClipCandidates);
-      if (!candidates.length) throw new Error(transcript.length ? 'No stretch of the speech was long enough to make a clip from.' : 'No speech was recognised in this video, so there is nothing to base clips on. Try a video in which someone is talking.');
+      if (!candidates.length) throw new PlainFailure(transcript.length ? 'No stretch of the speech was long enough to make a clip from.' : 'No speech was recognised in this video, so there is nothing to base clips on. Try a video in which someone is talking.');
       await this.enterStage(jobId, 'extracting_clips');
       await mkdir(jobOutputDir, { recursive: true });
       let completedCount = 0; let framingMs = 0;
@@ -493,11 +497,11 @@ export class VideoPipeline {
           await this.db.updateClip(clipId, { status: 'completed', durationSeconds: rendered.durationSeconds, errorMessage: null, captionPath }); completedCount += 1;
         } catch (error) {
           await rm(captionPath, { force: true }); await rm(styledCaptionPath, { force: true });
-          const message = error instanceof Error ? error.message : 'Unexpected clip extraction failure'; await this.db.updateClip(clipId, { status: 'failed', errorMessage: message }); this.logger.error({ err: error, jobId, clipId, candidateId: candidate.id }, 'Clip extraction failed');
+          await this.db.updateClip(clipId, { status: 'failed', errorMessage: plainWords.oneClip }); this.logger.error({ err: error, jobId, clipId, candidateId: candidate.id }, 'Clip extraction failed');
         }
         this.reportProgress(jobId, stageProgress('extracting_clips', (candidateNumber + 1) / candidates.length));
       }
-      if (!completedCount) throw new Error(`Clip extraction failed for all ${candidates.length} ranked candidate(s).`);
+      if (!completedCount) throw new PlainFailure(`None of the ${candidates.length} clip${candidates.length === 1 ? '' : 's'} could be made from this video. Please try again, or try another video.`);
       await this.progressWrites.get(jobId)?.catch(() => undefined);
       const stageTimings = this.clocks.get(jobId)?.finish() ?? {};
       await this.db.updateJob(jobId, { status: 'completed', stage: 'clip_extraction_complete', progress: 100, stageTimings });

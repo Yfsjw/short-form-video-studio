@@ -4,6 +4,7 @@ import { basename, join } from 'node:path';
 import { Readable } from 'node:stream';
 import { pipeline as streamPipeline } from 'node:stream/promises';
 import type { ReadableStream as NodeWebReadableStream } from 'node:stream/web';
+import { PlainFailure } from './failures.js';
 
 type CobaltResponse =
   | { status: 'tunnel' | 'redirect'; url: string; filename?: string }
@@ -12,9 +13,10 @@ type CobaltResponse =
   | { status: 'error'; error?: { code?: string; context?: unknown } };
 
 function assertYouTubeUrl(value: string): URL {
-  const url = new URL(value);
+  let url: URL;
+  try { url = new URL(value); } catch { throw new PlainFailure('That is not a web address. Paste the address of a YouTube video.', { code: 'INVALID_YOUTUBE_URL' }); }
   if (!['youtube.com', 'www.youtube.com', 'm.youtube.com', 'youtu.be', 'www.youtu.be'].includes(url.hostname.toLowerCase())) {
-    throw new Error('Only YouTube URLs are accepted.');
+    throw new PlainFailure('Only YouTube addresses are accepted.', { code: 'INVALID_YOUTUBE_URL' });
   }
   return url;
 }
@@ -74,7 +76,9 @@ export async function downloadYouTubeVideo(options: {
       if (video) sourceUrl = video.url;
     } else if (data.status === 'error') {
       const code = data.error?.code ?? 'unknown';
-      throw new Error(`Cobalt error: ${code}`);
+      // The reason Cobalt gives is a short code ("error.api.content.video.unavailable"); it comes from another service, so only a code is passed on.
+      const safeCode = typeof code === 'string' && /^[A-Za-z0-9._-]{1,80}$/.test(code) ? code : 'unknown';
+      throw new PlainFailure(`The video could not be downloaded from YouTube (the reason given: ${safeCode}).`, { status: 502, code: 'DOWNLOAD_FAILED', cause: new Error(`Cobalt error: ${String(code).slice(0, 200)}`) });
     }
 
     if (!sourceUrl) throw new Error(`Cobalt did not return a downloadable video (status: ${data.status}).`);

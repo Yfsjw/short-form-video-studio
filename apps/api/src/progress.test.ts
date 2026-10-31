@@ -46,6 +46,17 @@ test('the stage clock records every stage once it ends, and a stage entered twic
   assert.equal(totalMilliseconds({ a: Number.NaN, b: 5 }), 5);
 });
 
+test('the stage clock says which stage is running: none before the first, the latest one while it runs, and none again at the end', () => {
+  const clock = new StageClock(() => 0);
+  assert.equal(clock.currentStage, undefined);
+  clock.enter('probing_video');
+  assert.equal(clock.currentStage, 'probing_video');
+  clock.enter('transcribing');
+  assert.equal(clock.currentStage, 'transcribing');
+  clock.finish();
+  assert.equal(clock.currentStage, undefined);
+});
+
 test('reusing a transcript sits where listening to the speech does, so progress still only moves forward', () => {
   assert.equal(stageProgress('reusing_transcript'), stageProgress('transcribing'));
   const order = ['extracting_audio', 'reusing_transcript', 'detecting_highlights', 'extracting_clips'];

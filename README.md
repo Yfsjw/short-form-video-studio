@@ -261,6 +261,42 @@ Accepted extensions: MP4, MOV, MKV, WebM, AVI, M4V. Extension and declared MIME 
 `ffprobe` then checks that the file really contains a readable video stream. An upload that is abandoned halfway, or whose job
 cannot be created, leaves nothing behind on the disk.
 
+### When a video cannot be processed
+
+What a person reads when something goes wrong (the `errorMessage` of a failed job, on its page and in `GET /api/jobs/:id`, and the
+answer to a request that failed) says what is wrong with the video or the request and what to do about it, and nothing about the inside
+of the server: no folder, no program name, no exit code, nothing a storage, speech or database service said. What really happened is
+in the log (the error itself, with what it was made from, and the stage the job was in), which is where the operator looks.
+
+| What happened | What the person is told |
+| --- | --- |
+| The video has no sound track at all (found when the video is first looked at, before anything is listened to) | This video has no sound, so there is no speech to write captions from or to choose moments by. Upload a video in which someone is talking. |
+| The file is not a video, is damaged or was cut short | This file could not be read as a video. It may be damaged, cut short, or in a format this server does not support. |
+| Its sound cannot be read | The sound of this video could not be read. The file may be damaged, or its sound may be in a format this server does not support. |
+| Speech recognition passes its time limit (`TRANSCRIPTION_TIMEOUT_MS`) | Listening to the speech took longer than the 60 minutes allowed, so it was stopped. A shorter video will be faster. |
+| Speech recognition is killed from outside (on a small server almost always for using too much memory) | The speech recognition was stopped by the server, most likely because it ran out of memory. A shorter video may work. |
+| No speech was recognised, or no stretch of it is long enough | No speech was recognised in this video, so there is nothing to base clips on. Try a video in which someone is talking. / No stretch of the speech was long enough to make a clip from. |
+| Every clip failed | None of the 3 clips could be made from this video. Please try again, or try another video. (A single clip that fails says "This clip could not be made." and the job goes on with the others.) |
+| The upload could not be saved or read back, or its saved copy is gone | The video could not be received properly by the server. Please upload it again. / The saved copy of this video is gone, so processing could not be resumed. Please upload the video again. |
+| Anything else that goes wrong | General words that fit the stage the job was in (listening, choosing moments, making the clips), or, for a stage with no words of its own, "This video could not be processed because of a problem on the server. Please try again in a few minutes." |
+
+A request that fails is answered the same way: a file of another type is `400` `INVALID_UPLOAD` with the list of types that are taken
+(a file over the limit too, and an upload that cannot be read as one video: a file in a field other than `video`, two videos at once, or a
+field with far more in it than any field has, each in the server's own words and not in those of the upload library); a body the server cannot read is `400` `INVALID_REQUEST` (`413` when it is too large) without the words of the
+parser; a YouTube address that is not one is `400` `INVALID_YOUTUBE_URL`, and a download the service refused is `502` `DOWNLOAD_FAILED` with
+the short reason code the service gave (only when it is a plain code); everything else is `500` `INTERNAL_ERROR` with "Something went wrong on the
+server. Please try again in a moment." The upload form shows the same words on a page instead of JSON. Jobs that failed before this was
+introduced keep the message they were given then.
+
+What has been tried, and what has not. On the development machine (the whole suite, 422 tests, passes): every message above comes out of a
+test that makes the situation happen with real files and the real FFmpeg and ffprobe (a video without sound, a file that is not a video, a
+file cut in half, a recording with no picture, a file whose sound comes before its picture), or with a stand-in for a program that fails the
+way real ones do (killed from outside, past its time limit, not installed), and the same tests read the page of the job, the answer of the
+API and the log: the first two must show no folder, program name, address or password, and the log must have them. The new code was then
+broken on purpose in 101 ways (a word changed, a cause dropped, a status wrong, a check moved after the work it should come before), one at
+a time, and the tests caught all 101. Not yet tried: these words on the live service with a real failing video (uploading a video with no
+sound to the live address shows the first row in one step), and a failure of the real whisper.cpp on the live host.
+
 ### Deterministic highlight ranking
 
 The detector makes no semantic, LLM or "AI understanding" claim: every signal is a plain rule over the words and their timing. It

@@ -16,6 +16,7 @@ import { DeterministicHighlightDetector } from './highlights.js';
 import type { ClipRenderer, ClipRenderRequest } from './clips.js';
 import type { ClipFramer } from './face-track.js';
 import type { FramingPlan } from './framing.js';
+import { PlainFailure, plainWords } from './failures.js';
 
 const TEST_DATABASE_URL = process.env.DATABASE_URL ?? 'postgresql://postgres:localtest@localhost:5432/studio_local_test';
 const VIDEO = 'pretend these are the bytes of an uploaded video';
@@ -27,6 +28,13 @@ const highlightOptions = { minDurationSeconds: 1, maxDurationSeconds: 10, maxCan
 const fastRuntime: PipelineRuntimeOptions = { concurrency: 1, staleAfterMs: 1000, heartbeatMs: 50, recheckMs: 100, watchdogMs: 60_000, maxAttempts: 3 };
 
 type Context = Awaited<ReturnType<typeof setup>>;
+
+/** Whether the log holds an error (or something one was made from) whose words include `text`: what really went wrong is kept for the operator. */
+const logged = (ctx: Context, text: string) => ctx.errorFields.some((fields) => {
+  for (let error = fields.err as { message?: unknown; cause?: unknown } | undefined, depth = 0; error && depth < 5; error = error.cause as typeof error, depth += 1) if (String(error.message).includes(text)) return true;
+  return false;
+});
+const receivingWords = 'The video could not be received properly by the server. Please upload it again.';
 /** Waits for `promise`, but not for ever: a test of a lock that is never given back must fail, not hang. */
 const within = <T>(promise: Promise<T>, ms: number, what: string) => Promise.race([promise, sleep(ms).then((): never => { throw new Error(what); })]);
 
@@ -48,9 +56,11 @@ async function setup(options: { highlights?: Partial<typeof highlightOptions>; s
   const raw = new Pool({ connectionString: TEST_DATABASE_URL, options: `-c search_path="${schema}"` });
   const storage = options.storage ?? new MemoryStorage();
   const errors: string[] = [];
+  /** The fields that came with each of those errors (the error itself, as `err`): what really went wrong, which is for the log and not for the person. */
+  const errorFields: Array<Record<string, unknown>> = [];
   /** What the pipeline said about itself at the information level (the fields it attached, and the sentence). */
   const infos: Array<{ fields: Record<string, unknown>; message: string }> = [];
-  const logger = { info: (fields: unknown, message?: string) => { infos.push({ fields: (fields && typeof fields === 'object' ? fields : {}) as Record<string, unknown>, message: String(message) }); }, error: (_fields: unknown, message?: string) => { errors.push(String(message)); } };
+  const logger = { info: (fields: unknown, message?: string) => { infos.push({ fields: (fields && typeof fields === 'object' ? fields : {}) as Record<string, unknown>, message: String(message) }); }, error: (fields: unknown, message?: string) => { errors.push(String(message)); errorFields.push((fields && typeof fields === 'object' ? fields : {}) as Record<string, unknown>); } };
   const pipelines: VideoPipeline[] = [];
   const makePipeline = () => {
     const pipeline = new VideoPipeline(options.database ? options.database(db) : db, options.media ?? fakeMedia, options.transcriber ?? speech, new DeterministicHighlightDetector(), { ...highlightOptions, ...options.highlights }, options.renderer ?? writingRenderer, 1, uploadDir, tempDir, outputDir, logger, storage, { ...fastRuntime, ...options.runtime }, options.framer);
@@ -58,7 +68,7 @@ async function setup(options: { highlights?: Partial<typeof highlightOptions>; s
     return pipeline;
   };
   return {
-    root, uploadDir, tempDir, outputDir, db, raw, storage, errors, infos, makePipeline, pipeline: makePipeline(),
+    root, uploadDir, tempDir, outputDir, db, raw, storage, errors, errorFields, infos, makePipeline, pipeline: makePipeline(),
     /** Pretend nothing has touched this job for a while, as if the process working on it had died. */
     backdate: async (id: string, minutes: number) => { await raw.query('UPDATE video_jobs SET updated_at = $1 WHERE id = $2', [new Date(Date.now() - minutes * 60_000).toISOString(), id]); },
     cleanup: async () => { for (const pipeline of pipelines) pipeline.close(); await raw.end(); await db.close({ dropSchema: true }); await rm(root, { recursive: true, force: true }); },
@@ -148,7 +158,8 @@ test('fails the job immediately, with the reason, when the video cannot be saved
     await ctx.pipeline.run('j1');
     const job = await ctx.db.getJob('j1');
     assert.equal(job?.status, 'failed');
-    assert.match(job?.errorMessage ?? '', /simulated storage outage/);
+    assert.equal(job?.errorMessage, receivingWords, 'told in plain words: what the storage service said is not for the person');
+    assert.ok(logged(ctx, 'simulated storage outage'), 'but the log has it');
     assert.equal(job?.sourceStorageKey, null);
     assert.equal(transcribed, false, 'no CPU should be spent on a video that is not safe');
     assert.equal((await ctx.db.listClips('j1')).length, 0);
@@ -375,7 +386,8 @@ test('a video restored with the wrong size is rejected rather than processed', a
     await ctx.pipeline.recoverInterruptedJobs();
     const job = await waitForStatus(ctx, 'j9', ['completed', 'failed']);
     assert.equal(job.status, 'failed');
-    assert.match(job.errorMessage ?? '', /restored from durable storage has 9 bytes/);
+    assert.equal(job.errorMessage, receivingWords);
+    assert.ok(logged(ctx, 'restored from durable storage has 9 bytes'), 'the log has the sizes');
   } finally { await ctx.cleanup(); }
 });
 
@@ -421,8 +433,8 @@ test('when storage stays unreadable the job is given up on after its last attemp
     const job = await waitForStatus(ctx, 'j16', ['completed', 'failed'], 10_000);
     assert.equal(job.status, 'failed');
     assert.equal(job.attempts, 2);
-    assert.match(job.errorMessage ?? '', /could not be read back from durable storage/);
-    assert.match(job.errorMessage ?? '', /simulated storage outage/, 'the reason must be given');
+    assert.equal(job.errorMessage, receivingWords);
+    assert.ok(logged(ctx, 'could not be read back from durable storage') && logged(ctx, 'simulated storage outage'), 'the reason is in the log');
     await untilSettled(ctx);
     assert.equal(storage.objects.has('sources/j16/source.mp4'), false, 'once the job is over for good its stored video goes');
     assert.equal((await ctx.db.getJob('j16'))?.sourceStorageKey, null);
@@ -438,7 +450,8 @@ test('a stored video that no longer exists fails the job at once, because trying
     await ctx.pipeline.recoverInterruptedJobs();
     const job = await waitForStatus(ctx, 'j17', ['completed', 'failed']);
     assert.equal(job.status, 'failed');
-    assert.match(job.errorMessage ?? '', /no longer exists in durable storage/);
+    assert.equal(job.errorMessage, 'The saved copy of this video is gone, so processing could not be resumed. Please upload the video again.');
+    assert.ok(logged(ctx, 'no such object sources/j17/source.mp4'), 'the log has what the storage said, as what the failure was made from');
   } finally { await ctx.cleanup(); }
 });
 
@@ -449,7 +462,9 @@ test('a failing job reports why and still frees its local copies', async () => {
     await ctx.pipeline.run('j10');
     const job = await ctx.db.getJob('j10');
     assert.equal(job?.status, 'failed');
-    assert.match(job?.errorMessage ?? '', /Clip extraction failed for all 1/);
+    assert.equal(job?.errorMessage, 'None of the 1 clip could be made from this video. Please try again, or try another video.');
+    assert.deepEqual((await ctx.db.listClips('j10')).map((clip) => clip.errorMessage), [plainWords.oneClip], 'a clip that could not be made says so in general words too');
+    assert.ok(logged(ctx, 'ffmpeg exploded'), 'what FFmpeg said is in the log');
     assert.deepEqual(await readdir(ctx.uploadDir), []);
   } finally { await ctx.cleanup(); }
 });
@@ -694,7 +709,8 @@ test('a job that fails keeps the timings of the stages it went through and does 
     await ctx.pipeline.run('j-broken');
     const job = await ctx.db.getJob('j-broken');
     assert.equal(job?.status, 'failed');
-    assert.match(job?.errorMessage ?? '', /speech recognition exploded/);
+    assert.equal(job?.errorMessage, 'The speech in this video could not be turned into text. Please try again, or try another video.');
+    assert.ok(logged(ctx, 'speech recognition exploded'), 'what the engine said is in the log');
     assert.ok(job.stageTimings.transcribing >= 25, 'the stage that failed must be timed too');
     assert.ok(job.progress < 100);
   } finally { await ctx.cleanup(); }
@@ -1173,4 +1189,89 @@ test('whatever goes wrong with the cache, the job is done: a cache that cannot b
     assert.ok(unwritable.errors.some((message) => /Could not keep the transcript for next time/.test(message)));
     assert.equal((await unwritable.db.listClips('j1')).filter((clip) => clip.status === 'completed').length, 1);
   } finally { await unwritable.cleanup(); }
+});
+
+// ---- what a person is told when a job fails ---------------------------------------------------------------------------------------
+
+/** Something that goes wrong the way things go wrong on a server: the words carry a folder, a program, an address. */
+const SECRET = '/opt/render/project/src/.render/whisper-cli (connect ECONNREFUSED 10.1.2.3:5432, postgres://user:hunter2@db.example.test/prod)';
+const noTrace = (message: string | null | undefined) => {
+  assert.ok(message, 'there is a message');
+  assert.doesNotMatch(message, /\/opt\/|\/tmp\/|whisper-cli|ECONNREFUSED|10\.1\.2\.3|hunter2|postgres:|db\.example|\.mp4|\.wav|ffmpeg|ffprobe|exit code|signal|stderr|stdout|Error:/i, `a person must not read this: ${message}`);
+};
+
+test('whatever goes wrong in a stage, the person is told in general words that fit the stage, and the log has the real cause', async () => {
+  const cases: Array<{ stage: string; setup: () => Parameters<typeof setup>[0]; words: string }> = [
+    { stage: 'probing_video', setup: () => ({ media: { probe: async () => { throw new Error(`spawn ${SECRET} ENOENT`); }, extractAudio: fakeMedia.extractAudio } }), words: plainWords.jobServer },
+    { stage: 'extracting_audio', setup: () => ({ media: { probe: fakeMedia.probe, extractAudio: async () => { throw new Error(`spawn ${SECRET} ENOENT`); } } }), words: plainWords.jobServer },
+    { stage: 'transcribing', setup: () => ({ transcriber: { transcribe: async () => { throw new Error(SECRET); } } }), words: 'The speech in this video could not be turned into text. Please try again, or try another video.' },
+    { stage: 'extracting_clips', setup: () => ({ renderer: { render: async () => { throw new Error(SECRET); } } }), words: 'None of the 1 clip could be made from this video. Please try again, or try another video.' },
+  ];
+  for (const { stage, setup: options, words } of cases) {
+    const ctx = await setup(options());
+    try {
+      await addJob(ctx, 'plain'); await ctx.pipeline.run('plain');
+      const job = await ctx.db.getJob('plain');
+      assert.equal(job?.status, 'failed', stage);
+      assert.equal(job?.errorMessage, words, stage);
+      noTrace(job?.errorMessage);
+      assert.ok(logged(ctx, 'ECONNREFUSED'), `${stage}: the log has the real cause`);
+      assert.ok(ctx.errorFields.some((fields) => fields.stage === stage || stage === 'extracting_clips'), `${stage}: and says in which stage it happened`);
+      for (const clip of await ctx.db.listClips('plain')) noTrace(clip.errorMessage);
+    } finally { await ctx.cleanup(); }
+  }
+});
+
+test('what is wrong with the video itself is told as it was written, the reason behind it kept for the log', async () => {
+  const unreadable = new PlainFailure(plainWords.unreadableVideo, { cause: new Error(`${SECRET}: moov atom not found`) });
+  const ctx = await setup({ media: { probe: async () => { throw unreadable; }, extractAudio: fakeMedia.extractAudio } });
+  try {
+    await addJob(ctx, 'bad'); await ctx.pipeline.run('bad');
+    const job = await ctx.db.getJob('bad');
+    assert.equal(job?.status, 'failed');
+    assert.equal(job?.errorMessage, plainWords.unreadableVideo);
+    noTrace(job?.errorMessage);
+    assert.ok(logged(ctx, 'moov atom not found'), 'the real reason is in the log, as what the failure was made from');
+  } finally { await ctx.cleanup(); }
+});
+
+test('a video without any sound fails at once, in words that say so, before anything is listened to or made', async () => {
+  let listened = 0; let extracted = 0;
+  const silent = { probe: async () => ({ durationSeconds: 6, width: 1920, height: 1080, hasAudio: false }), extractAudio: async () => { extracted += 1; } };
+  const ctx = await setup({ media: silent, transcriber: { transcribe: async () => { listened += 1; return []; } } });
+  try {
+    await addJob(ctx, 'quiet'); await ctx.pipeline.run('quiet');
+    const job = await ctx.db.getJob('quiet');
+    assert.equal(job?.status, 'failed');
+    assert.equal(job?.errorMessage, plainWords.noSound);
+    assert.match(job?.errorMessage ?? '', /no sound/);
+    assert.deepEqual({ listened, extracted }, { listened: 0, extracted: 0 }, 'no time is spent on a video there is nothing to listen to in');
+    assert.equal(job?.width, 1920, 'what was learned about the picture is kept');
+    assert.deepEqual(await ctx.db.listClips('quiet'), []);
+    assert.deepEqual(await readdir(ctx.uploadDir), [], 'and the local copy is freed as for any failed job');
+
+    // A look that does not say either way (a stand-in, an older answer) is not taken for silence.
+    const unsure = await setup({ media: { probe: async () => ({ durationSeconds: 6, width: 1920, height: 1080 }), extractAudio: fakeMedia.extractAudio } });
+    try {
+      await addJob(unsure, 'unsure'); await unsure.pipeline.run('unsure');
+      assert.equal((await unsure.db.getJob('unsure'))?.status, 'completed', 'a video that was not said to be silent is tried');
+    } finally { await unsure.cleanup(); }
+  } finally { await ctx.cleanup(); }
+});
+
+test('a video that is no longer on the server, and was not saved anywhere else, is told so in words that say what to do', async () => {
+  const cases: Array<{ name: string; options: Parameters<typeof setup>[0]; words: string }> = [
+    { name: 'without durable storage', options: { storage: new NullStorage() }, words: 'The uploaded video is no longer on the server. Please upload it again.' },
+    { name: 'with durable storage, but the video never reached it', options: {}, words: 'The uploaded video is no longer on the server and was never saved. Please upload it again.' },
+  ];
+  for (const { name, options, words } of cases) {
+    const ctx = await setup(options);
+    try {
+      await addJob(ctx, 'gone', { local: false }); await ctx.pipeline.run('gone');
+      const job = await ctx.db.getJob('gone');
+      assert.equal(job?.status, 'failed', name);
+      assert.equal(job?.errorMessage, words, name);
+      noTrace(job?.errorMessage);
+    } finally { await ctx.cleanup(); }
+  }
 });

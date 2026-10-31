@@ -9,6 +9,7 @@ import type { NewVideoJob } from './domain.js';
 import { VideoPipeline } from './pipeline.js';
 import { NullStorage } from './storage.js';
 import { createProgressListener, parseWhisperCppJson, WhisperCppTranscriber, type TranscriptionEngine } from './transcription.js';
+import { PlainFailure } from './failures.js';
 import { DeterministicHighlightDetector } from './highlights.js';
 import type { ClipRenderer } from './clips.js';
 
@@ -152,8 +153,31 @@ test('a speech recognition program that runs past the time limit is stopped', as
     const audio = await audioIn(root);
     const slow = await fakeWhisper(root, 'exec sleep 30');
     const started = Date.now();
-    await assert.rejects(new WhisperCppTranscriber(slow, 'm', 'en', 300).transcribe(audio, root), /time limit/);
+    await assert.rejects(new WhisperCppTranscriber(slow, 'm', 'en', 300).transcribe(audio, root), (error: unknown) => {
+      assert.ok(error instanceof PlainFailure, 'the time limit is told to the person, in plain words: a shorter video is the way out');
+      assert.equal(error.message, 'Listening to the speech took longer than the 1 second allowed, so it was stopped. A shorter video will be faster.');
+      assert.match((error.cause as Error).message, /time limit/, 'and what really happened is kept for the log');
+      return true;
+    });
     assert.ok(Date.now() - started < 5000, 'it must not wait for the program to finish by itself');
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('a speech recognition program that is killed from outside (a server that runs out of memory does that) is told so in plain words, and the real story is kept', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'studio-whisper-'));
+  try {
+    const audio = await audioIn(root);
+    const killed = await fakeWhisper(root, 'kill -9 $$');
+    await assert.rejects(new WhisperCppTranscriber(killed, 'm', 'en', 30_000).transcribe(audio, root), (error: unknown) => {
+      assert.ok(error instanceof PlainFailure);
+      assert.equal(error.message, 'The speech recognition was stopped by the server, most likely because it ran out of memory. A shorter video may work.');
+      assert.ok(!error.message.includes(root), 'no folder of the server in what a person reads');
+      assert.match((error.cause as Error).message, /signal SIGKILL/);
+      assert.match((error.cause as Error).message, /Local whisper\.cpp transcription failed/);
+      return true;
+    });
+    const failing = await fakeWhisper(root, 'echo "error: failed to load model" >&2\nexit 3');
+    await assert.rejects(new WhisperCppTranscriber(failing, 'm', 'en', 30_000).transcribe(audio, root), (error: unknown) => !(error instanceof PlainFailure) && error instanceof Error, 'any other failure is not told: it is the server\'s business, and the job says so in general words');
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
