@@ -4,6 +4,9 @@ import { z } from 'zod';
 /** A true/false switch read from the environment. Anything that is not a clear yes or no is rejected so a typo in a safety flag fails loudly at startup instead of silently turning the protection off. Unset or empty means `defaultValue`. */
 const envFlag = (defaultValue: boolean) => z.string().default(String(defaultValue)).transform((value) => value.trim().toLowerCase() || String(defaultValue)).pipe(z.enum(['true', 'false', '1', '0', 'yes', 'no', 'on', 'off'])).transform((value) => ['true', '1', 'yes', 'on'].includes(value));
 
+/** A switch with a third answer: `auto` (which is also what an empty value means), true or false. Anything else is rejected, like in `envFlag`. */
+const envFlagOrAuto = z.string().default('auto').transform((value) => value.trim().toLowerCase() || 'auto').pipe(z.enum(['auto', 'true', 'false', '1', '0', 'yes', 'no', 'on', 'off'])).transform((value): 'auto' | boolean => (value === 'auto' ? 'auto' : ['true', '1', 'yes', 'on'].includes(value)));
+
 const schema = z.object({
   PORT: z.coerce.number().int().positive().default(3001),
   HOST: z.string().default('0.0.0.0'),
@@ -58,6 +61,11 @@ const schema = z.object({
   CLIP_PRESET: z.string().default('veryfast'),
   // How many threads FFmpeg may use when it makes a clip or looks for faces. 0 = automatic, as for WHISPER_THREADS.
   CLIP_THREADS: z.coerce.number().int().min(0).max(64).default(0),
+  // Whether the colours of an HDR video (what an iPhone records by default) are converted to those of an ordinary picture, so that the clips look as they did
+  // on the phone. Needs the zscale and tonemap filters of FFmpeg (the server tries them once at start-up and says so in the log) and about 90 MiB of memory more
+  // for every clip. `auto`, the default, converts where the machine has the memory for it (see decideToneMapping in hdr.ts); true converts wherever FFmpeg can; false
+  // never. Without the conversion clips are still made as ordinary 8-bit pictures that play everywhere, but HDR colours look flat.
+  CLIP_TONE_MAP_HDR: envFlagOrAuto,
   CLIP_VERTICAL_WIDTH: z.coerce.number().int().positive().default(1080),
   CLIP_VERTICAL_HEIGHT: z.coerce.number().int().positive().default(1920),
   TRANSCRIPTION_ENGINE: z.enum(['whisper_cpp', 'openai_compatible']).default('whisper_cpp'),

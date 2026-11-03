@@ -211,6 +211,7 @@ All configuration comes from environment variables; see [`.env.example`](.env.ex
 | `CLIP_MAX_CANDIDATES` | Highest-ranked candidates rendered per job (default 3). |
 | `CLIP_VERTICAL_WIDTH`, `CLIP_VERTICAL_HEIGHT` | Output size of a vertical clip; must be 9:16 (default 1080×1920). The other shapes are worked out from it (see `aspect` under [Job options](#job-options)). |
 | `CLIP_VIDEO_CODEC`, `CLIP_AUDIO_CODEC`, `CLIP_CRF`, `CLIP_PRESET` | FFmpeg encoding (defaults `libx264`, `aac`, 23, `veryfast`). |
+| `CLIP_TONE_MAP_HDR` | Whether the colours of an HDR video (an iPhone's, say) are converted to those of an ordinary video when its clip is made 8-bit: `auto` (the default) converts where this machine has at least 1 GiB of memory (the limit of its container, when it has one; a machine whose memory cannot be read is not taken for a small one) and its FFmpeg can (tried once at start-up); `true` converts wherever FFmpeg can, whatever the memory; `false` never converts, and the colours stay as they were. Anything other than one of these (or the usual yes/no spellings) is rejected. See [Clips that play everywhere](#clips-that-play-everywhere). |
 | `FACE_FRAMING_ENABLED` | `false` removes the "Follow a face" choice from the upload page and makes every clip be cut from the middle (default `true`; a person still has to choose it per video). Anything other than a clear yes/no is rejected. See [Following a face](#following-a-face-beta-opt-in). |
 | `TOOLCHAIN_CHECK_ENABLED` | `false` switches off the start-up check of the video tools (default `true`). See [Start-up check of the video tools](#start-up-check-of-the-video-tools). Anything other than a clear yes/no is rejected. |
 | `TOOLCHAIN_REAL_SAMPLES` | `false` leaves the three real samples out of that check: the machine's limits, whisper.cpp listening to a recording of speech, and one clip of the real size made from a busy picture (default `true`; they take minutes on a very small instance, and a job waits while they run). Anything other than a clear yes/no is rejected. |
@@ -327,12 +328,84 @@ is frame-accurate and placed before the input, so the range does not depend on s
 zero (which is what the captions are counted from), and a clip deep inside a long video does not require decoding everything
 before it. FFmpeg then
 **scales the picture to fill the shape of the clip (9:16 unless another was chosen) and crops it** (from the centre, or along the path of a face when the person chose `framing: face`),
-burns in the captions for the words spoken inside the range (see below), and encodes H.264/AAC with `+faststart`. Without that
+burns in the captions for the words spoken inside the range (see below), and encodes H.264/AAC with `+faststart` (an ordinary 8-bit picture and one sound of at most two channels whatever the source, see [Clips that play everywhere](#clips-that-play-everywhere)). Without that
 choice the crop is fixed to the centre of the frame. With `framing: fit` nothing is cropped: the whole picture is scaled to the
 width of the clip and laid over a blurred copy of the same picture that fills the rest of the frame. The copy is made at an eighth
 of the size before it is blurred and enlarged, so it costs little, and FFmpeg measures the picture it is given (after turning a phone
 video that is stored sideways), so any shape of video, from ultra-wide to taller than the clip, fits. A candidate that fails keeps a failed clip record with its error and
 processing continues; the job completes only if at least one clip was made.
+
+### Clips that play everywhere
+
+A clip is worth something only if it plays on the phone of whoever receives it. Left to itself FFmpeg copies into the clip whatever the
+camera recorded, and much of it is refused or drawn wrongly by phones, browsers and platforms. These were found by making clips from
+such videos and looking at what came out (the first four lines are what the code did before this change):
+
+- **Ten bits per colour.** An iPhone records HDR video (HEVC with the HLG curve) with ten bits per colour, and some cameras record ten-bit
+  H.264. The clip came out as H.264 "High 10", which many phones, browsers and editing apps will not play (a source with full colour
+  resolution, 4:4:4, gave "High 4:4:4"). Every clip is now 8-bit, 4:2:0 whatever the source (`-pix_fmt yuv420p`, and a `format=yuv420p`
+  step at the end of the picture filters so that nothing is drawn on a ten-bit picture).
+- **The colours of HDR.** An HDR picture made 8-bit and nothing else looks grey and washed out, because the numbers still mean "HDR" while
+  the clip does not say so. When ffprobe says the video is HLG (`arib-std-b67`, an iPhone's) or PQ (`smpte2084`), and this machine has
+  the memory for it (at least 1 GiB, see "What it costs" below) and its FFmpeg has the filters (`zscale` and `tonemap`: tried once at
+  start-up on a made-up HLG picture, and told in the log), the colours are converted to those of an ordinary video (the recipe of the FFmpeg wiki: to linear light with a nominal peak of 100 nits, to
+  BT.709 primaries, the Hable curve, back to BT.709) and the clip is tagged as an ordinary BT.709 video, so that every player draws it
+  the same way. Without the memory or the filters, or for a video that does not say everything about its colours (FFmpeg refuses to convert
+  those: "no path between colourspaces"), the clip is still made, as an ordinary 8-bit picture with the colours it had, and the log says
+  so (`HDR video: ...` at start-up, once per video for a clip that kept its colours): a clip with flat colours is better than no clip.
+  Only a failure that FFmpeg itself blames on the conversion (told by what the program printed, never by the words of our own error
+  message, which contain the whole command line) makes the clip be made again without it; any other failure stays a failure, as it
+  would fail a second time, later.
+- **Pixels that are not square** (some cameras, DVDs, old recordings) made the clip too wide or too narrow; they are made square before
+  the picture is cut, and again after it.
+- **More than one sound, and more than two channels.** A video with two audio tracks (a second language, a commentary) kept both in the
+  clip, and a recording made for a cinema kept its six channels, which not every phone plays. A clip now has the first sound only (the
+  one the speech was recognised from) with at most two channels. A video without sound is fine as it is.
+
+For a video that is already ordinary (8-bit, 4:2:0, square pixels, one stereo sound) none of this changes a pixel or a sample.
+`CLIP_TONE_MAP_HDR` (`auto` by default, `true`, `false`) decides whether the colours of HDR are converted; with `false`, or on a machine that
+`auto` leaves out, the colours of HDR are left alone (the clip is still 8-bit and plays everywhere).
+
+What it costs: converting the colours makes a clip take about 1.7 times as long as an ordinary one, and use about 90 MiB more memory.
+Measured on the development machine (FFmpeg 6.1.1, a lossless full-HD HLG source, 120 frames cut to 1080x1920 and encoded with the
+default settings): 9.5 s against 5.3 s with two threads, 16.7 s against 9.8 s with one; at most 234 MiB of memory against 320 MiB with
+one thread, 279 against 368 with two (the picture is worked on as floating-point numbers). A real phone video also costs its decoding,
+which is not in these figures. The free instance (0.15 of a processor, 512 MiB, on which a whole job without the conversion was seen to
+peak at 475 MiB) is therefore not given the conversion unless it is asked for: with `CLIP_TONE_MAP_HDR=auto` the colours are converted
+only where the machine has at least 1 GiB of memory (the memory limit of its container when it has one, the machine's own memory
+otherwise; a machine whose memory cannot be read is not taken for a small one), and the start-up log says which way it went. On a
+smaller machine `CLIP_TONE_MAP_HDR=true` converts them anyway, at the risk of running out of memory, and `false` never converts.
+
+Evidence. On the development machine (FFmpeg 6.1.1), videos made to look like what cameras record (HLG and PQ at ten bits, written with
+FFV1 and the colour tags of an iPhone; ten bits with no colour tags at all; 4:4:4; anamorphic pixels; six channels; two sounds; no sound;
+a variable frame rate; a start time that is not zero) went through the real renderer, and every clip was then examined with ffprobe: 8-bit
+4:2:0, an H.264 profile every phone plays, square pixels, exactly the shape asked for, one sound at most with two channels at most, and,
+for the HDR ones, the BT.709 tags. The HDR test picture (a white bar on a dark ground) was measured pixel by pixel after the conversion,
+because a conversion gone wrong gives an all-black or an all-white clip. A video that states only some of its colours (which FFmpeg will
+not convert) was made through the fallback. An HDR upload was followed through the service in the tests (the upload request, the job, the
+stored clip, the log), with a real database and a real FFmpeg and stand-ins for speech recognition and cloud storage.
+
+The continuous integration runs all of these tests on three FFmpegs, and all of them passed on each: 5.1.9 (Debian 12, the version that
+Render's start-up check logged), 6.1.1 and 8.0.1. On all three the start-up trial finds that the conversion works, a video that states
+only some of its colours makes FFmpeg print "no path between colorspaces" (which is what makes the clip be made again without the
+conversion), and a converted clip says that it is an ordinary BT.709 video. The first run on the three found two differences between
+them, which the code and the tests now take into account: FFmpeg 5.1 loses the colour tags a made-up picture is given in the graph that
+makes it, so the start-up trial said that the conversion could not be done where it can (the picture now says its colours in the graph
+that converts it); and FFmpeg 8 ignores the encoder options `-color_trc` and `-color_primaries`, so a test video written with them
+carried no HDR tags (the pictures now carry the tags themselves, which every version writes). A real phone video carries its tags from
+the camera and needs neither.
+
+137 deliberate breakages of the code and of the start-up check, made one at a time (a curve misspelt, the tags dropped, the second
+attempt made for every failure or for none, the sound filter removed, the decision read from the error message instead of what the
+program printed, the pixel checks of the start-up step switched off, the memory limit moved or an unknown memory taken for a small
+one, the setting or the limit of the container ignored...), were each caught by the tests (none survived). That shows that the tests
+notice those faults, not that there are no others.
+
+Not proven: a real iPhone video through the live service (the server's own start-up log line `HDR video:` says whether it converts
+there; on the free instance it is expected not to, for want of memory); how long such a clip takes on the free instance; whether the
+limit of 1 GiB is the right one (it follows from the measurements above, on the development machine, and was not tried on a machine of
+that size); and that the converted colours look right to a viewer, which was measured on grey patches and a test picture only, not
+judged on a real recording.
 
 ### Following a face (beta, opt-in)
 
@@ -537,7 +610,16 @@ running job could use up the memory of the 512 MB instance, so it looks again ev
 - Tiny real clips (144x256, one second) made by the very code that makes the customers' clips, judged by single pixels, because an
   FFmpeg that ignores a filter option still produces a playable video: the captions are drawn, with the bundled font and not with one
   that happens to be installed on the server (libass reports which it used); the whole-picture layout shows the whole picture over a
-  dark blurred copy; and a crop window planned to move from the left edge to the right does move.
+  dark blurred copy; and a crop window planned to move from the left edge to the right does move. Every one of these clips must also be
+  one that plays everywhere: 8-bit 4:2:0, square pixels, no more than one sound and no more than two channels.
+- A ten-bit HDR picture like an iPhone's (BT.2020 colours, the HLG curve, written with FFV1, which every FFmpeg has, so that this does
+  not depend on an encoder): the very code that looks at customers' videos has to find that it is HLG, and the clip made from it has to
+  be an ordinary one, cut like any clip is, with the white bar down the middle of the picture still white and the dark ground beside it
+  still dark (a conversion gone wrong gives an all-black or all-white clip; the whole-picture layout is judged by its own step, so a
+  fault there is not reported as a fault of the colours). When the start-up trial found that this FFmpeg can convert the colours (see
+  [Clips that play everywhere](#clips-that-play-everywhere)) the clip must also say that it is an ordinary BT.709 video; when it cannot,
+  the step says so and passes, because a clip made without the conversion is the designed fallback and not a fault. `zscale` and
+  `tonemap` are therefore not among the filters whose absence fails the check.
 - When "Follow a face" is on offer: the real face follower watches a three-second video of a public-domain portrait (the one in
   `apps/api/test-assets`) crossing the picture, and has to follow it across.
 - The real samples (`TOOLCHAIN_REAL_SAMPLES`). The checks above say that the tools work, not how fast, and not how the machine is

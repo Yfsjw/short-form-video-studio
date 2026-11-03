@@ -27,6 +27,7 @@ import { installAccessGate } from './access-http.js';
 import { parseJobOptions } from './options.js';
 import { escapeHtml, renderJobPage, renderMessagePage, renderUploadPage } from './pages.js';
 import { PlainFailure, onlyVideos, plainWords } from './failures.js';
+import { decideToneMapping, probeToneMapping, type ToneMappingSupport } from './hdr.js';
 
 const acceptedExtensions = new Set(['.mp4', '.mov', '.mkv', '.webm', '.avi', '.m4v']);
 const acceptedMimeTypes = new Set(['video/mp4', 'video/quicktime', 'video/x-matroska', 'video/webm', 'video/x-msvideo', 'video/x-m4v']);
@@ -73,6 +74,8 @@ export interface AppOverrides {
   toolchainRetryMs?: number;
   /** What limits the machine (default: the control group files of the container). It decides how many threads the programs are started with, and is what the start-up check reports. */
   machine?: () => Promise<MachineLimits>;
+  /** What the trial of converting HDR colours finds (a stand-in for tests; production passes nothing and FFmpeg is asked, see hdr.ts). Not asked at all when CLIP_TONE_MAP_HDR is off, or is `auto` on a machine with little memory. */
+  toneMapping?: () => Promise<ToneMappingSupport>;
 }
 
 const DEFAULT_BOOT_RECOVERY_WAIT_MS = 30_000;
@@ -88,6 +91,8 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
   // Whatever a request carries that proves who it is (the access cookie, the code in a header) or that opens a door (the signed address a clip
   // download is sent on to) stays out of the logs: the request line of every request is logged with its headers.
   const logger = pino({ level: overrides.logLevel ?? process.env.LOG_LEVEL ?? 'info', redact: { paths: ['req.headers.cookie', 'req.headers.authorization', 'req.headers["x-access-code"]', 'res.headers["set-cookie"]', 'res.headers.location'], censor: '[hidden]' } }, overrides.logDestination);
+  // Whether this FFmpeg can convert the colours of HDR video (an iPhone records HDR by default) is found out by trying it, once it is known that the machine is to.
+  const tryToneMapping = async (): Promise<ToneMappingSupport> => { try { return await (overrides.toneMapping ?? (() => probeToneMapping(config.FFMPEG_PATH)))(); } catch (error) { return { works: false, detail: error instanceof Error ? error.message : String(error) }; } };
   const accessGate = createAccessGate(config.ACCESS_CODE);
   if (accessGate.enabled) logger.info('An access code is required for every page and every call except /api/health');
   else logger.warn('No ACCESS_CODE is set: anyone who can reach this address can upload videos and see every job. Set ACCESS_CODE (at least 8 characters) before sharing the address.');
@@ -99,12 +104,22 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
   const whisperThreads = config.WHISPER_THREADS || automatic(4);
   const clipThreads = config.CLIP_THREADS || automatic();
   logger.info({ processorShare: machineLimits?.cpuLimit ?? null, whisperThreads: whisperThreads ?? null, clipThreads: clipThreads ?? null }, `Threads: ${config.TRANSCRIPTION_ENGINE === 'whisper_cpp' ? `whisper.cpp with ${describeThreads(whisperThreads)}, ` : ''}FFmpeg with ${describeThreads(clipThreads)}${machineLimits?.cpuLimit != null ? ` (this machine may use ${machineLimits.cpuLimit.toFixed(2)} of a processor)` : ''}`);
+  // Converting the colours of HDR video needs memory (about 90 MiB more for every clip, see hdr.ts), which the machine may not have: the container's limit, when it has one.
+  let toneMapping = false;
+  const toneMappingDecision = decideToneMapping(config.CLIP_TONE_MAP_HDR, machineLimits ? (machineLimits.memoryLimitBytes ?? machineLimits.totalMemoryBytes) : null);
+  if (!toneMappingDecision.convert) logger.info({ toneMappingDecision }, `HDR video: ${toneMappingDecision.why}. Clips from HDR video are made as ordinary 8-bit pictures that play everywhere, but their colours look flat`);
+  else {
+    const support = await tryToneMapping();
+    toneMapping = support.works;
+    if (support.works) logger.info({ toneMapping: support }, `HDR video: its colours are converted to those of an ordinary picture (${support.detail})`);
+    else logger.warn({ toneMapping: support }, `HDR video: this FFmpeg cannot convert its colours (${support.detail}). Clips from HDR video are made as ordinary 8-bit pictures that play everywhere, but their colours look flat`);
+  }
   const transcriber = overrides.transcriber ?? createTranscriptionEngine(config, whisperThreads);
   const highlightOptions: HighlightOptions = { minDurationSeconds: config.HIGHLIGHT_MIN_DURATION_SECONDS, maxDurationSeconds: config.HIGHLIGHT_MAX_DURATION_SECONDS, maxCandidates: config.HIGHLIGHT_MAX_CANDIDATES, overlapThreshold: config.HIGHLIGHT_OVERLAP_THRESHOLD, weights: { density: config.HIGHLIGHT_WEIGHT_DENSITY, emphasis: config.HIGHLIGHT_WEIGHT_EMPHASIS, question: config.HIGHLIGHT_WEIGHT_QUESTION, number: config.HIGHLIGHT_WEIGHT_NUMBER, contrast: config.HIGHLIGHT_WEIGHT_CONTRAST, hook: config.HIGHLIGHT_WEIGHT_HOOK, completeness: config.HIGHLIGHT_WEIGHT_COMPLETENESS, standalone: config.HIGHLIGHT_WEIGHT_STANDALONE, continuity: config.HIGHLIGHT_WEIGHT_CONTINUITY, length: config.HIGHLIGHT_WEIGHT_LENGTH } };
   const framer: ClipFramer | undefined = overrides.framer === undefined
     ? (config.FACE_FRAMING_ENABLED ? new FaceClipFramer({ ffmpegPath: config.FFMPEG_PATH, outputAspect: config.CLIP_VERTICAL_WIDTH / config.CLIP_VERTICAL_HEIGHT, threads: clipThreads }) : undefined)
     : overrides.framer ?? undefined;
-  const renderer = new FfmpegClipRenderer(config.FFMPEG_PATH, config.CLIP_VIDEO_CODEC, config.CLIP_AUDIO_CODEC, config.CLIP_CRF, config.CLIP_PRESET, config.CLIP_VERTICAL_WIDTH, config.CLIP_VERTICAL_HEIGHT, undefined, undefined, clipThreads);
+  const renderer = new FfmpegClipRenderer(config.FFMPEG_PATH, config.CLIP_VIDEO_CODEC, config.CLIP_AUDIO_CODEC, config.CLIP_CRF, config.CLIP_PRESET, config.CLIP_VERTICAL_WIDTH, config.CLIP_VERTICAL_HEIGHT, undefined, undefined, clipThreads, toneMapping);
   const pipeline = new VideoPipeline(db, new FfmpegAdapter(config.FFPROBE_PATH, config.FFMPEG_PATH), transcriber, new DeterministicHighlightDetector(), highlightOptions, renderer, config.CLIP_MAX_CANDIDATES, config.UPLOAD_DIR, config.TEMP_DIR, config.OUTPUT_DIR, logger, durableStorage, {
     concurrency: config.JOB_CONCURRENCY,
     maxAttempts: config.JOB_MAX_ATTEMPTS,
@@ -172,7 +187,7 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
       whisper: config.TRANSCRIPTION_ENGINE === 'whisper_cpp' ? { binaryPath: config.WHISPER_CPP_PATH, modelPath: config.WHISPER_MODEL_PATH, ...(whisperThreads ? { threads: whisperThreads } : {}) } : null,
       faceFollowing: framer !== undefined,
       realSamples: config.TOOLCHAIN_REAL_SAMPLES, clipSize: { width: config.CLIP_VERTICAL_WIDTH, height: config.CLIP_VERTICAL_HEIGHT },
-      clipThreads, machine: overrides.machine,
+      clipThreads, toneMapping, machine: overrides.machine,
     }))),
     isBusy: () => pipeline.activeJobCount > 0 || requestsInFlight > 0,
     logger,

@@ -60,7 +60,9 @@ async function setup(options: { highlights?: Partial<typeof highlightOptions>; s
   const errorFields: Array<Record<string, unknown>> = [];
   /** What the pipeline said about itself at the information level (the fields it attached, and the sentence). */
   const infos: Array<{ fields: Record<string, unknown>; message: string }> = [];
-  const logger = { info: (fields: unknown, message?: string) => { infos.push({ fields: (fields && typeof fields === 'object' ? fields : {}) as Record<string, unknown>, message: String(message) }); }, error: (fields: unknown, message?: string) => { errors.push(String(message)); errorFields.push((fields && typeof fields === 'object' ? fields : {}) as Record<string, unknown>); } };
+  /** What it said as a warning: something an operator should know that is not a failure. */
+  const warnings: Array<{ fields: Record<string, unknown>; message: string }> = [];
+  const logger = { warn: (fields: unknown, message?: string) => { warnings.push({ fields: (fields && typeof fields === 'object' ? fields : {}) as Record<string, unknown>, message: String(message) }); }, info: (fields: unknown, message?: string) => { infos.push({ fields: (fields && typeof fields === 'object' ? fields : {}) as Record<string, unknown>, message: String(message) }); }, error: (fields: unknown, message?: string) => { errors.push(String(message)); errorFields.push((fields && typeof fields === 'object' ? fields : {}) as Record<string, unknown>); } };
   const pipelines: VideoPipeline[] = [];
   const makePipeline = () => {
     const pipeline = new VideoPipeline(options.database ? options.database(db) : db, options.media ?? fakeMedia, options.transcriber ?? speech, new DeterministicHighlightDetector(), { ...highlightOptions, ...options.highlights }, options.renderer ?? writingRenderer, 1, uploadDir, tempDir, outputDir, logger, storage, { ...fastRuntime, ...options.runtime }, options.framer);
@@ -68,7 +70,7 @@ async function setup(options: { highlights?: Partial<typeof highlightOptions>; s
     return pipeline;
   };
   return {
-    root, uploadDir, tempDir, outputDir, db, raw, storage, errors, errorFields, infos, makePipeline, pipeline: makePipeline(),
+    root, uploadDir, tempDir, outputDir, db, raw, storage, errors, errorFields, infos, warnings, makePipeline, pipeline: makePipeline(),
     /** Pretend nothing has touched this job for a while, as if the process working on it had died. */
     backdate: async (id: string, minutes: number) => { await raw.query('UPDATE video_jobs SET updated_at = $1 WHERE id = $2', [new Date(Date.now() - minutes * 60_000).toISOString(), id]); },
     cleanup: async () => { for (const pipeline of pipelines) pipeline.close(); await raw.end(); await db.close({ dropSchema: true }); await rm(root, { recursive: true, force: true }); },
@@ -476,7 +478,7 @@ test('enqueue never lets a database failure escape as an unhandled rejection (wh
   const logged: string[] = [];
   try {
     const brokenDatabase = new Proxy({}, { get: () => async () => { throw new Error('database is down'); } });
-    const pipeline = new VideoPipeline(brokenDatabase as never, fakeMedia, speech, new DeterministicHighlightDetector(), highlightOptions, writingRenderer, 1, tmpdir(), tmpdir(), tmpdir(), { info: () => undefined, error: (_fields: unknown, message?: string) => { logged.push(String(message)); } }, new MemoryStorage());
+    const pipeline = new VideoPipeline(brokenDatabase as never, fakeMedia, speech, new DeterministicHighlightDetector(), highlightOptions, writingRenderer, 1, tmpdir(), tmpdir(), tmpdir(), { info: () => undefined, warn: () => undefined, error: (_fields: unknown, message?: string) => { logged.push(String(message)); } }, new MemoryStorage());
     pipeline.enqueue('whatever');
     await sleep(100);
     pipeline.close();
@@ -714,6 +716,66 @@ test('a job that fails keeps the timings of the stages it went through and does 
     assert.ok(job.stageTimings.transcribing >= 25, 'the stage that failed must be timed too');
     assert.ok(job.progress < 100);
   } finally { await ctx.cleanup(); }
+});
+
+test('a video that is HDR is handed to the renderer as such and stored as nothing but a video, and the log says whether the colours of its clips were converted, warning once when they were not', async () => {
+  const requests: ClipRenderRequest[] = [];
+  let colours: (call: number) => 'converted' | 'not converted' | undefined = () => undefined;
+  const renderer: ClipRenderer = { render: async (request) => {
+    requests.push(request); await writeFile(request.outputPath, 'rendered clip');
+    const said = colours(requests.length);
+    return { durationSeconds: request.endSeconds - request.startSeconds, sizeBytes: 13, ...(said ? { colours: said } : {}) };
+  } };
+  const talk = Array.from({ length: 36 }, (_, index) => ({ segmentIndex: index, startSeconds: index * 5, endSeconds: index * 5 + 5, text: index % 3 === 2 ? 'Is this the best part of all?' : `Sentence number ${index} makes a point.` }));
+  const seen = (hdr?: 'hlg' | 'pq') => ({ ...fakeMedia, probe: async () => ({ durationSeconds: 180, width: 1920, height: 1080, hasAudio: true, ...(hdr ? { hdr } : {}) }) });
+  const options: JobOptions = { ...defaultJobOptions, clipCount: 2, clipLength: 'short', captionStyle: 'none' };
+  const finishedLine = (ctx: Context, id: string) => ctx.infos.find((entry) => entry.fields.jobId === id && entry.message.startsWith('Video processing'))!;
+  const warningsAbout = (ctx: Context, id: string) => ctx.warnings.filter((entry) => entry.fields.jobId === id);
+  const run = async (id: string, media: ReturnType<typeof seen>, say: typeof colours) => {
+    const ctx = await setup({ transcriber: { transcribe: async () => talk }, renderer, media });
+    try {
+      colours = say; requests.length = 0;
+      await addJob(ctx, id, { options });
+      await ctx.pipeline.run(id);
+      const job = await ctx.db.getJob(id);
+      assert.equal(job?.status, 'completed', job?.errorMessage ?? '');
+      assert.equal(requests.length, 2, `${id}: two clips were asked for`);
+      return { ctx, job: job!, line: finishedLine(ctx, id), warnings: warningsAbout(ctx, id), requests: [...requests] };
+    } finally { await ctx.cleanup(); }
+  };
+
+  const converted = await run('j-hdr-converted', seen('hlg'), () => 'converted');
+  for (const request of converted.requests) assert.equal(request.hdr, 'hlg', 'every clip is told what kind of HDR the picture is in');
+  assert.deepEqual(converted.line.fields.metadata, { durationSeconds: 180, width: 1920, height: 1080 }, 'what is kept of the video is its size and length, nothing of how it is looked at');
+  assert.equal(converted.line.fields.hdr, 'hlg');
+  assert.equal(converted.line.fields.coloursConverted, true);
+  assert.deepEqual(converted.warnings, [], 'nothing to warn about');
+  assert.equal(converted.job.durationSeconds, 180); assert.equal(converted.job.width, 1920); assert.equal(converted.job.height, 1080);
+  assert.equal('hdr' in converted.job, false, 'the job a person is shown does not carry it');
+
+  const pq = await run('j-hdr-pq', seen('pq'), () => 'converted');
+  for (const request of pq.requests) assert.equal(request.hdr, 'pq');
+  assert.equal(pq.line.fields.hdr, 'pq');
+
+  const kept = await run('j-hdr-kept', seen('hlg'), () => 'not converted');
+  assert.equal(kept.line.fields.coloursConverted, false);
+  assert.equal(kept.warnings.length, 1, 'one warning for the video, not one for each clip');
+  assert.equal(kept.warnings[0].message, 'This video is HDR but its colours could not be converted to those of an ordinary picture (this machine does not convert them, or the video does not say what its colours are): the clips play everywhere but look flatter than the original');
+  assert.deepEqual(kept.warnings[0].fields, { jobId: 'j-hdr-kept', hdr: 'hlg', clipCount: 2 });
+
+  const mixed = await run('j-hdr-mixed', seen('hlg'), (call) => (call === 1 ? 'converted' : 'not converted'));
+  assert.equal(mixed.line.fields.coloursConverted, false, 'converted only when every clip was');
+  assert.deepEqual(mixed.warnings.map((entry) => entry.fields.clipCount), [1], 'and the warning counts the clips that were not');
+
+  const unsaid = await run('j-hdr-unsaid', seen('hlg'), () => undefined);
+  assert.equal(unsaid.line.fields.coloursConverted, false, 'a renderer that does not say is not taken to have converted anything');
+  assert.deepEqual(unsaid.warnings, [], 'and is not warned about either: nothing is known to have been left unconverted');
+
+  const ordinary = await run('j-ordinary', seen(), () => 'converted');
+  for (const request of ordinary.requests) assert.equal('hdr' in request, false, 'an ordinary video is not told it is HDR, not even with an empty word');
+  assert.equal('hdr' in ordinary.line.fields, false);
+  assert.equal('coloursConverted' in ordinary.line.fields, false, 'the log says nothing about colours of a video that has no HDR');
+  assert.deepEqual(ordinary.warnings, []);
 });
 
 test('makes the clips the way the person asked: how many, how long, with or without captions, at which quality', async () => {

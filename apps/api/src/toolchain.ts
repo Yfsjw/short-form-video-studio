@@ -6,7 +6,9 @@ import { promisify } from 'node:util';
 import { writeAssCaptions } from './captions.js';
 import { BUNDLED_FONTS_DIRECTORY, FfmpegClipRenderer, type FfmpegRunner } from './clips.js';
 import { FaceClipFramer } from './face-track.js';
+import { FfmpegAdapter } from './ffmpeg.js';
 import { positionAt, type FramingPlan } from './framing.js';
+import { SAYS_HLG } from './hdr.js';
 import { describeMachine, describeThreads, readMachineLimits, type MachineLimits } from './machine.js';
 import { WhisperCppTranscriber, type TranscriptInput } from './transcription.js';
 
@@ -22,7 +24,8 @@ const execFileAsync = promisify(execFile);
  * are there (without loading the model, which needs far more memory than a small server can spare while a job runs); and then, with
  * tiny real clips made by the very code that makes the customers' clips (FfmpegClipRenderer), that captions really are drawn
  * (and with the bundled font), that the whole-picture layout really shows the whole picture, and that a moving crop window really
- * moves. Those three are judged by looking at single pixels of the result, because an FFmpeg that ignores a filter option still
+ * moves, and (HDR video being what a phone records by default) that a ten-bit HDR picture really becomes an ordinary 8-bit clip, with the colours of one
+ * when this FFmpeg can convert them. Those three are judged by looking at single pixels of the result, because an FFmpeg that ignores a filter option still
  * produces a perfectly playable video. When face following is on, a last check lets the real face follower watch a short video of a
  * face (a public-domain portrait) crossing the picture, which exercises picture taking, face finding and camera planning on this machine.
  */
@@ -45,6 +48,8 @@ export interface ToolchainCheckOptions {
   faceFollowing?: boolean;
   /** How many threads FFmpeg is started with for clips (`-threads`), as for the customers' clips; left out, it chooses for itself. */
   clipThreads?: number;
+  /** Whether the customers' clips convert the colours of HDR video (what the start-up trial of this FFmpeg found, see hdr.ts): the check of an HDR clip then expects it. Left out: not expected. */
+  toneMapping?: boolean;
   /** The portrait the face follower is shown (default: the one in test-assets, which comes with the program). */
   portraitPath?: string;
   /** How long one program may take (default two minutes: a small shared processor is slow, not stuck). */
@@ -224,7 +229,7 @@ export async function checkToolchain(options: ToolchainCheckOptions): Promise<To
   };
   const skip = (name: string, because: string) => { steps.push({ name, ok: false, ms: 0, detail: `not run: ${because}` }); };
   const wantsRenderSample = options.realSamples === true && options.clipSize !== undefined;
-  const ffmpegSteps = ['test-video', 'captions', 'whole-picture', 'moving-window', ...(wantsRenderSample ? ['render-speed'] : []), ...(options.faceFollowing ? ['face-following'] : [])];
+  const ffmpegSteps = ['test-video', 'captions', 'whole-picture', 'moving-window', 'hdr-clip', ...(wantsRenderSample ? ['render-speed'] : []), ...(options.faceFollowing ? ['face-following'] : [])];
 
   if (options.realSamples) {
     // What the machine is like is only told, never judged: a machine whose limits cannot be read is not a machine that does not work.
@@ -334,11 +339,17 @@ export async function checkToolchain(options: ToolchainCheckOptions): Promise<To
     const runner: FfmpegRunner = async (binary, args, runOptions) => { log = (await execFileAsync(binary, ['-loglevel', 'verbose', ...args], { ...runOptions, encoding: 'utf8' })).stderr; };
     const renderer = new FfmpegClipRenderer(options.ffmpegPath, options.videoCodec, options.audioCodec, options.crf, options.preset, SIZE.width, SIZE.height, runner, fontsDirectory);
     const shape = async (video: string, size: { width: number; height: number } = SIZE) => {
-      const { stdout } = await execFileAsync(options.ffprobePath, ['-v', 'error', '-show_entries', 'stream=codec_type,codec_name,width,height', '-of', 'json', video], { timeout, maxBuffer: 1024 * 1024, encoding: 'utf8' });
-      const streams = (JSON.parse(stdout) as { streams?: Array<{ codec_type?: string; codec_name?: string; width?: number; height?: number }> }).streams ?? [];
+      const { stdout } = await execFileAsync(options.ffprobePath, ['-v', 'error', '-show_entries', 'stream=codec_type,codec_name,width,height,pix_fmt,sample_aspect_ratio,channels', '-of', 'json', video], { timeout, maxBuffer: 1024 * 1024, encoding: 'utf8' });
+      const streams = (JSON.parse(stdout) as { streams?: Array<{ codec_type?: string; codec_name?: string; width?: number; height?: number; pix_fmt?: string; sample_aspect_ratio?: string; channels?: number }> }).streams ?? [];
       const picture = streams.find((stream) => stream.codec_type === 'video');
       if (!picture || picture.width !== size.width || picture.height !== size.height) throw new Error(`the clip should be ${size.width}x${size.height} but is ${picture?.width ?? '?'}x${picture?.height ?? '?'}`);
-      if (!streams.some((stream) => stream.codec_type === 'audio')) throw new Error('the clip has no sound');
+      // Every clip has to play on a phone and in a browser: 8-bit pixels with half the colour detail across and down (anything else is a "High 10" or "High 4:4:4" video,
+      // which many of them cannot play), square pixels (or the picture is shown stretched), and one sound of at most two channels.
+      if (picture.pix_fmt !== 'yuv420p') throw new Error(`the clip is made of ${picture.pix_fmt ?? '?'} pixels, which many phones and browsers cannot play (it should be yuv420p)`);
+      if (picture.sample_aspect_ratio !== undefined && !['1:1', '0:1', 'N/A'].includes(picture.sample_aspect_ratio)) throw new Error(`the pixels of the clip are not square (${picture.sample_aspect_ratio}), so it would be shown stretched`);
+      const sounds = streams.filter((stream) => stream.codec_type === 'audio');
+      if (!sounds.length) throw new Error('the clip has no sound');
+      if (sounds.length > 1 || sounds.some((sound) => (sound.channels ?? 2) > 2)) throw new Error(`the clip should have one sound of at most two channels, but has ${sounds.length} with ${sounds.map((sound) => sound.channels ?? '?').join(' and ')} channels`);
       return picture.codec_name ?? '?';
     };
 
@@ -380,6 +391,36 @@ export async function checkToolchain(options: ToolchainCheckOptions): Promise<To
       if (atStart < BRIGHT) throw new Error('the window did not start at the left edge of the picture');
       if (atEnd >= DARK) throw new Error('the window did not move away from the left edge');
       return 'the window moves from the left edge to the right';
+    });
+
+    await record('hdr-clip', async () => {
+      // What an iPhone records: ten bits per colour, the colours of BT.2020 and the HLG curve. Written with FFV1, which every FFmpeg has, so that this does not depend on an encoder.
+      // The pictures say what colours they have themselves (see `saysColours`): the encoder options for it are ignored by FFmpeg 8.
+      // A dark picture with a white bar down its middle: the clip is cut from the middle like most clips are, so the bar is what has to survive, and the dark ground beside it.
+      const recorded = join(work, 'hdr-source.mkv');
+      await execFileAsync(options.ffmpegPath, [
+        '-nostdin', '-y', '-f', 'lavfi', '-i', 'color=c=0x202020:s=320x180:r=10:d=2,drawbox=x=140:y=0:w=40:h=180:color=white:t=fill,format=yuv420p10le',
+        '-f', 'lavfi', '-i', 'anullsrc=r=16000:cl=mono', '-t', '2', '-vf', SAYS_HLG, '-c:v', 'ffv1', '-pix_fmt', 'yuv420p10le', '-c:a', 'pcm_s16le', recorded,
+      ], { timeout, maxBuffer: 4 * 1024 * 1024 });
+      // Looked at and cut by the very code the customers' videos go through.
+      const seen = await new FfmpegAdapter(options.ffprobePath, options.ffmpegPath).probe(recorded);
+      if (seen.hdr !== 'hlg') throw new Error('looking at a picture with the colours of HDR video (HLG) did not find them');
+      const output = join(work, 'hdr-clip.mp4');
+      const hdrRenderer = new FfmpegClipRenderer(options.ffmpegPath, options.videoCodec, options.audioCodec, options.crf, options.preset, SIZE.width, SIZE.height, runner, fontsDirectory, options.clipThreads, options.toneMapping === true);
+      // Cut like any clip is, not shown whole: whether the whole-picture layout works is the business of its own step, and a fault there must not be reported here as a fault of the colours.
+      // The conversion must not spoil the picture (all black, all white): the bar stays bright and the ground beside it stays dark.
+      const rendered = await hdrRenderer.render({ sourcePath: recorded, startSeconds: 0.2, endSeconds: 1.2, outputPath: output, hdr: seen.hdr });
+      await shape(output);
+      const all = await pictures(output);
+      const frame = all[Math.floor(all.length / 2)];
+      if (pixelAt(frame, SIZE.width, SIZE.width / 2, 128) < BRIGHT) throw new Error('the white bar of the picture was lost on the way to an 8-bit clip');
+      if (pixelAt(frame, SIZE.width, 4, 128) >= DARK) throw new Error('the dark ground of the picture was lost on the way to an 8-bit clip');
+      const { stdout } = await execFileAsync(options.ffprobePath, ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=color_space,color_transfer,color_primaries', '-of', 'json', output], { timeout, maxBuffer: 1024 * 1024, encoding: 'utf8' });
+      const tags = (JSON.parse(stdout) as { streams?: Array<{ color_space?: string; color_transfer?: string; color_primaries?: string }> }).streams?.[0] ?? {};
+      if (options.toneMapping !== true) return `a ten-bit HDR picture became an ordinary 8-bit clip; its colours were not converted (${options.toneMapping === false ? 'switched off, left off for want of memory, or this FFmpeg cannot' : 'not asked for'})`;
+      if (rendered.colours !== 'converted') throw new Error('the start-up trial found that the colours of HDR video can be converted, but this clip was made without converting them');
+      if (tags.color_space !== 'bt709' || tags.color_transfer !== 'bt709' || tags.color_primaries !== 'bt709') throw new Error(`the colours were converted but the clip says it is ${tags.color_primaries ?? '?'}/${tags.color_transfer ?? '?'}/${tags.color_space ?? '?'} and not bt709`);
+      return 'a ten-bit HDR picture (HLG) became an ordinary 8-bit clip with the colours of an ordinary video (bt709)';
     });
 
     if (wantsRenderSample) {

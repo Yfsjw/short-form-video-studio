@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import type { AspectChoice, QualityChoice } from './domain.js';
 import { cropXExpression, type FramingPlan } from './framing.js';
+import { SDR_COLOUR_TAGS, TONE_MAP_TO_SDR, isColourConversionFailure, type HdrKind } from './hdr.js';
 import { outputSizeFor } from './options.js';
 
 const execFileAsync = promisify(execFile);
@@ -25,8 +26,11 @@ export interface ClipRenderRequest {
   framing?: FramingPlan | null;
   /** `fill` (the default) cuts the clip out of the picture; `fit` shows the whole picture over a blurred copy of itself and cuts nothing off (a framing plan is then not used). */
   layout?: 'fill' | 'fit';
+  /** The kind of HDR the picture is in, when it is one. The clip is an ordinary picture either way; with this it also gets the colours of one, where the renderer can (see hdr.ts). */
+  hdr?: HdrKind;
 }
-export interface RenderedClip { durationSeconds: number; sizeBytes: number; }
+/** `colours` is there only for an HDR picture: whether its colours were converted to those of an ordinary one, or the clip was only made 8-bit (a build of FFmpeg without the filters, or a video that does not say what its colours are). */
+export interface RenderedClip { durationSeconds: number; sizeBytes: number; colours?: 'converted' | 'not converted'; }
 export interface ClipRenderer { render(request: ClipRenderRequest): Promise<RenderedClip>; }
 export type FfmpegRunner = (binary: string, arguments_: string[], options: { maxBuffer: number; timeout: number; cwd: string }) => Promise<void>;
 
@@ -47,37 +51,50 @@ export class FfmpegClipRenderer implements ClipRenderer {
      * of the host, which on a container with a small share of them means threads that only wait for each other, see machine.ts).
      */
     private readonly threads?: number,
+    /** Whether this FFmpeg can convert the colours of an HDR picture (it has the filters, see hdr.ts); without it an HDR picture is only made 8-bit. */
+    private readonly toneMapping: boolean = false,
   ) {}
 
   async render(request: ClipRenderRequest): Promise<RenderedClip> {
     const durationSeconds = request.endSeconds - request.startSeconds;
     if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) throw new Error('Clip range must have a positive duration.');
     const size = outputSizeFor({ width: this.verticalWidth, height: this.verticalHeight }, request.quality ?? 'hd', request.aspect ?? 'vertical');
-    const videoFilter = this.buildVideoFilter(request.captionPath, size, request.framing, request.layout);
-    const args = [
-      // `-ss` goes BEFORE `-i` on purpose. Placed after it, FFmpeg decodes everything from the start of the file and cuts at the very end
-      // of the filter chain, so the caption filter would see the ORIGINAL timeline (a clip that starts 40 s into the video would look for
-      // its captions at 40 s onwards while ours are counted from the start of the clip, and they would never show up or show at the wrong
-      // moment). Placed before it, the seek is still frame-accurate, the clip's own timeline starts at 0, and a clip deep inside a long video
-      // no longer costs the time of decoding everything before it.
-      '-nostdin', '-y', ...this.filterThreadOptions(), '-ss', request.startSeconds.toFixed(3), ...this.threadOptions(), '-i', request.sourcePath,
-      '-t', durationSeconds.toFixed(3),
-      '-map', '0:v:0', '-map', '0:a?',
-      '-vf', videoFilter,
-      '-c:v', this.videoCodec, '-preset', this.preset, '-crf', String(this.crf),
-      '-c:a', this.audioCodec, '-movflags', '+faststart', ...this.threadOptions(), request.outputPath,
-    ];
-    try {
-      await this.runner(this.ffmpegPath, args, { maxBuffer: 4 * 1024 * 1024, timeout: 30 * 60_000, cwd: dirname(request.outputPath) });
-      const info = await stat(request.outputPath);
-      if (!info.isFile() || info.size <= 0) throw new Error('FFmpeg completed without producing a non-empty MP4 file.');
-      return { durationSeconds, sizeBytes: info.size };
-    } catch (error) {
-      await rm(request.outputPath, { force: true });
-      const stderr = typeof error === 'object' && error && 'stderr' in error ? String(error.stderr).trim().slice(-2000) : '';
-      const detail = error instanceof Error ? error.message : 'Unknown FFmpeg execution failure';
-      throw new Error(`Clip extraction failed: ${detail}${stderr ? `; ffmpeg: ${stderr}` : ''}`);
+    // An HDR picture is converted to the colours of an ordinary one when this FFmpeg can. If the conversion itself fails (a video that does not say what
+    // its colours are, say) the clip is made again without it, because a clip with flat colours is better than no clip.
+    const convert = request.hdr !== undefined && this.toneMapping;
+    for (const toneMap of convert ? [true, false] : [false]) {
+      const videoFilter = this.buildVideoFilter(request.captionPath, size, request.framing, request.layout, toneMap);
+      const args = [
+        // `-ss` goes BEFORE `-i` on purpose. Placed after it, FFmpeg decodes everything from the start of the file and cuts at the very end
+        // of the filter chain, so the caption filter would see the ORIGINAL timeline (a clip that starts 40 s into the video would look for
+        // its captions at 40 s onwards while ours are counted from the start of the clip, and they would never show up or show at the wrong
+        // moment). Placed before it, the seek is still frame-accurate, the clip's own timeline starts at 0, and a clip deep inside a long video
+        // no longer costs the time of decoding everything before it.
+        '-nostdin', '-y', ...this.filterThreadOptions(), '-ss', request.startSeconds.toFixed(3), ...this.threadOptions(), '-i', request.sourcePath,
+        '-t', durationSeconds.toFixed(3),
+        // The picture, and the first sound only (the one the speech was recognised from), with no more than two channels: a recording made for a cinema
+        // has six, which not every phone and platform plays. A video without sound is fine as it is (the mapping is optional).
+        '-map', '0:v:0', '-map', '0:a:0?',
+        '-vf', videoFilter, '-af', 'aformat=channel_layouts=mono|stereo',
+        // 8 bits, 4:2:0: what every phone, browser and platform plays (a 10-bit or 4:4:4 source would otherwise give H.264 "High 10" or "High 4:4:4").
+        '-c:v', this.videoCodec, '-preset', this.preset, '-crf', String(this.crf), '-pix_fmt', 'yuv420p', ...(toneMap ? SDR_COLOUR_TAGS : []),
+        '-c:a', this.audioCodec, '-movflags', '+faststart', ...this.threadOptions(), request.outputPath,
+      ];
+      try {
+        await this.runner(this.ffmpegPath, args, { maxBuffer: 4 * 1024 * 1024, timeout: 30 * 60_000, cwd: dirname(request.outputPath) });
+        const info = await stat(request.outputPath);
+        if (!info.isFile() || info.size <= 0) throw new Error('FFmpeg completed without producing a non-empty MP4 file.');
+        return { durationSeconds, sizeBytes: info.size, ...(request.hdr ? { colours: toneMap ? 'converted' as const : 'not converted' as const } : {}) };
+      } catch (error) {
+        await rm(request.outputPath, { force: true });
+        // Only a failure of the conversion itself is tried again without it (see above); anything else would only fail a second time, later.
+        if (toneMap && isColourConversionFailure(typeof error === 'object' && error ? (error as { stderr?: unknown }).stderr : undefined)) continue;
+        const stderr = typeof error === 'object' && error && 'stderr' in error ? String(error.stderr).trim().slice(-2000) : '';
+        const detail = error instanceof Error ? error.message : 'Unknown FFmpeg execution failure';
+        throw new Error(`Clip extraction failed: ${detail}${stderr ? `; ffmpeg: ${stderr}` : ''}`);
+      }
     }
+    throw new Error('Clip extraction failed.'); // not reached: the last attempt returns or throws
   }
 
   /** `-threads`: in front of an input it is for the decoder, in front of an output for the encoder. */
@@ -85,17 +102,20 @@ export class FfmpegClipRenderer implements ClipRenderer {
   /** `-filter_threads` is a global option: how many threads the filters (scaling, blurring, captions) may use. */
   private filterThreadOptions(): string[] { return this.threads ? ['-filter_threads', String(this.threads)] : []; }
 
-  private buildVideoFilter(captionPath: string | null | undefined, size: { width: number; height: number }, framing?: FramingPlan | null, layout: 'fill' | 'fit' = 'fill') {
+  private buildVideoFilter(captionPath: string | null | undefined, size: { width: number; height: number }, framing?: FramingPlan | null, layout: 'fill' | 'fit' = 'fill', toneMap = false) {
     // `fill`: the picture is enlarged until it covers the clip, and the clip is cut out of it: from the middle, unless a plan says where the window
     // goes at every moment (its `x` is an expression FFmpeg works out for every frame from `t`, the time counted from the start of the clip).
     // `fit`: the whole picture, as large as the width allows, in the middle of a blurred copy of itself.
     const window = framing ? `crop=${size.width}:${size.height}:x='${cropXExpression(framing.keyframes)}':y='(in_h-out_h)/2'` : `crop=${size.width}:${size.height}`;
     const crop = layout === 'fit' ? wholePictureFilter(size) : `scale=${size.width}:${size.height}:force_original_aspect_ratio=increase,${window}`;
-    if (!captionPath) return crop;
+    // Pixels that are not square (some cameras and old recordings) are made square first, or the whole clip would be drawn too wide or too narrow, and the
+    // picture is made an ordinary 8-bit one before anything is drawn on it. Every one of these is a no-op for an ordinary video.
+    const picture = `scale=trunc(iw*sar/2)*2:ih,setsar=1,${crop},setsar=1,${toneMap ? TONE_MAP_TO_SDR : 'format=yuv420p'}`;
+    if (!captionPath) return picture;
     const escapedPath = escapeFilterPath(captionPath);
     // A styled caption file (.ass) brings its own look and is drawn with the bundled font; a plain .srt gets the fixed look below.
-    if (captionPath.toLowerCase().endsWith('.ass')) return `${crop},ass='${escapedPath}':fontsdir='${escapeFilterPath(this.fontsDirectory)}'`;
-    return `${crop},subtitles='${escapedPath}':force_style='FontName=Arial,FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=3,Shadow=0,Alignment=2,MarginV=110'`;
+    if (captionPath.toLowerCase().endsWith('.ass')) return `${picture},ass='${escapedPath}':fontsdir='${escapeFilterPath(this.fontsDirectory)}'`;
+    return `${picture},subtitles='${escapedPath}':force_style='FontName=Arial,FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=3,Shadow=0,Alignment=2,MarginV=110'`;
   }
 }
 

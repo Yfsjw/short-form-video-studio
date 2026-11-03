@@ -98,7 +98,7 @@ export class VideoPipeline {
   private recheckTimer: NodeJS.Timeout | undefined;
   private closed = false;
 
-  constructor(private readonly db: PipelineStore, private readonly ffmpeg: MediaProcessor, private readonly transcriber: TranscriptionEngine, private readonly highlightDetector: HighlightDetector, private readonly highlightOptions: HighlightOptions, private readonly clipRenderer: ClipRenderer, private readonly maxClipCandidates: number, private readonly uploadDir: string, private readonly tempDir: string, private readonly outputDir: string, private readonly logger: Pick<Logger, 'info' | 'error'>, private readonly storage: DurableStorage, private readonly options: PipelineRuntimeOptions = defaultRuntimeOptions, private readonly framer?: ClipFramer) {
+  constructor(private readonly db: PipelineStore, private readonly ffmpeg: MediaProcessor, private readonly transcriber: TranscriptionEngine, private readonly highlightDetector: HighlightDetector, private readonly highlightOptions: HighlightOptions, private readonly clipRenderer: ClipRenderer, private readonly maxClipCandidates: number, private readonly uploadDir: string, private readonly tempDir: string, private readonly outputDir: string, private readonly logger: Pick<Logger, 'info' | 'warn' | 'error'>, private readonly storage: DurableStorage, private readonly options: PipelineRuntimeOptions = defaultRuntimeOptions, private readonly framer?: ClipFramer) {
     this.slots = new Semaphore(options.concurrency);
   }
 
@@ -449,7 +449,7 @@ export class VideoPipeline {
   private async renderClips(job: VideoJob, sourcePath: string, jobOutputDir: string) {
     const jobId = job.id;
     await this.discardPreviousClips(jobId, jobOutputDir);
-    const { hasAudio, ...metadata } = await this.ffmpeg.probe(sourcePath);
+    const { hasAudio, hdr, ...metadata } = await this.ffmpeg.probe(sourcePath);
     await this.enterStage(jobId, 'extracting_audio', { ...metadata });
     if (hasAudio === false) throw new PlainFailure(plainWords.noSound);   // nothing to listen to: say so now, not after a failed extraction
     const workDir = await mkdtemp(join(this.tempDir, `${jobId}-`));
@@ -467,7 +467,7 @@ export class VideoPipeline {
       if (!candidates.length) throw new PlainFailure(transcript.length ? 'No stretch of the speech was long enough to make a clip from.' : 'No speech was recognised in this video, so there is nothing to base clips on. Try a video in which someone is talking.');
       await this.enterStage(jobId, 'extracting_clips');
       await mkdir(jobOutputDir, { recursive: true });
-      let completedCount = 0; let framingMs = 0;
+      let completedCount = 0; let framingMs = 0; let coloursKept = 0; let coloursConverted = 0;
       for (const [candidateNumber, candidate] of candidates.entries()) {
         const clipId = randomUUID();
         const outputFilename = `${clipId}.mp4`;
@@ -490,7 +490,8 @@ export class VideoPipeline {
             captionCount = await writeSrtCaptions(captionPath, transcript, range.startSeconds, range.endSeconds);
             styledCount = await writeAssCaptions(styledCaptionPath, transcript, range.startSeconds, range.endSeconds, captionStyle, options.aspect, { accent: options.captionAccent, position: options.captionPosition, size: options.captionSize });
           }
-          const rendered = await this.clipRenderer.render({ sourcePath, startSeconds: range.startSeconds, endSeconds: range.endSeconds, outputPath, captionPath: styledCount ? styledCaptionPath : null, quality: options.quality, aspect: options.aspect, framing: framing?.followed ? framing.plan : null, layout: options.framing === 'fit' ? 'fit' : 'fill' });
+          const rendered = await this.clipRenderer.render({ sourcePath, startSeconds: range.startSeconds, endSeconds: range.endSeconds, outputPath, captionPath: styledCount ? styledCaptionPath : null, quality: options.quality, aspect: options.aspect, framing: framing?.followed ? framing.plan : null, layout: options.framing === 'fit' ? 'fit' : 'fill', ...(hdr ? { hdr } : {}) });
+          if (rendered.colours === 'not converted') coloursKept += 1; else if (rendered.colours === 'converted') coloursConverted += 1;
           await rm(styledCaptionPath, { force: true });
           await this.storage.upload(outputPath, clip.outputPath, 'video/mp4');
           if (captionCount) await this.storage.upload(captionPath, `${jobId}/${clipId}.srt`, 'application/x-subrip');
@@ -501,11 +502,12 @@ export class VideoPipeline {
         }
         this.reportProgress(jobId, stageProgress('extracting_clips', (candidateNumber + 1) / candidates.length));
       }
+      if (coloursKept) this.logger.warn({ jobId, hdr, clipCount: coloursKept }, 'This video is HDR but its colours could not be converted to those of an ordinary picture (this machine does not convert them, or the video does not say what its colours are): the clips play everywhere but look flatter than the original');
       if (!completedCount) throw new PlainFailure(`None of the ${candidates.length} clip${candidates.length === 1 ? '' : 's'} could be made from this video. Please try again, or try another video.`);
       await this.progressWrites.get(jobId)?.catch(() => undefined);
       const stageTimings = this.clocks.get(jobId)?.finish() ?? {};
       await this.db.updateJob(jobId, { status: 'completed', stage: 'clip_extraction_complete', progress: 100, stageTimings });
-      this.logger.info({ jobId, metadata, options, stageTimingsMs: stageTimings, totalMs: totalMilliseconds(stageTimings), transcriptSegmentCount: segments.length, transcriptReused, highlightCandidateCount: highlights.length, completedClipCount: completedCount, ...(options.framing === 'face' ? { framingMs } : {}) }, 'Video processing, vertical rendering, and caption burn-in completed');
+      this.logger.info({ jobId, metadata, options, stageTimingsMs: stageTimings, totalMs: totalMilliseconds(stageTimings), transcriptSegmentCount: segments.length, transcriptReused, highlightCandidateCount: highlights.length, completedClipCount: completedCount, ...(hdr ? { hdr, coloursConverted: coloursConverted > 0 && coloursKept === 0 } : {}), ...(options.framing === 'face' ? { framingMs } : {}) }, 'Video processing, vertical rendering, and caption burn-in completed');
     } finally {
       await rm(workDir, { recursive: true, force: true });
     }

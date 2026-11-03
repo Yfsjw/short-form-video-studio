@@ -58,6 +58,15 @@ test('following a face is on by default (a person still has to ask for it per vi
   assert.throws(() => loadConfig({ FACE_FRAMING_ENABLED: 'flase' }));
 });
 
+test('converting the colours of HDR video is automatic by default (where the machine has the memory, and its FFmpeg can), can be forced on or off, and rejects typos like the other flags', () => {
+  assert.equal(loadConfig({}).CLIP_TONE_MAP_HDR, 'auto');
+  assert.equal(loadConfig({ CLIP_TONE_MAP_HDR: '' }).CLIP_TONE_MAP_HDR, 'auto');
+  assert.equal(loadConfig({ CLIP_TONE_MAP_HDR: ' AUTO ' }).CLIP_TONE_MAP_HDR, 'auto');
+  for (const off of ['false', 'FALSE', '0', 'no', 'off']) assert.equal(loadConfig({ CLIP_TONE_MAP_HDR: off }).CLIP_TONE_MAP_HDR, false, `"${off}" should switch it off`);
+  for (const on of ['true', '1', 'yes', 'on']) assert.equal(loadConfig({ CLIP_TONE_MAP_HDR: on }).CLIP_TONE_MAP_HDR, true);
+  for (const typo of ['flase', 'maybe', 'atuo', 'auto-ish']) assert.throws(() => loadConfig({ CLIP_TONE_MAP_HDR: typo }), /./, typo);
+});
+
 test('the start-up check of the video tools is on by default, can be switched off, and rejects typos like the other flags', () => {
   assert.equal(loadConfig({}).TOOLCHAIN_CHECK_ENABLED, true);
   assert.equal(loadConfig({ TOOLCHAIN_CHECK_ENABLED: '' }).TOOLCHAIN_CHECK_ENABLED, true);

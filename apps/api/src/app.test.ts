@@ -13,6 +13,7 @@ import { createApp, type AppOverrides } from './app.js';
 import { loadConfig } from './config.js';
 import { StudioDatabase } from './database.js';
 import type { ClipFramer } from './face-track.js';
+import { SAYS_HLG, probeToneMapping } from './hdr.js';
 import type { MachineLimits } from './machine.js';
 import { NullStorage, type DurableStorage } from './storage.js';
 import { MemoryStorage, eventually, sleep, speechSampleJson, writeFakeWhisper } from './test-support.js';
@@ -43,6 +44,10 @@ if (hasFfmpeg) await run('ffmpeg', ['-nostdin', '-y', '-f', 'lavfi', '-i', 'test
 /** A genuine 2-second video with no sound track at all. */
 const silentVideo = join(workspace, 'silent.mp4');
 if (hasFfmpeg) await run('ffmpeg', ['-nostdin', '-y', '-f', 'lavfi', '-i', 'testsrc=duration=2:size=160x120:rate=10', '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', silentVideo]);
+
+/** What an iPhone records: 8 seconds of ten bits per colour, BT.2020 colours and the HLG curve (written with FFV1, which every FFmpeg has). */
+const hdrVideo = join(workspace, 'iphone-hdr.mkv');
+if (hasFfmpeg) await run('ffmpeg', ['-nostdin', '-y', '-f', 'lavfi', '-i', 'testsrc=duration=8:size=160x120:rate=10,format=yuv420p10le', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=8', '-vf', SAYS_HLG, '-c:v', 'ffv1', '-pix_fmt', 'yuv420p10le', '-c:a', 'pcm_s16le', hdrVideo]);
 
 /** The same video followed by a valid MP4 "free" (padding) box, so it is still a real, playable video but megabytes larger. */
 async function paddedVideo(megabytes: number) {
@@ -919,7 +924,7 @@ test('the real check, in the real server: a missing whisper.cpp is the one thing
   const passedLine = lines.map((line) => JSON.parse(line) as { level: number; msg?: string; steps?: Array<{ name: string; ok: boolean }> }).find((entry) => entry.msg?.startsWith('Toolchain check passed'));
   assert.ok(passedLine, 'the pass is in the log');
   assert.equal(passedLine.level, 30);
-  assert.deepEqual(passedLine.steps?.map((step) => step.name), ['machine', 'ffmpeg', 'ffprobe', 'encoders', 'filters', 'fonts', 'speech-engine', 'speech-sample', 'test-video', 'captions', 'whole-picture', 'moving-window', 'render-speed', 'face-following'], 'what the machine is like, the recording of speech and a render at the size of real clips are part of the check unless they are switched off');
+  assert.deepEqual(passedLine.steps?.map((step) => step.name), ['machine', 'ffmpeg', 'ffprobe', 'encoders', 'filters', 'fonts', 'speech-engine', 'speech-sample', 'test-video', 'captions', 'whole-picture', 'moving-window', 'hdr-clip', 'render-speed', 'face-following'], 'what the machine is like, the recording of speech and a render at the size of real clips are part of the check unless they are switched off');
   const detail = (name: string) => (passedLine.steps as unknown as Array<{ name: string; detail: string }>).find((step) => step.name === name)?.detail ?? '';
   assert.match(detail('speech-sample'), /^wrote 22 words with their times, 100% of those said/, 'the real program, here a stand-in that writes what whisper.cpp writes, was listened to and understood');
   assert.match(detail('render-speed'), /^3 s of 360x640 with captions/, 'at the size of clips this server is set to make');
@@ -933,6 +938,8 @@ test('the real check, in the real server: a missing whisper.cpp is the one thing
 const MEBIBYTE = 1024 * 1024;
 /** What Render's free instance reports (measured on 27 October 2026): 0.15 of one core, 512 MiB. */
 const smallInstance = async (): Promise<MachineLimits> => ({ cpuLimit: 0.15, memoryLimitBytes: 512 * MEBIBYTE, cores: 1, totalMemoryBytes: 8192 * MEBIBYTE });
+/** A machine with memory to spare and no limit of its container: the colours of HDR video are converted on it (by default) when its FFmpeg can. */
+const plentyOfMemory = async (): Promise<MachineLimits> => ({ cpuLimit: null, memoryLimitBytes: null, cores: 2, totalMemoryBytes: 16 * 1024 * MEBIBYTE });
 
 /** A stand-in for FFmpeg that notes every start (one line each) and then runs the real FFmpeg: what the server asks of the program can be read afterwards. */
 const writeRecordingFfmpeg = (path: string, log: string) => writeFile(path, `#!/bin/sh\necho "$*" >> '${log}'\nexec ffmpeg "$@"\n`, { mode: 0o755 });
@@ -1021,7 +1028,7 @@ test('with a hosted speech service and face following switched off, the check le
     assert.equal((await server.studio.toolchain.run()).state, 'passed');
   } finally { await server.stop(); await dropSchema(schema); }
   const entry = lines.map((line) => JSON.parse(line) as { msg?: string; steps?: Array<{ name: string }> }).find((candidate) => candidate.msg?.startsWith('Toolchain check passed'));
-  assert.deepEqual(entry?.steps?.map((step) => step.name), ['machine', 'ffmpeg', 'ffprobe', 'encoders', 'filters', 'fonts', 'test-video', 'captions', 'whole-picture', 'moving-window', 'render-speed'], 'no speech engine on this machine, so no recording to listen to');
+  assert.deepEqual(entry?.steps?.map((step) => step.name), ['machine', 'ffmpeg', 'ffprobe', 'encoders', 'filters', 'fonts', 'test-video', 'captions', 'whole-picture', 'moving-window', 'hdr-clip', 'render-speed'], 'no speech engine on this machine, so no recording to listen to');
   assert.ok(!lines.join('').includes('a-key-that-is-never-used'), 'the key of a hosted service is never in the logs');
 });
 
@@ -1032,7 +1039,7 @@ test('with TOOLCHAIN_REAL_SAMPLES switched off the check is what it was: no reco
     assert.equal((await server.studio.toolchain.run()).state, 'passed');
   } finally { await server.stop(); await dropSchema(schema); }
   const entry = lines.map((line) => JSON.parse(line) as { msg?: string; steps?: Array<{ name: string }> }).find((candidate) => candidate.msg?.startsWith('Toolchain check passed'));
-  assert.deepEqual(entry?.steps?.map((step) => step.name), ['ffmpeg', 'ffprobe', 'encoders', 'filters', 'fonts', 'test-video', 'captions', 'whole-picture', 'moving-window']);
+  assert.deepEqual(entry?.steps?.map((step) => step.name), ['ffmpeg', 'ffprobe', 'encoders', 'filters', 'fonts', 'test-video', 'captions', 'whole-picture', 'moving-window', 'hdr-clip']);
 });
 
 test('the check does not run while a job is being processed, and runs as soon as the work is done', needsFfmpeg, async () => {
@@ -1309,4 +1316,116 @@ test('an error that carries a status of its own is taken for a bad request only 
     assert.equal(refused.status, 422);
     assert.deepEqual(((await refused.json()) as { error: unknown }).error, { code: 'INVALID_REQUEST', message: 'The request could not be understood.' });
   } finally { await server.stop(); await dropSchema(schema); }
+});
+
+// ---- HDR video from phones -------------------------------------------------------------------------------------------------
+
+type LogEntry = { level: number; msg?: string; jobId?: string; hdr?: string; coloursConverted?: boolean; toneMapping?: { works: boolean; detail: string }; toneMappingDecision?: { convert: boolean; why: string }; steps?: Array<{ name: string; ok: boolean; detail: string }> };
+const readLog = (lines: string[]) => lines.map((line) => JSON.parse(line) as LogEntry);
+const capturing = (lines: string[]) => ({ logLevel: 'info', logDestination: { write: (line: string) => { lines.push(line); } } });
+const clipPicture = async (path: string) => (JSON.parse((await run('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=profile,pix_fmt,width,height,color_space,color_transfer,color_primaries', '-of', 'json', path])).stdout) as { streams: Array<{ profile: string; pix_fmt: string; width: number; height: number; color_space?: string; color_transfer?: string; color_primaries?: string }> }).streams[0];
+
+test('a video from an iPhone (ten bits, HDR) comes out of the whole service as a clip that plays everywhere: its colours are converted where this machine can and left as they were where it cannot, and the log says which', needsFfmpeg, async () => {
+  const canConvert = (await probeToneMapping('ffmpeg')).works;
+  const cases: Array<{ label: string; trial?: () => Promise<{ works: boolean; detail: string }>; converted: boolean }> = [
+    { label: 'the start-up trial found that the machine cannot', trial: async () => ({ works: false, detail: 'tried, and it did not work' }), converted: false },
+    { label: 'the machine is asked, as in production', converted: canConvert },
+  ];
+  for (const { label, trial, converted } of cases) {
+    const schema = schemaName('hdr'); const lines: string[] = [];
+    const server = await start({ schema, framer: null, extra: { ...capturing(lines), machine: plentyOfMemory, ...(trial ? { toneMapping: trial } : {}) } });
+    try {
+      const response = await upload(server.base, '/api/jobs', await readFile(hdrVideo), 'iphone.mkv');
+      assert.equal(response.status, 202, label);
+      const { job } = await response.json() as { job: { id: string } };
+      const finished = await waitForJob(server.base, job.id);
+      assert.equal(finished.job.status, 'completed', `${label}: ${finished.job.errorMessage ?? ''}`);
+      await untilSettled(server);
+      assert.equal(finished.clips.length, 1);
+
+      const clipFile = join(workspace, `${finished.clips[0].id}-hdr.mp4`);
+      await writeFile(clipFile, (server.storage as MemoryStorage).objects.get(finished.clips[0].outputPath)!);
+      const picture = await clipPicture(clipFile);
+      assert.deepEqual({ width: picture.width, height: picture.height, pixels: picture.pix_fmt }, { width: 360, height: 640, pixels: 'yuv420p' }, `${label}: a vertical clip of 8-bit pixels, not "${picture.profile}" of ten bits`);
+      assert.ok(['Constrained Baseline', 'Baseline', 'Main', 'High'].includes(picture.profile), `${label}: a profile that plays everywhere, not ${picture.profile}`);
+      if (converted) assert.deepEqual([picture.color_primaries, picture.color_transfer, picture.color_space], ['bt709', 'bt709', 'bt709'], `${label}: the colours of an ordinary video`);
+      else assert.equal(picture.color_transfer, 'arib-std-b67', `${label}: the clip says what it still is (HLG) instead of claiming colours it was not converted to`);
+
+      const log = readLog(lines);
+      const done = log.find((entry) => entry.msg?.startsWith('Video processing') && entry.jobId === job.id);
+      assert.ok(done, `${label}: the job's end is in the log`);
+      assert.equal(done.hdr, 'hlg', `${label}: the log says the video was HDR`);
+      assert.equal(done.coloursConverted, converted, `${label}: and whether its colours were converted`);
+      const warned = log.find((entry) => entry.level === 40 && /^This video is HDR but its colours could not be converted/.test(entry.msg ?? ''));
+      assert.equal(warned !== undefined, !converted, `${label}: a warning exactly when the colours were not converted`);
+      assert.equal(JSON.stringify(finished.job).includes('hlg'), false, `${label}: the kind of HDR is for the log, not for the job a person is shown`);
+    } finally { await server.stop(); await dropSchema(schema); }
+  }
+});
+
+test('at start-up the server tries converting HDR colours once and says what it found, and hands that to its own check of the clips', needsFfmpeg, async () => {
+  const canConvert = (await probeToneMapping('ffmpeg')).works;
+  const env = { TRANSCRIPTION_ENGINE: 'openai_compatible', TRANSCRIPTION_API_URL: 'https://speech.example.test/v1', TRANSCRIPTION_API_KEY: 'a-key-that-is-never-used', FACE_FRAMING_ENABLED: 'false', TOOLCHAIN_REAL_SAMPLES: 'false' };
+  const boot = async (label: string, settings: { env?: Record<string, string>; trial?: () => Promise<{ works: boolean; detail: string }>; machine?: () => Promise<MachineLimits> }) => {
+    const schema = schemaName('hdrboot'); const lines: string[] = [];
+    const server = await start({ schema, env: { ...env, ...settings.env }, extra: { ...capturing(lines), machine: settings.machine ?? plentyOfMemory, ...(settings.trial ? { toneMapping: settings.trial } : {}) } });
+    try { await server.studio.toolchain.run(); } finally { await server.stop(); await dropSchema(schema); }
+    const log = readLog(lines);
+    return { label, log, line: log.find((entry) => entry.msg?.startsWith('HDR video:')), step: log.find((entry) => entry.msg?.startsWith('Toolchain check'))?.steps?.find((step) => step.name === 'hdr-clip') };
+  };
+
+  const no = await boot('trial: no', { trial: async () => ({ works: false, detail: 'No such filter: zscale' }) });
+  assert.equal(no.line?.level, 40, 'a machine that cannot is a warning: its HDR clips look flat');
+  assert.equal(no.line?.msg, 'HDR video: this FFmpeg cannot convert its colours (No such filter: zscale). Clips from HDR video are made as ordinary 8-bit pictures that play everywhere, but their colours look flat');
+  assert.deepEqual(no.line?.toneMapping, { works: false, detail: 'No such filter: zscale' });
+  assert.equal(no.step?.ok, true, 'and the check of the clips passes: they are still clips that play');
+  assert.equal(no.step?.detail, 'a ten-bit HDR picture became an ordinary 8-bit clip; its colours were not converted (switched off, left off for want of memory, or this FFmpeg cannot)');
+
+  const thrown = await boot('trial: throws', { trial: async () => { throw new Error('the trial itself broke'); } });
+  assert.equal(thrown.line?.level, 40);
+  assert.match(thrown.line?.msg ?? '', /this FFmpeg cannot convert its colours \(the trial itself broke\)/, 'a trial that blows up is a machine that cannot, never a server that does not start');
+
+  let asked = 0;
+  const off = await boot('switched off', { env: { CLIP_TONE_MAP_HDR: 'false' }, trial: async () => { asked += 1; return { works: true, detail: 'yes' }; } });
+  assert.equal(asked, 0, 'switched off, the machine is not even asked');
+  assert.equal(off.line?.level, 30);
+  assert.equal(off.line?.msg, 'HDR video: converting its colours is switched off (CLIP_TONE_MAP_HDR). Clips from HDR video are made as ordinary 8-bit pictures that play everywhere, but their colours look flat');
+  assert.match(off.step?.detail ?? '', /not converted \(switched off, left off for want of memory, or this FFmpeg cannot\)$/, 'and the check does not expect a conversion either');
+
+  // By default (nothing set) the machine's memory decides: the free instance (512 MiB, a limit of its container below the 8 GiB of the host) is not asked.
+  const counting = async () => { asked += 1; return { works: true, detail: 'yes' }; };
+  asked = 0;
+  const tight = await boot('automatic, 512 MiB', { machine: smallInstance, trial: counting });
+  assert.equal(asked, 0, 'a machine with 512 MiB of memory is not even asked: the limit of its container counts, not the memory of the host');
+  assert.equal(tight.line?.level, 30);
+  assert.equal(tight.line?.msg, 'HDR video: converting its colours is left off on this machine, which has 512 MiB of memory: it needs about 90 MiB more for every clip (CLIP_TONE_MAP_HDR=true converts them anyway). Clips from HDR video are made as ordinary 8-bit pictures that play everywhere, but their colours look flat');
+  assert.equal(tight.line?.toneMappingDecision?.convert, false);
+  assert.match(tight.step?.detail ?? '', /not converted \(switched off, left off for want of memory, or this FFmpeg cannot\)$/, 'and the check does not expect a conversion either');
+  const noLimitSmall = await boot('automatic, no limit but a small host', { machine: async () => ({ cpuLimit: null, memoryLimitBytes: null, cores: 2, totalMemoryBytes: 768 * MEBIBYTE }), trial: counting });
+  assert.equal(asked, 0, 'with no limit of the container the memory of the machine is what counts');
+  assert.match(noLimitSmall.line?.msg ?? '', /which has 768 MiB of memory/);
+  const withRoom = await boot('automatic, 2 GiB', { machine: async () => ({ cpuLimit: 1, memoryLimitBytes: 2048 * MEBIBYTE, cores: 2, totalMemoryBytes: 8192 * MEBIBYTE }), trial: counting });
+  assert.equal(asked, 1, 'with 2 GiB it is asked');
+  assert.equal(withRoom.line?.msg, 'HDR video: its colours are converted to those of an ordinary picture (yes)');
+  const unreadableMachine = await boot('automatic, memory unknown', { machine: async () => { throw new Error('the control group files cannot be read here'); }, trial: counting });
+  assert.equal(asked, 2, 'a machine whose memory cannot be read is not taken for a small one');
+  assert.equal(unreadableMachine.line?.msg, 'HDR video: its colours are converted to those of an ordinary picture (yes)');
+  const forced = await boot('asked for, 512 MiB', { env: { CLIP_TONE_MAP_HDR: 'true' }, machine: smallInstance, trial: counting });
+  assert.equal(asked, 3, 'asked for, a small machine converts all the same');
+  assert.equal(forced.line?.msg, 'HDR video: its colours are converted to those of an ordinary picture (yes)');
+  asked = 0;
+
+  const yes = await boot('trial: yes', { trial: async () => ({ works: true, detail: 'a test HLG picture was converted in 3 ms' }) });
+  assert.equal(yes.line?.level, 30);
+  assert.equal(yes.line?.msg, 'HDR video: its colours are converted to those of an ordinary picture (a test HLG picture was converted in 3 ms)');
+  if (canConvert) {
+    assert.equal(yes.step?.ok, true, JSON.stringify(yes.log.filter((entry) => entry.level >= 40)));
+    assert.match(yes.step?.detail ?? '', /\(bt709\)$/, 'when the trial says the colours are converted, the check of the clips expects the clip to say so, and it does');
+  } else assert.equal(yes.step?.ok, false, 'a trial that promises what this FFmpeg cannot do is found out by the check of the clips');
+
+  const real = await boot('as in production', {});
+  assert.ok(real.line, 'with nothing set the machine is asked, and the log says what it found');
+  assert.equal(real.line?.level, canConvert ? 30 : 40);
+  assert.equal(real.line?.toneMapping?.works, canConvert);
+  assert.equal(real.log.filter((entry) => entry.msg?.startsWith('HDR video:')).length, 1, 'once');
 });

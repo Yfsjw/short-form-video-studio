@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import test, { after, before } from 'node:test';
 import { promisify } from 'node:util';
 import { BUNDLED_FONTS_DIRECTORY } from './clips.js';
+import { probeToneMapping } from './hdr.js';
 import { MIN_MODEL_BYTES, REQUIRED_FILTERS, SPEECH_SAMPLE_PATH, SPEECH_SAMPLE_TEXT, ToolchainMonitor, checkToolchain, countAtLeast, fontChosenIn, helpShowsEncoder, helpShowsFilter, isBundledFont, judgeSpeechSample, listsEncoder, listsFilter, pixelAt, shareOfWordsHeard, versionOf, type ToolchainCheckOptions, type ToolchainReport } from './toolchain.js';
 import type { TranscriptInput } from './transcription.js';
 import { sleep, speechSampleJson, writeFakeWhisper } from './test-support.js';
@@ -190,13 +191,19 @@ process.exitCode = result.status === null ? 1 : result.status;
   return path;
 }
 const changingFilter = (body: string) => String.raw`(args) => { const at = args.indexOf('-vf'); if (at >= 0) { const graph = args[at + 1]; ${body} } return args; }`;
+/**
+ * Makes a clip say another colour tag than the one it was asked to: in the encoder option (which is what FFmpeg 5.1 and 6.1 write) and in the pictures
+ * themselves (which is what FFmpeg 8 writes: it ignores the options for the curve and the primaries), so that the fault is the same on every FFmpeg.
+ */
+const relabelling = (option: string, value: string, filterOption: string) => String.raw`(args) => { const at = args.indexOf('${option}'); const graph = args.indexOf('-vf');
+  if (at >= 0 && graph >= 0 && args[at + 1] === 'bt709') { args[at + 1] = '${value}'; args[graph + 1] += ',setparams=${filterOption}=${value}'; } return args; }`;
 
 test('where everything works every check passes, in order, with what was found, and nothing is left behind', needsFfmpeg, async () => {
   const options = await optionsFor({ whisper: fakeWhisper, faceFollowing: true });
   const report = await checkToolchain(options);
   assert.deepEqual(failedIn(report), [], JSON.stringify(report.steps.filter((step) => !step.ok)));
   assert.equal(report.ok, true);
-  assert.deepEqual(report.steps.map((step) => step.name), ['ffmpeg', 'ffprobe', 'encoders', 'filters', 'fonts', 'speech-engine', 'test-video', 'captions', 'whole-picture', 'moving-window', 'face-following']);
+  assert.deepEqual(report.steps.map((step) => step.name), ['ffmpeg', 'ffprobe', 'encoders', 'filters', 'fonts', 'speech-engine', 'test-video', 'captions', 'whole-picture', 'moving-window', 'hdr-clip', 'face-following']);
   assert.match(stepOf(report, 'ffmpeg').detail, /^ffmpeg \S+$/);
   assert.match(stepOf(report, 'ffprobe').detail, /^ffprobe \S+$/);
   assert.equal(stepOf(report, 'encoders').detail, 'libx264, aac');
@@ -212,7 +219,7 @@ test('where everything works every check passes, in order, with what was found, 
 test('hosted speech recognition and a switched-off face follower simply leave their checks out', needsFfmpeg, async () => {
   const report = await checkToolchain(await optionsFor());
   assert.equal(report.ok, true, JSON.stringify(report.steps.filter((step) => !step.ok)));
-  assert.deepEqual(report.steps.map((step) => step.name), ['ffmpeg', 'ffprobe', 'encoders', 'filters', 'fonts', 'test-video', 'captions', 'whole-picture', 'moving-window']);
+  assert.deepEqual(report.steps.map((step) => step.name), ['ffmpeg', 'ffprobe', 'encoders', 'filters', 'fonts', 'test-video', 'captions', 'whole-picture', 'moving-window', 'hdr-clip']);
 });
 
 // ---- ways a host can be wrong, each played out for real ------------------------------------------------------------------------
@@ -221,7 +228,7 @@ test('an FFmpeg that is not there is reported, the checks that need it are marke
   const options = await optionsFor({ ffmpegPath: join(workspace, 'no-such-ffmpeg') });
   const report = await checkToolchain(options);
   assert.equal(report.ok, false);
-  assert.deepEqual(failedIn(report), ['ffmpeg', 'encoders', 'filters', 'test-video', 'captions', 'whole-picture', 'moving-window']);
+  assert.deepEqual(failedIn(report), ['ffmpeg', 'encoders', 'filters', 'test-video', 'captions', 'whole-picture', 'moving-window', 'hdr-clip']);
   assert.match(stepOf(report, 'ffmpeg').detail, /was not found/);
   assert.match(stepOf(report, 'encoders').detail, /^not run: ffmpeg does not work$/);
   assert.match(stepOf(report, 'captions').detail, /^not run: ffmpeg does not work$/);
@@ -241,14 +248,14 @@ test('a program that starts but does not say what it is (a wrong file at the rig
 
 test('an ffprobe that is not there is reported and stops the clips from being tried', needsFfmpeg, async () => {
   const report = await checkToolchain(await optionsFor({ ffprobePath: join(workspace, 'no-such-ffprobe') }));
-  assert.deepEqual(failedIn(report), ['ffprobe', 'test-video', 'captions', 'whole-picture', 'moving-window']);
+  assert.deepEqual(failedIn(report), ['ffprobe', 'test-video', 'captions', 'whole-picture', 'moving-window', 'hdr-clip']);
   assert.match(stepOf(report, 'ffprobe').detail, /was not found/);
   assert.match(stepOf(report, 'captions').detail, /^not run: ffprobe does not work$/);
 });
 
 test('an encoder this FFmpeg does not have is named', needsFfmpeg, async () => {
   const report = await checkToolchain(await optionsFor({ videoCodec: 'libnot264' }));
-  assert.deepEqual(failedIn(report), ['encoders', 'test-video', 'captions', 'whole-picture', 'moving-window']);
+  assert.deepEqual(failedIn(report), ['encoders', 'test-video', 'captions', 'whole-picture', 'moving-window', 'hdr-clip']);
   assert.match(stepOf(report, 'encoders').detail, /no encoder named libnot264/);
   assert.equal(stepOf(report, 'ffmpeg').ok, true);
   const audio = await checkToolchain(await optionsFor({ audioCodec: 'notaac' }));
@@ -310,15 +317,89 @@ test('a crop window that does not move is caught, and so is a whole picture that
   assert.deepEqual(failedIn(stays), ['moving-window']);
   assert.match(stepOf(stays, 'moving-window').detail, /did not move away from the left edge/, 'a window that starts right but never moves is not a moving window');
 
-  const cutInstead = await ffmpegThat({ args: changingFilter(String.raw`if (graph.startsWith('split=2')) args[at + 1] = 'scale=144:256:force_original_aspect_ratio=increase,crop=144:256';`) });
+  const cutInstead = await ffmpegThat({ args: changingFilter(String.raw`if (graph.includes('split=2')) args[at + 1] = 'scale=144:256:force_original_aspect_ratio=increase,crop=144:256,setsar=1';`) });
   const cut = await checkToolchain(await optionsFor({ ffmpegPath: cutInstead }));
   assert.deepEqual(failedIn(cut), ['whole-picture']);
   assert.match(stepOf(cut, 'whole-picture').detail, /the whole picture is not shown/);
 
-  const noBlur = await ffmpegThat({ args: changingFilter(String.raw`if (graph.startsWith('split=2')) args[at + 1] = 'scale=144:256:force_original_aspect_ratio=decrease,pad=144:256:(ow-iw)/2:(oh-ih)/2:color=white';`) });
+  const noBlur = await ffmpegThat({ args: changingFilter(String.raw`if (graph.includes('split=2')) args[at + 1] = 'scale=144:256:force_original_aspect_ratio=decrease,pad=144:256:(ow-iw)/2:(oh-ih)/2:color=white,setsar=1';`) });
   const bright = await checkToolchain(await optionsFor({ ffmpegPath: noBlur }));
   assert.deepEqual(failedIn(bright), ['whole-picture']);
   assert.match(stepOf(bright, 'whole-picture').detail, /not filled with the dark blurred copy/, 'the space around the picture has to be the copy, not a bar of something else');
+});
+
+/** A stand-in for ffprobe that runs the real one and changes what it printed, with a sed script: what the check reads of a clip can be made wrong. */
+async function ffprobeThat(sed: string): Promise<string> {
+  const path = join(workspace, `ffprobe-${randomUUID().slice(0, 8)}`);
+  await writeFile(path, `#!/bin/sh\nffprobe "$@" | sed '${sed}'\n`, { mode: 0o755 });
+  return path;
+}
+const CLIP_STEPS = ['captions', 'whole-picture', 'moving-window', 'hdr-clip'];
+
+test('a clip that would not play everywhere is caught by the check: pixels of more than 8 bits, pixels that are not square, or more sounds or channels than a phone plays', needsFfmpeg, async () => {
+  const faults: Array<[string, string, RegExp]> = [
+    ['pixels of ten bits', 's/"pix_fmt": "yuv420p"/"pix_fmt": "yuv420p10le"/', /the clip is made of yuv420p10le pixels, which many phones and browsers cannot play \(it should be yuv420p\)/],
+    ['pixels of full colour detail', 's/"pix_fmt": "yuv420p"/"pix_fmt": "yuv444p"/', /made of yuv444p pixels/],
+    ['pixels that are not square', 's/"sample_aspect_ratio": "1:1"/"sample_aspect_ratio": "4:3"/', /the pixels of the clip are not square \(4:3\), so it would be shown stretched/],
+    ['a sound of six channels', 's/"channels": 1/"channels": 6/', /the clip should have one sound of at most two channels, but has 1 with 6 channels/],
+  ];
+  for (const [what, sed, message] of faults) {
+    const report = await checkToolchain(await optionsFor({ ffprobePath: await ffprobeThat(sed) }));
+    assert.deepEqual(failedIn(report), CLIP_STEPS, what);
+    for (const name of CLIP_STEPS) assert.match(stepOf(report, name).detail, message, `${what}: ${name}`);
+  }
+  // Square pixels are told as they come: an unknown shape of pixels is not a fault of the clip.
+  for (const said of ['"sample_aspect_ratio": "0:1"', '"sample_aspect_ratio": "N/A"']) {
+    const report = await checkToolchain(await optionsFor({ ffprobePath: await ffprobeThat(`s|"sample_aspect_ratio": "1:1"|${said}|`) }));
+    assert.deepEqual(failedIn(report), [], said);
+  }
+  const withoutRatio = await checkToolchain(await optionsFor({ ffprobePath: await ffprobeThat('/"sample_aspect_ratio"/d') }));
+  assert.deepEqual(failedIn(withoutRatio), [], 'ffprobe that does not say is not a clip that is wrong');
+
+  // Two sounds: the renderer is made to keep the first sound twice.
+  const twice = await ffmpegThat({ args: String.raw`(args) => { const at = args.indexOf('0:a:0?'); if (at > 0) args.splice(at + 1, 0, '-map', '0:a:0?'); return args; }` });
+  const two = await checkToolchain(await optionsFor({ ffmpegPath: twice }));
+  assert.deepEqual(failedIn(two), CLIP_STEPS);
+  assert.match(stepOf(two, 'captions').detail, /the clip should have one sound of at most two channels, but has 2 with 1 and 1 channels/);
+});
+
+test('the check makes a clip from a ten-bit HDR picture and says whether its colours were converted, as the start-up trial of the machine decided', needsFfmpeg, async () => {
+  const canConvert = (await probeToneMapping('ffmpeg')).works;
+  const plain = await checkToolchain(await optionsFor());
+  assert.deepEqual(failedIn(plain), []);
+  assert.equal(stepOf(plain, 'hdr-clip').detail, 'a ten-bit HDR picture became an ordinary 8-bit clip; its colours were not converted (not asked for)');
+  const declined = await checkToolchain(await optionsFor({ toneMapping: false }));
+  assert.deepEqual(failedIn(declined), []);
+  assert.equal(stepOf(declined, 'hdr-clip').detail, 'a ten-bit HDR picture became an ordinary 8-bit clip; its colours were not converted (switched off, left off for want of memory, or this FFmpeg cannot)');
+  const unseen = await checkToolchain(await optionsFor({ ffprobePath: await ffprobeThat('s/"color_transfer": "arib-std-b67"/"color_transfer": "bt709"/') }));
+  assert.deepEqual(failedIn(unseen), ['hdr-clip'], 'a look at the picture that does not find its HDR colours is a failed check of that clip, and only of that');
+  assert.match(stepOf(unseen, 'hdr-clip').detail, /^looking at a picture with the colours of HDR video \(HLG\) did not find them$/);
+  const asked = await checkToolchain(await optionsFor({ toneMapping: true }));
+  if (canConvert) {
+    assert.deepEqual(failedIn(asked), [], JSON.stringify(asked.steps.filter((step) => !step.ok)));
+    assert.equal(stepOf(asked, 'hdr-clip').detail, 'a ten-bit HDR picture (HLG) became an ordinary 8-bit clip with the colours of an ordinary video (bt709)');
+  } else {
+    assert.deepEqual(failedIn(asked), ['hdr-clip'], 'a trial that promised what this FFmpeg cannot do is found out');
+    assert.match(stepOf(asked, 'hdr-clip').detail, /the start-up trial found that the colours of HDR video can be converted, but this clip was made without converting them/);
+  }
+});
+
+test('a conversion of HDR colours that spoils the picture, falls back unnoticed or mislabels the clip is caught', needsFfmpeg, async (t) => {
+  if (!(await probeToneMapping('ffmpeg')).works) { t.diagnostic('this FFmpeg cannot convert HDR colours, so there is no conversion to spoil'); return; }
+  const conversion = String.raw`/zscale=t=linear:npl=100.*$/`;
+  const faults: Array<[string, { args: string }, RegExp]> = [
+    ['everything turned black', { args: changingFilter(String.raw`if (graph.includes('zscale')) args[at + 1] = graph.replace(${conversion}, 'lutyuv=y=16:u=128:v=128,format=yuv420p');`) }, /the white bar of the picture was lost on the way to an 8-bit clip/],
+    ['everything turned white', { args: changingFilter(String.raw`if (graph.includes('zscale')) args[at + 1] = graph.replace(${conversion}, 'lutyuv=y=235:u=128:v=128,format=yuv420p');`) }, /the dark ground of the picture was lost on the way to an 8-bit clip/],
+    ['a conversion that FFmpeg refuses, so that the clip is made without it', { args: changingFilter(String.raw`if (graph.includes('zscale')) args[at + 1] = graph.replace('zscale=t=linear:npl=100', 'zscale=t=no-such-curve');`) }, /the start-up trial found that the colours of HDR video can be converted, but this clip was made without converting them/],
+    ['a clip that says its curve is another one', { args: relabelling('-color_trc', 'smpte2084', 'color_trc') }, /the colours were converted but the clip says it is bt709\/smpte2084\/bt709 and not bt709/],
+    ['a clip that says its primaries are other ones', { args: relabelling('-color_primaries', 'bt2020', 'color_primaries') }, /the colours were converted but the clip says it is bt2020\/bt709\/bt709 and not bt709/],
+    ['a clip that says its matrix is another one', { args: relabelling('-colorspace', 'smpte170m', 'colorspace') }, /the colours were converted but the clip says it is bt709\/bt709\/smpte170m and not bt709/],
+  ];
+  for (const [what, changes, message] of faults) {
+    const report = await checkToolchain(await optionsFor({ ffmpegPath: await ffmpegThat(changes), toneMapping: true }));
+    assert.deepEqual(failedIn(report), ['hdr-clip'], `${what}: only the check of the HDR clip is affected`);
+    assert.match(stepOf(report, 'hdr-clip').detail, message, what);
+  }
 });
 
 test('the face follower is checked on a face and fails with a reason when it cannot find one, or when its portrait is missing', needsFfmpeg, async () => {
@@ -657,7 +738,7 @@ test('the render sample makes three seconds of video at the size of real clips, 
   const options = await optionsFor({ ffmpegPath: ffmpeg.path, realSamples: true, clipSize: { width: 180, height: 320 }, machine: sharing(0.1), preset: 'veryfast', crf: 31, clipThreads: 1 });
   const report = await checkToolchain(options);
   assert.deepEqual(failedIn(report), [], JSON.stringify(report.steps.filter((step) => !step.ok)));
-  assert.deepEqual(report.steps.map((step) => step.name), ['machine', 'ffmpeg', 'ffprobe', 'encoders', 'filters', 'fonts', 'test-video', 'captions', 'whole-picture', 'moving-window', 'render-speed']);
+  assert.deepEqual(report.steps.map((step) => step.name), ['machine', 'ffmpeg', 'ffprobe', 'encoders', 'filters', 'fonts', 'test-video', 'captions', 'whole-picture', 'moving-window', 'hdr-clip', 'render-speed']);
   const told = stepOf(report, 'render-speed').detail;
   assert.match(told, /^3 s of 180x320 with captions, from a busy 1920x1080 picture, took \d+\.\d s with preset veryfast and 1 thread \(\d+\.\d times the length of the clip\)$/);
   const [, took, times] = /took (\d+\.\d) s .*\((\d+\.\d) times/.exec(told)!;
@@ -705,7 +786,7 @@ test('with real samples on, everything is checked in order, the speech and the r
   const options = await optionsFor({ whisper: { ...(await sampleWhisper()), threads: 1 }, faceFollowing: true, realSamples: true, clipSize: { width: 144, height: 256 }, machine: sharing(0.5), clipThreads: 1 });
   const report = await checkToolchain(options);
   assert.deepEqual(failedIn(report), [], JSON.stringify(report.steps.filter((step) => !step.ok)));
-  assert.deepEqual(report.steps.map((step) => step.name), ['machine', 'ffmpeg', 'ffprobe', 'encoders', 'filters', 'fonts', 'speech-engine', 'speech-sample', 'test-video', 'captions', 'whole-picture', 'moving-window', 'render-speed', 'face-following']);
+  assert.deepEqual(report.steps.map((step) => step.name), ['machine', 'ffmpeg', 'ffprobe', 'encoders', 'filters', 'fonts', 'speech-engine', 'speech-sample', 'test-video', 'captions', 'whole-picture', 'moving-window', 'hdr-clip', 'render-speed', 'face-following']);
   assert.deepEqual(await readdir(options.workDirectory), []);
 });
 

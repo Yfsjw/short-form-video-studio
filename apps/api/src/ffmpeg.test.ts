@@ -7,6 +7,7 @@ import test, { after, before } from 'node:test';
 import { promisify } from 'node:util';
 import { PlainFailure, plainWords } from './failures.js';
 import { FfmpegAdapter } from './ffmpeg.js';
+import { saysColours } from './hdr.js';
 
 const run = promisify(execFile);
 const hasFfmpeg = await run('ffmpeg', ['-version']).then(() => true, () => false);
@@ -23,6 +24,9 @@ const adapter = new FfmpegAdapter('ffprobe', 'ffmpeg');
 const lavfiVideo = ['-f', 'lavfi', '-i', 'testsrc=duration=2:size=160x120:rate=10'];
 const lavfiSound = (hz: number) => ['-f', 'lavfi', '-i', `sine=frequency=${hz}:duration=2`];
 const encodeVideo = ['-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p'];
+/** A ten-bit picture that says what colours it has (written with FFV1, which every FFmpeg has, so that this does not depend on an encoder). */
+/** Ten bits per colour, with the colours the picture says it has (see `saysColours`; encoder options are not enough on FFmpeg 8) or none. */
+const tenBitSaying = (colours?: string) => ['-f', 'lavfi', '-i', 'testsrc=duration=2:size=160x120:rate=10,format=yuv420p10le', ...lavfiSound(440), ...(colours ? ['-vf', colours] : []), '-c:v', 'ffv1', '-pix_fmt', 'yuv420p10le', '-c:a', 'pcm_s16le'];
 
 /** Makes a file of the kind named and says where it is. */
 async function make(name: string, kind: 'with-sound' | 'sound-first' | 'silent' | 'two-sounds' | 'sound-only' | 'cut-short' | 'garbage'): Promise<string> {
@@ -60,6 +64,26 @@ test('looking at a video tells its size, its length and whether it has any sound
 
   const soundFirst = await adapter.probe(await make('sound-first.mp4', 'sound-first'));
   assert.deepEqual({ width: soundFirst.width, height: soundFirst.height, hasAudio: soundFirst.hasAudio }, { width: 160, height: 120, hasAudio: true }, 'the picture and the sound are found wherever they are in the file, not only in the first place');
+});
+
+test('looking at a video tells which kind of HDR its picture is in: HLG (an iPhone) and PQ (HDR10) are told, and a picture that is ordinary, or does not say, is not', needsFfmpeg, async () => {
+  const kinds: Array<[string, string | undefined, 'hlg' | 'pq' | undefined]> = [
+    ['hlg', saysColours({ primaries: 'bt2020', transfer: 'arib-std-b67', matrix: 'bt2020nc' }), 'hlg'],
+    ['pq', saysColours({ primaries: 'bt2020', transfer: 'smpte2084', matrix: 'bt2020nc' }), 'pq'],
+    ['curve-only', saysColours({ transfer: 'arib-std-b67' }), 'hlg'],
+    ['ten-bit-ordinary', saysColours({ primaries: 'bt709', transfer: 'bt709', matrix: 'bt709' }), undefined],
+    ['ten-bit-silent-about-colours', undefined, undefined],
+  ];
+  for (const [name, colours, expected] of kinds) {
+    const path = join(dir, `hdr-${name}.mkv`);
+    await ffmpeg(...tenBitSaying(colours), path);
+    const result = await adapter.probe(path);
+    assert.equal(result.hdr, expected, name);
+    assert.equal('hdr' in result, expected !== undefined, `${name}: an ordinary picture has no word about HDR at all, not an empty one`);
+    assert.deepEqual({ width: result.width, height: result.height, hasAudio: result.hasAudio }, { width: 160, height: 120, hasAudio: true }, `${name}: and the rest of what it tells is as before`);
+  }
+  const ordinary = await adapter.probe(await make('hdr-not.mp4', 'with-sound'));
+  assert.equal('hdr' in ordinary, false, 'an ordinary 8-bit video');
 });
 
 test('a file that is not a video, is cut short, or has only sound is told as such, in words a person can act on, with the real reason kept', needsFfmpeg, async () => {
@@ -117,6 +141,11 @@ test('whatever the program that looks at a file prints, the file is taken for a 
 
   assert.deepEqual(await probeSaying('picture', say([picture], '2.5')), { durationSeconds: 2.5, width: 160, height: 120, hasAudio: false });
   assert.deepEqual(await probeSaying('both', say([sound, picture], '2.5')), { durationSeconds: 2.5, width: 160, height: 120, hasAudio: true });
+  // HDR is told from the curve of the picture, and only of the picture: nothing else the program prints can make a video HDR.
+  assert.deepEqual(await probeSaying('hlg', say([{ ...picture, color_transfer: 'arib-std-b67' }], '2.5')), { durationSeconds: 2.5, width: 160, height: 120, hasAudio: false, hdr: 'hlg' });
+  assert.deepEqual(await probeSaying('pq', say([sound, { ...picture, color_transfer: 'smpte2084' }], '2.5')), { durationSeconds: 2.5, width: 160, height: 120, hasAudio: true, hdr: 'pq' });
+  assert.deepEqual(await probeSaying('sound-with-a-curve', say([{ ...sound, color_transfer: 'arib-std-b67' }, picture], '2.5')), { durationSeconds: 2.5, width: 160, height: 120, hasAudio: true });
+  for (const curve of ['bt709', 'unknown', 'smpte170m', 'iec61966-2-1']) assert.deepEqual(await probeSaying(`curve-${curve}`, say([{ ...picture, color_transfer: curve }], '2.5')), { durationSeconds: 2.5, width: 160, height: 120, hasAudio: false }, curve);
 
   const unreadable: Array<[string, string]> = [
     ['no streams at all', say([], '2.5')], ['no length', say([picture])], ['a length that is not a number', say([picture], 'N/A')], ['a length of nothing', say([picture], '0')], ['a negative length', say([picture], '-3')],
