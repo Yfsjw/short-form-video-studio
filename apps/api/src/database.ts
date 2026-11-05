@@ -45,6 +45,7 @@ const COLUMNS_ADDED_LATER: Array<{ table: string; name: string; definition: stri
   { table: 'video_jobs', name: 'options_json', definition: 'TEXT' },
   { table: 'video_jobs', name: 'stage_timings_json', definition: 'TEXT' },
   { table: 'video_jobs', name: 'progress', definition: 'INTEGER NOT NULL DEFAULT 0' },
+  { table: 'video_jobs', name: 'audio_sha256', definition: 'TEXT' },
   { table: 'transcript_segments', name: 'words_json', definition: 'TEXT' },
   { table: 'highlight_candidates', name: 'title', definition: 'TEXT' },
   { table: 'generated_clips', name: 'title', definition: 'TEXT' },
@@ -295,6 +296,38 @@ export class StudioDatabase {
       [message, new Date().toISOString(), id, staleBefore]
     );
     return result.rowCount === 1;
+  }
+
+  /** Notes which sound a job listened to (its fingerprint, see transcript-cache.ts), so that deleting the job can also forget what was written down from that sound. */
+  async recordAudioFingerprint(jobId: string, audioSha256: string) {
+    await this.pool.query('UPDATE video_jobs SET audio_sha256 = $1 WHERE id = $2', [audioSha256, jobId]);
+  }
+
+  /** The jobs that are over (done, or failed for good) and have not changed since `before` (an ISO-8601 instant): the ones whose clips are due to be deleted. Oldest first. */
+  async listFinishedJobsOlderThan(before: string, limit = 50): Promise<VideoJob[]> {
+    const result = await this.pool.query(`SELECT * FROM video_jobs WHERE status IN ('completed', 'failed') AND updated_at < $1 ORDER BY updated_at LIMIT $2`, [before, limit]);
+    return result.rows.map((row) => this.mapJob(row)).filter((job): job is VideoJob => Boolean(job));
+  }
+
+  /**
+   * Removes a job that is over together with everything the database holds about it: its clips, its transcript, its highlights, and the transcript
+   * kept for reuse from the sound it listened to. All or nothing. Returns false (and removes nothing) when there is no such job or it is not over: a
+   * job that is still being worked on is never taken away from under the work.
+   */
+  async deleteFinishedJob(jobId: string): Promise<boolean> {
+    let deleted = false;
+    await this.withTransaction(async (client) => {
+      const found = await client.query(`SELECT audio_sha256 FROM video_jobs WHERE id = $1 AND status IN ('completed', 'failed') FOR UPDATE`, [jobId]);
+      if (found.rowCount !== 1) return;
+      const audio: string | null = found.rows[0].audio_sha256;
+      await client.query('DELETE FROM generated_clips WHERE job_id = $1', [jobId]);
+      await client.query('DELETE FROM transcript_segments WHERE job_id = $1', [jobId]);
+      await client.query('DELETE FROM highlight_candidates WHERE job_id = $1', [jobId]);
+      if (audio) await client.query('DELETE FROM transcript_cache WHERE audio_sha256 = $1', [audio]);
+      await client.query('DELETE FROM video_jobs WHERE id = $1', [jobId]);
+      deleted = true;
+    });
+    return deleted;
   }
 
   /** Deletes every clip row of a job before it is re-run, and returns them so their stored files can be removed too. */

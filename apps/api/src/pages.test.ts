@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { GeneratedClip, VideoJob } from './domain.js';
 import { defaultJobOptions } from './domain.js';
-import { renderJobPage, renderUploadPage } from './pages.js';
+import { deletedOn, keptFor, renderDeleteConfirmPage, renderDeletedPage, renderJobPage, renderUploadPage } from './pages.js';
 
 const job = (overrides: Partial<VideoJob> = {}): VideoJob => ({
   id: 'job-1', originalFilename: 'talk.mp4', storedFilename: 'talk.mp4', mimeType: 'video/mp4', sizeBytes: 1, status: 'completed', stage: 'completed', errorMessage: null,
@@ -91,4 +91,76 @@ test('the timings of a job whose transcript was reused say so in plain words', (
   assert.match(html, /<tr><td>Reusing what was heard in this video before<\/td><td>0 s<\/td><\/tr>/);
   assert.doesNotMatch(html, /Listening to the speech/, 'the speech was not listened to this time');
   assert.ok(html.indexOf('Extracting the audio') < html.indexOf('Reusing what was heard') && html.indexOf('Reusing what was heard') < html.indexOf('Finding the best moments') && html.indexOf('Finding the best moments') < html.indexOf('Rendering the clips'), 'in the order things happen');
+});
+
+test('how long clips are kept is said in plain words, in the singular for one day', () => {
+  assert.equal(keptFor(1), 'Clips are deleted a day after they are made.');
+  assert.equal(keptFor(2), 'Clips are deleted 2 days after they are made.');
+  assert.equal(keptFor(14), 'Clips are deleted 14 days after they are made.');
+});
+
+test('the day a job is deleted is counted from when it finished, in UTC, and is not guessed when the time is not a time', () => {
+  assert.equal(deletedOn('2026-10-01T10:05:00.000Z', 14), '2026-10-15');
+  assert.equal(deletedOn('2026-10-01T23:59:59.999Z', 1), '2026-10-02', 'the last moment of a day is still that day');
+  assert.equal(deletedOn('2026-12-20T00:00:00.000Z', 30), '2027-01-19', 'across the end of a year');
+  assert.equal(deletedOn('not a time', 7), undefined);
+  assert.equal(deletedOn('', 7), undefined);
+});
+
+test('a job that is over offers to be deleted, with words that fit what it is; a job that is still being worked on does not', () => {
+  const done = renderJobPage(job(), [clip()]);
+  assert.match(done, /<a class="btn danger" href="\/jobs\/job-1\/delete">Delete this video and its clips<\/a>/);
+  const failed = renderJobPage(job({ status: 'failed', stage: 'failed', errorMessage: 'No speech was found.' }), []);
+  assert.match(failed, /<a class="btn danger" href="\/jobs\/job-1\/delete">Delete this job<\/a>/);
+  for (const [status, stage] of [['queued', 'queued'], ['processing', 'transcribing'], ['processing', 'extracting_clips']] as const) {
+    assert.doesNotMatch(renderJobPage(job({ status, stage, progress: 40 }), []), /\/delete|Delete this/, `a job that is ${status} (${stage}) cannot be deleted`);
+  }
+  assert.doesNotMatch(renderJobPage(job(), [clip()]), /<script/, 'the pages stay free of JavaScript');
+  const hostile = renderJobPage(job({ id: '"><script>alert(1)</script>' }), [clip()]);
+  assert.doesNotMatch(hostile, /<script>alert/, 'the address of the job is escaped where it is put into the page');
+  assert.match(hostile, /href="\/jobs\/&quot;&gt;&lt;script&gt;alert\(1\)&lt;\/script&gt;\/delete"/);
+});
+
+test('the job page says how long clips are kept only when they are, only for a finished job that has clips, and until which day', () => {
+  const kept = renderJobPage(job(), [clip()], Date.now(), { retentionDays: 14 });
+  assert.match(kept, /<p class="muted">Clips are deleted 14 days after they are made\. These are kept until 2026-10-15\. Download the clips you want to keep\.<\/p>/);
+  assert.doesNotMatch(renderJobPage(job(), [clip()]), /Clips are deleted|kept until/, 'nothing is said while clips are kept until a person deletes them');
+  assert.doesNotMatch(renderJobPage(job(), [clip()], Date.now(), { retentionDays: 0 }), /Clips are deleted|kept until/);
+  assert.doesNotMatch(renderJobPage(job(), [], Date.now(), { retentionDays: 14 }), /Clips are deleted|kept until/, 'with no clips there is nothing to download');
+  assert.doesNotMatch(renderJobPage(job(), [clip({ status: 'failed', errorMessage: 'x' })], Date.now(), { retentionDays: 14 }), /Clips are deleted|kept until/, 'nor with only clips that could not be made');
+  assert.doesNotMatch(renderJobPage(job({ status: 'processing', stage: 'transcribing', progress: 50 }), [clip()], Date.now(), { retentionDays: 14 }), /Clips are deleted|kept until/, 'the clock starts when the job is over');
+  assert.doesNotMatch(renderJobPage(job({ status: 'failed', stage: 'failed', errorMessage: 'x' }), [clip()], Date.now(), { retentionDays: 14 }), /Clips are deleted|kept until/, 'a failed job promises no clips');
+  const unknownDay = renderJobPage(job({ updatedAt: 'garbage', stageTimings: { transcribing: 1000 } }), [clip()], Date.now(), { retentionDays: 14 });
+  assert.match(unknownDay, /Clips are deleted 14 days after they are made\. Download the clips you want to keep\./);
+  assert.doesNotMatch(unknownDay, /kept until|NaN|undefined|Invalid/, 'no day is made up');
+});
+
+test('the upload page says how long clips are kept, and says nothing when they are kept until deleted', () => {
+  assert.match(renderUploadPage({ ...uploadInfo, retentionDays: 30 }), /<p class="notice">Clips are deleted 30 days after they are made\. Download the clips you want to keep\.<\/p>/);
+  assert.match(renderUploadPage({ ...uploadInfo, retentionDays: 1 }), /Clips are deleted a day after they are made\./);
+  assert.doesNotMatch(renderUploadPage(uploadInfo), /Clips are deleted/);
+  assert.doesNotMatch(renderUploadPage({ ...uploadInfo, retentionDays: 0 }), /Clips are deleted/);
+});
+
+test('the page that asks before deleting says what is lost, posts with a plain form, offers the way back, and escapes what came from the video', () => {
+  const page = renderDeleteConfirmPage(job({ id: 'job-9', originalFilename: '<b>talk</b>.mp4' }));
+  assert.match(page, /<form method="post" action="\/jobs\/job-9\/delete"><button type="submit" class="danger">Yes, delete it for good<\/button><\/form>/);
+  assert.match(page, /<a href="\/jobs\/job-9">No, keep it<\/a>/);
+  assert.match(page, /cannot be undone/);
+  assert.match(page, /Clips you already downloaded stay where you saved them/);
+  assert.doesNotMatch(page, /<b>talk/);
+  assert.match(page, /&lt;b&gt;talk&lt;\/b&gt;\.mp4/);
+  assert.doesNotMatch(page, /<script/);
+  assert.match(page, /The clips made from it, its transcript and the record of this job are deleted for good\./, 'what is lost is said');
+  const hostile = renderDeleteConfirmPage(job({ id: '"><script>alert(1)</script>' }));
+  assert.doesNotMatch(hostile, /<script>alert/, 'the address of the job is escaped where it is put into the form and the link');
+  assert.equal((hostile.match(/&quot;&gt;&lt;script&gt;alert\(1\)&lt;\/script&gt;/g) ?? []).length, 2);
+});
+
+test('the page shown after deleting says so and leads on, with nothing about the job in it', () => {
+  const page = renderDeletedPage();
+  assert.match(page, /<h1>Deleted<\/h1>/);
+  assert.match(page, /were deleted/);
+  assert.match(page, /<a href="\/test-upload">Upload another video<\/a>/);
+  assert.doesNotMatch(page, /<script|job-1|talk\.mp4/);
 });

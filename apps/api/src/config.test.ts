@@ -132,3 +132,12 @@ test('transcripts are kept for 30 days by default, never for longer than a year,
   assert.equal(loadConfig({ TRANSCRIPT_CACHE_DAYS: '365' }).TRANSCRIPT_CACHE_DAYS, 365);
   for (const bad of ['-1', '366', '1.5', 'many']) assert.throws(() => loadConfig({ TRANSCRIPT_CACHE_DAYS: bad }), Error, `${bad} days`);
 });
+
+test('CLIP_RETENTION_DAYS keeps clips until a person deletes them by default, accepts 1 to 3650 days, and rejects what is not a number of days', () => {
+  assert.equal(loadConfig({}).CLIP_RETENTION_DAYS, 0);
+  assert.equal(loadConfig({ CLIP_RETENTION_DAYS: '0' }).CLIP_RETENTION_DAYS, 0);
+  assert.equal(loadConfig({ CLIP_RETENTION_DAYS: '1' }).CLIP_RETENTION_DAYS, 1);
+  assert.equal(loadConfig({ CLIP_RETENTION_DAYS: '30' }).CLIP_RETENTION_DAYS, 30);
+  assert.equal(loadConfig({ CLIP_RETENTION_DAYS: '3650' }).CLIP_RETENTION_DAYS, 3650);
+  for (const bad of ['-1', '3651', '1.5', 'week', 'forever']) assert.throws(() => loadConfig({ CLIP_RETENTION_DAYS: bad }), Error, `${bad} days`);
+});

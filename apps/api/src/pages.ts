@@ -30,6 +30,7 @@ const STYLE = `
   details[open] summary{margin-bottom:10px}
   button,.btn{display:block;width:100%;text-align:center;padding:14px 16px;border:0;border-radius:12px;background:var(--accent);color:var(--accent-text);font:inherit;font-weight:700;text-decoration:none;cursor:pointer}
   .btn.secondary{background:transparent;color:var(--accent);border:1px solid var(--accent)}
+  .danger{background:transparent;color:var(--bad);border:1px solid var(--bad)}
   .notice{white-space:pre-wrap;word-break:break-word;color:var(--muted);font-size:.9rem;margin:0}
   progress{width:100%;height:14px;border-radius:7px;overflow:hidden;appearance:none;-webkit-appearance:none;border:0;background:var(--track);display:block}
   progress::-webkit-progress-bar{background:var(--track)}
@@ -77,6 +78,8 @@ export interface UploadPageInfo {
   clipSize: { width: number; height: number };
   /** Whether this server can follow a face (FACE_FRAMING_ENABLED); the choice is only offered when it can. */
   faceFraming: boolean;
+  /** CLIP_RETENTION_DAYS: how many days clips are kept (nothing is said when they are kept until a person deletes them). */
+  retentionDays?: number;
 }
 
 export function renderUploadPage(info: UploadPageInfo): string {
@@ -148,7 +151,19 @@ export function renderUploadPage(info: UploadPageInfo): string {
   </details>
   <button type="submit">Upload video</button>
 </form>
-<p class="notice">Large videos take a while to upload over a mobile connection. Keep this page open and the screen on until the next page appears. Videos are processed one at a time, and videos over about 100 MB have not been tested on this server yet.</p>`);
+<p class="notice">Large videos take a while to upload over a mobile connection. Keep this page open and the screen on until the next page appears. Videos are processed one at a time, and videos over about 100 MB have not been tested on this server yet.</p>${info.retentionDays ? `
+<p class="notice">${escapeHtml(keptFor(info.retentionDays))} Download the clips you want to keep.</p>` : ''}`);
+}
+
+/** How long clips are kept, in a sentence (for a number of days above 0). */
+export function keptFor(days: number): string {
+  return `Clips are deleted ${days === 1 ? 'a day' : `${days} days`} after they are made.`;
+}
+
+/** The day (UTC, as YYYY-MM-DD) a job that last changed at `updatedAt` is deleted when clips are kept for `days` days; nothing when the time is not a time. */
+export function deletedOn(updatedAt: string, days: number): string | undefined {
+  const finished = Date.parse(updatedAt);
+  return Number.isFinite(finished) ? new Date(finished + days * 86_400_000).toISOString().slice(0, 10) : undefined;
 }
 
 export function renderMessagePage(title: string, message: string, link: { href: string; text: string } = { href: '/test-upload', text: 'Try again' }): string {
@@ -165,13 +180,13 @@ function whyThisMoment(clip: GeneratedClip): string {
 
 const STAGE_ORDER = ['preparing_source', 'saving_source', 'restoring_source', 'probing_video', 'extracting_audio', 'transcribing', 'reusing_transcript', 'detecting_highlights', 'extracting_clips'];
 
-export function renderJobPage(job: VideoJob, clips: GeneratedClip[], now: number = Date.now()): string {
+export function renderJobPage(job: VideoJob, clips: GeneratedClip[], now: number = Date.now(), options: { retentionDays?: number } = {}): string {
   const stillWorking = job.status !== 'completed' && job.status !== 'failed';
   const finished = job.status === 'completed';
   const readyClips = clips.filter((clip) => clip.status === 'completed');
   const unmadeClips = clips.filter((clip) => clip.status === 'failed').length;
   const elapsedMs = Math.max(0, now - Date.parse(job.createdAt));
-  const clipUrl = (clip: GeneratedClip) => `/api/jobs/${job.id}/clips/${clip.id}`;
+  const clipUrl = (clip: GeneratedClip) => escapeHtml(`/api/jobs/${job.id}/clips/${clip.id}`);
   const length = (clip: GeneratedClip) => (clip.durationSeconds ? `${Math.round(clip.durationSeconds)} s` : '');
   const timings = STAGE_ORDER.filter((stage) => job.stageTimings[stage] !== undefined).map((stage) => `<tr><td>${escapeHtml(stageLabel(stage))}</td><td>${formatDuration(job.stageTimings[stage])}</td></tr>`).join('');
 
@@ -199,14 +214,39 @@ export function renderJobPage(job: VideoJob, clips: GeneratedClip[], now: number
 </section>`).join('')
     : readyClips.map((clip) => `<a class="btn" style="margin:0 0 12px" href="${clipUrl(clip)}?download=1">Download clip (${length(clip)})</a>`).join('');
 
+  const over = finished || job.status === 'failed';
+  const until = options.retentionDays ? deletedOn(job.updatedAt, options.retentionDays) : undefined;
+  const keeping = finished && readyClips.length && options.retentionDays
+    ? `<p class="muted">${escapeHtml(keptFor(options.retentionDays))}${until ? ` These are kept until ${until}.` : ''} Download the clips you want to keep.</p>` : '';
   return shell('Job status', `
 <h1>${heading}</h1>
 <p class="lead" style="word-break:break-word">${escapeHtml(job.originalFilename)}</p>
 ${status}
 ${clipSection}
 ${timings && finished ? `<details class="card"><summary>Where the time went</summary><table>${timings}</table></details>` : ''}
-<p><a href="/test-upload">Upload another video</a></p>
+${keeping}
+<p><a href="/test-upload">Upload another video</a></p>${over ? `
+<p><a class="btn danger" href="/jobs/${escapeHtml(job.id)}/delete">${finished ? 'Delete this video and its clips' : 'Delete this job'}</a></p>` : ''}
 <p class="id">Job ${escapeHtml(job.id)}</p>`, { refreshSeconds: stillWorking ? 5 : undefined });
+}
+
+/** Asks once more before a job is deleted: what is deleted for good cannot be brought back. */
+export function renderDeleteConfirmPage(job: VideoJob): string {
+  const id = escapeHtml(job.id);
+  return shell('Delete this video?', `
+<h1>Delete this video?</h1>
+<p class="lead" style="word-break:break-word">${escapeHtml(job.originalFilename)}</p>
+<div class="card">The clips made from it, its transcript and the record of this job are deleted for good. This cannot be undone. Clips you already downloaded stay where you saved them.</div>
+<form method="post" action="/jobs/${id}/delete"><button type="submit" class="danger">Yes, delete it for good</button></form>
+<p><a href="/jobs/${id}">No, keep it</a></p>`);
+}
+
+/** What is shown after a job was deleted. */
+export function renderDeletedPage(): string {
+  return shell('Deleted', `
+<h1>Deleted</h1>
+<div class="card">The clips, the transcript and the record of the job were deleted.</div>
+<p><a href="/test-upload">Upload another video</a></p>`);
 }
 
 /** The page where the access code is typed (see access.ts). `next` is where the person goes afterwards; it has been checked by safeNextPath. */

@@ -1429,3 +1429,256 @@ test('at start-up the server tries converting HDR colours once and says what it 
   assert.equal(real.line?.toneMapping?.works, canConvert);
   assert.equal(real.log.filter((entry) => entry.msg?.startsWith('HDR video:')).length, 1, 'once');
 });
+
+// ---- Deleting a job, and how long clips are kept ---------------------------------------------------------------------------------
+
+/** A job made directly in the database and in storage, with no video processed: what the routes that delete act on. It is made as new (its row and its clips together, so that nothing sees it half made) and then given its age. */
+async function makeJobToDelete(server: RunningServer, schema: string, options: { status?: 'completed' | 'failed' | 'processing' | 'queued'; ageDays?: number; clipCount?: number } = {}) {
+  const id = randomUUID(); const status = options.status ?? 'completed'; const stamp = new Date().toISOString();
+  await server.studio.db.createJob({ id, originalFilename: 'match.mp4', storedFilename: `${randomUUID()}.mp4`, mimeType: 'video/mp4', sizeBytes: 1, status, stage: status, errorMessage: status === 'failed' ? 'This video has no sound.' : null, durationSeconds: 8, width: 320, height: 240, createdAt: stamp, updatedAt: stamp });
+  const keys: string[] = [];
+  for (let index = 0; index < (options.clipCount ?? 1); index += 1) {
+    const clipId = randomUUID();
+    await server.studio.db.createClip({ id: clipId, jobId: id, candidateId: 'c', startSeconds: 0, endSeconds: 5, durationSeconds: 5, outputPath: `${id}/${clipId}.mp4`, outputFilename: `${clipId}.mp4`, status: 'completed', errorMessage: null, captionPath: null, createdAt: stamp, updatedAt: stamp, title: 'A clip', score: null, reasons: [], framing: null });
+    for (const key of [`${id}/${clipId}.mp4`, `${id}/${clipId}.srt`]) { (server.storage as MemoryStorage).objects.set(key, Buffer.from('stored')); keys.push(key); }
+  }
+  if (options.ageDays) await admin.query(`UPDATE "${schema}".video_jobs SET updated_at = $1 WHERE id = $2`, [new Date(Date.now() - options.ageDays * 86_400_000).toISOString(), id]);
+  return { id, keys };
+}
+/** Servers that have jobs not yet over must not have them taken over by the check for abandoned jobs while a test is looking. */
+const patient = { JOB_STALE_AFTER_SECONDS: '600' };
+const stillStored = (server: RunningServer, keys: string[]) => keys.filter((key) => (server.storage as MemoryStorage).objects.has(key));
+
+test('the API deletes a job that is over together with its clips, and says why it cannot delete one that is still being worked on, one that is not there, or one whose files storage will not delete', async () => {
+  const schema = schemaName('delete_api'); const server = await start({ schema, env: patient });
+  try {
+    const done = await makeJobToDelete(server, schema, { clipCount: 2 }); const other = await makeJobToDelete(server, schema);
+    const deleted = await fetch(`${server.base}/api/jobs/${done.id}`, { method: 'DELETE' });
+    assert.equal(deleted.status, 204);
+    assert.equal(await deleted.text(), '', 'nothing is said when it is done');
+    assert.deepEqual(stillStored(server, done.keys), [], 'every file of the job is gone from storage');
+    const gone = await fetch(`${server.base}/api/jobs/${done.id}`);
+    assert.equal(gone.status, 404);
+    assert.equal(((await gone.json()) as { error: { code: string } }).error.code, 'JOB_NOT_FOUND');
+    assert.equal((await fetch(`${server.base}/api/jobs/${done.id}/transcript`)).status, 404);
+    assert.equal((await fetch(`${server.base}/api/jobs/${other.id}`)).status, 200, 'another job is not touched');
+    assert.deepEqual(stillStored(server, other.keys), other.keys);
+
+    const again = await fetch(`${server.base}/api/jobs/${done.id}`, { method: 'DELETE' });
+    assert.equal(again.status, 404, 'a job that is gone cannot be deleted again');
+    assert.deepEqual(((await again.json()) as { error: unknown }).error, { code: 'JOB_NOT_FOUND', message: 'No processing job exists for this id.' });
+    assert.equal((await fetch(`${server.base}/api/jobs/${randomUUID()}`, { method: 'DELETE' })).status, 404);
+
+    for (const status of ['queued', 'processing'] as const) {
+      const running = await makeJobToDelete(server, schema, { status });
+      const refused = await fetch(`${server.base}/api/jobs/${running.id}`, { method: 'DELETE' });
+      assert.equal(refused.status, 409, status);
+      assert.deepEqual(((await refused.json()) as { error: unknown }).error, { code: 'JOB_NOT_FINISHED', message: 'This video is still being processed. It can be deleted when it is finished.' }, status);
+      assert.equal((await fetch(`${server.base}/api/jobs/${running.id}`)).status, 200, `${status}: still there`);
+      assert.deepEqual(stillStored(server, running.keys), running.keys, `${status}: and so are its files`);
+    }
+
+    const stuck = await makeJobToDelete(server, schema); const memory = server.storage as MemoryStorage;
+    memory.failDeletes = true;
+    const failed = await fetch(`${server.base}/api/jobs/${stuck.id}`, { method: 'DELETE' });
+    assert.equal(failed.status, 503);
+    const body = await failed.json() as { error: { code: string; message: string } };
+    assert.deepEqual(body.error, { code: 'DELETE_FAILED', message: 'The files of this video could not be deleted right now, and nothing was removed. Please try again in a moment.' });
+    assert.ok(!JSON.stringify(body).includes('simulated storage outage'), 'what storage said stays in the log');
+    assert.equal((await fetch(`${server.base}/api/jobs/${stuck.id}`)).status, 200, 'the job is still there to be deleted again');
+    memory.failDeletes = false;
+    assert.equal((await fetch(`${server.base}/api/jobs/${stuck.id}`, { method: 'DELETE' })).status, 204, 'and it is, once storage works');
+    assert.deepEqual(stillStored(server, stuck.keys), []);
+  } finally { await server.stop(); await dropSchema(schema); }
+});
+
+test('the pages offer deleting only for a job that is over, ask once more first, and do it with a plain form, with no JavaScript', async () => {
+  const schema = schemaName('delete_pages'); const server = await start({ schema, env: patient });
+  try {
+    const done = await makeJobToDelete(server, schema); const failed = await makeJobToDelete(server, schema, { status: 'failed', clipCount: 0 }); const running = await makeJobToDelete(server, schema, { status: 'processing' });
+    const page = (path: string) => fetch(`${server.base}${path}`);
+
+    const finishedPage = await (await page(`/jobs/${done.id}`)).text();
+    assert.match(finishedPage, new RegExp(`<a class="btn danger" href="/jobs/${done.id}/delete">Delete this video and its clips</a>`), 'a finished job has a way to delete it');
+    assert.match(await (await page(`/jobs/${failed.id}`)).text(), new RegExp(`href="/jobs/${failed.id}/delete">Delete this job</a>`), 'so has one that failed, in words that do not speak of clips');
+    assert.doesNotMatch(await (await page(`/jobs/${running.id}`)).text(), /\/delete|Delete this/, 'a job that is still being worked on has none');
+
+    const ask = await page(`/jobs/${done.id}/delete`);
+    assert.equal(ask.status, 200);
+    const asking = await ask.text();
+    assert.match(asking, /<h1>Delete this video\?<\/h1>/);
+    assert.match(asking, new RegExp(`<form method="post" action="/jobs/${done.id}/delete"><button type="submit" class="danger">Yes, delete it for good</button></form>`));
+    assert.match(asking, new RegExp(`<a href="/jobs/${done.id}">No, keep it</a>`));
+    assert.match(asking, /cannot be undone/);
+    assert.doesNotMatch(asking, /<script/i, 'the pages have no JavaScript at all');
+    assert.deepEqual(stillStored(server, done.keys), done.keys, 'asking deletes nothing');
+    assert.equal((await fetch(`${server.base}/api/jobs/${done.id}`)).status, 200);
+
+    const notYet = await page(`/jobs/${running.id}/delete`);
+    assert.equal(notYet.status, 409);
+    assert.match(await notYet.text(), /still being processed[\s\S]*Back to the video/);
+    const nobody = await page(`/jobs/${randomUUID()}/delete`);
+    assert.equal(nobody.status, 404);
+    assert.match(await nobody.text(), /No job exists for this id\./);
+
+    const doIt = await fetch(`${server.base}/jobs/${done.id}/delete`, { method: 'POST' });
+    assert.equal(doIt.status, 200);
+    const result = await doIt.text();
+    assert.match(result, /<h1>Deleted<\/h1>[\s\S]*were deleted\.[\s\S]*Upload another video/);
+    assert.doesNotMatch(result, /class="card error"/, 'it is not shown as an error');
+    assert.deepEqual(stillStored(server, done.keys), []);
+    assert.equal((await page(`/jobs/${done.id}`)).status, 404, 'the page of a deleted job is the page of a job that is not there');
+    assert.equal((await fetch(`${server.base}/jobs/${done.id}/delete`, { method: 'POST' })).status, 404, 'and deleting it again finds nothing');
+
+    const refused = await fetch(`${server.base}/jobs/${running.id}/delete`, { method: 'POST' });
+    assert.equal(refused.status, 409);
+    assert.equal((await fetch(`${server.base}/api/jobs/${running.id}`)).status, 200, 'a job that is still being worked on is not deleted by a form either');
+
+    const memory = server.storage as MemoryStorage; memory.failDeletes = true;
+    const stuck = await fetch(`${server.base}/jobs/${failed.id}/delete`, { method: 'POST' });
+    assert.equal(stuck.status, 503);
+    const stuckPage = await stuck.text();
+    assert.match(stuckPage, /could not be deleted right now[\s\S]*Back to the video/);
+    assert.ok(!stuckPage.includes('simulated storage outage'));
+    memory.failDeletes = false;
+    assert.equal((await fetch(`${server.base}/jobs/${failed.id}/delete`, { method: 'POST' })).status, 200);
+  } finally { await server.stop(); await dropSchema(schema); }
+});
+
+test('what is said about how long clips are kept: nothing unless CLIP_RETENTION_DAYS is set, and then the upload page, the job page and the page of a job that is gone say it', async () => {
+  const keptSentence = /Clips are deleted 14 days after they are made\./;
+  for (const days of [undefined, '14'] as const) {
+    const schema = schemaName('retention_pages'); const server = await start({ schema, env: days ? { CLIP_RETENTION_DAYS: days } : {} });
+    try {
+      const done = await makeJobToDelete(server, schema, { ageDays: 3 }); const failed = await makeJobToDelete(server, schema, { status: 'failed', clipCount: 0 });
+      const upload = await (await fetch(`${server.base}/test-upload`)).text();
+      const job = await (await fetch(`${server.base}/jobs/${done.id}`)).text();
+      const jobFailed = await (await fetch(`${server.base}/jobs/${failed.id}`)).text();
+      const missing = await (await fetch(`${server.base}/jobs/${randomUUID()}`)).text();
+      if (!days) {
+        for (const html of [upload, job, jobFailed, missing]) assert.doesNotMatch(html, /Clips are deleted|are kept until/, 'with clips kept until they are deleted, nothing is promised');
+        continue;
+      }
+      assert.match(upload, /<p class="notice">Clips are deleted 14 days after they are made\. Download the clips you want to keep\.<\/p>/);
+      const until = new Date(Date.now() - 3 * 86_400_000 + 14 * 86_400_000).toISOString().slice(0, 10);
+      assert.match(job, keptSentence);
+      assert.ok(job.includes(`These are kept until ${until}.`), `the day is counted from when the job finished (${until})`);
+      assert.doesNotMatch(jobFailed, /These are kept until/, 'a job that made no clips has none to keep');
+      assert.match(missing, /No job exists for this id\. Clips are deleted 14 days after they are made\./, 'a job that is not there may be one that was deleted by the clock, and the page says so');
+    } finally { await server.stop(); await dropSchema(schema); }
+  }
+});
+
+test('with CLIP_RETENTION_DAYS the server itself deletes the jobs that are older than that, with their clips, and keeps the others; the log says what is kept at start-up', async () => {
+  const schema = schemaName('retention_e2e'); const lines: string[] = [];
+  const server = await start({ schema, env: { CLIP_RETENTION_DAYS: '7', ...patient }, extra: { ...capturing(lines), retention: { firstSweepMs: 20, intervalMs: 60 } } });
+  try {
+    const kept = readLog(lines).find((entry) => entry.msg?.startsWith('Clips are deleted 7 days after'));
+    assert.ok(kept, 'the log says how long clips are kept');
+    const old = await makeJobToDelete(server, schema, { ageDays: 10, clipCount: 2 }); const young = await makeJobToDelete(server, schema, { ageDays: 6 });
+    const running = await makeJobToDelete(server, schema, { status: 'processing', ageDays: 20 });
+    await eventually('the job that is ten days old to be deleted by the server itself', async () => (await fetch(`${server.base}/api/jobs/${old.id}`)).status, (status) => status === 404);
+    assert.deepEqual(stillStored(server, old.keys), [], 'with its clips');
+    await sleep(200);
+    assert.equal((await fetch(`${server.base}/api/jobs/${young.id}`)).status, 200, 'six days is not older than seven');
+    assert.deepEqual(stillStored(server, young.keys), young.keys);
+    assert.equal((await fetch(`${server.base}/api/jobs/${running.id}`)).status, 200, 'a job that is still being worked on is never deleted by the clock, however long ago it began');
+    const told = readLog(lines).find((entry) => entry.msg === 'Deleted the clips that are older than they are kept');
+    assert.ok(told, 'and what was deleted is in the log');
+  } finally { await server.stop(); await dropSchema(schema); }
+
+  const quietSchema = schemaName('retention_off'); const quietLines: string[] = [];
+  const quiet = await start({ schema: quietSchema, extra: { ...capturing(quietLines), retention: { firstSweepMs: 20, intervalMs: 30 } } });
+  try {
+    const ancient = await makeJobToDelete(quiet, quietSchema, { ageDays: 4000 });
+    await sleep(200);
+    assert.equal((await fetch(`${quiet.base}/api/jobs/${ancient.id}`)).status, 200, 'by default nothing is ever deleted by the clock');
+    assert.ok(readLog(quietLines).some((entry) => entry.msg === 'Clips are kept until a person deletes them (CLIP_RETENTION_DAYS is 0)'));
+  } finally { await quiet.stop(); await dropSchema(quietSchema); }
+});
+
+test('with no durable storage (local-only mode) deleting a finished job removes its clips and its video from the server\'s own disk, and nothing of any other job', needsFfmpeg, async () => {
+  const schema = schemaName('delete_local'); const server = await start({ schema, storage: new NullStorage() });
+  try {
+    const first = await uploadAndFinish(server); await untilSettled(server);
+    const second = await uploadAndFinish(server); await untilSettled(server);
+    assert.equal(first.job.status, 'completed', first.job.errorMessage ?? '');
+    assert.equal(second.job.status, 'completed', second.job.errorMessage ?? '');
+    const outputs = async () => (await readdir(server.dirs.OUTPUT_DIR)).sort();
+    const uploads = async () => (await readdir(server.dirs.UPLOAD_DIR)).sort();
+    assert.deepEqual(await outputs(), [first.job.id, second.job.id].sort(), 'the clips are on the server\'s own disk, a folder for each job');
+    const videosBefore = await uploads();
+
+    assert.equal((await fetch(`${server.base}/api/jobs/${first.job.id}`, { method: 'DELETE' })).status, 204);
+    assert.deepEqual(await outputs(), [second.job.id], 'the clips of the job are gone from the disk, and the other job keeps its own');
+    assert.equal((await fetch(`${server.base}/api/jobs/${first.job.id}/clips/${first.clips[0].id}`, { redirect: 'manual' })).status, 404, 'a clip that was deleted cannot be fetched');
+    assert.equal((await fetch(`${server.base}/api/jobs/${second.job.id}/clips/${second.clips[0].id}`, { redirect: 'manual' })).status, 200, 'and the other job\'s clips still play');
+    assert.equal((await uploads()).length, videosBefore.length - 1, 'the video that was uploaded for the job went with it, the other one stays');
+    assert.equal((await fetch(`${server.base}/api/jobs/${second.job.id}`, { method: 'DELETE' })).status, 204);
+    assert.deepEqual(await outputs(), [], 'nothing of either job is left');
+    assert.deepEqual(await uploads(), [], 'neither is the video of either');
+  } finally { await server.stop(); await dropSchema(schema); }
+});
+
+test('the log says that a person asked for a deletion, whether through the API or through the page, and which job it was', async () => {
+  const schema = schemaName('delete_log'); const lines: string[] = [];
+  const server = await start({ schema, env: patient, extra: { ...capturing(lines) } });
+  try {
+    const viaApi = await makeJobToDelete(server, schema, { clipCount: 1 }); const viaPage = await makeJobToDelete(server, schema, { clipCount: 1 });
+    assert.equal((await fetch(`${server.base}/api/jobs/${viaApi.id}`, { method: 'DELETE' })).status, 204);
+    assert.equal((await fetch(`${server.base}/jobs/${viaPage.id}/delete`, { method: 'POST' })).status, 200);
+    const told = readLog(lines).filter((entry) => entry.msg?.startsWith('Deleted a job'));
+    assert.deepEqual(told.map((entry) => entry.msg), ['Deleted a job at the request of the person who made it', 'Deleted a job at the request of the person who made it']);
+    assert.deepEqual(told.map((entry) => (entry as unknown as { jobId: string }).jobId), [viaApi.id, viaPage.id]);
+  } finally { await server.stop(); await dropSchema(schema); }
+});
+
+test('stopping the server stops the look for old jobs: a look that was about to happen does not happen once the server is stopped', async () => {
+  const schema = schemaName('retention_stop');
+  const server = await start({ schema, env: { CLIP_RETENTION_DAYS: '7', ...patient }, extra: { retention: { firstSweepMs: 150, intervalMs: 150 } } });
+  let looks = 0;
+  server.studio.retention.sweep = async () => { looks += 1; return { erased: 0, failed: 0 }; };
+  try { await server.stop(); await sleep(450); } finally { await dropSchema(schema); }
+  assert.equal(looks, 0, 'the database is closed by then: nothing may look into it any more');
+});
+
+test('deleting needs the access code like everything else, and with the code it works', async () => {
+  const schema = schemaName('delete_gate'); const server = await start({ schema, env: { ...gated, ...patient }, extra: noDelay });
+  try {
+    const job = await makeJobToDelete(server, schema);
+    const without = await fetch(`${server.base}/api/jobs/${job.id}`, { method: 'DELETE' });
+    assert.equal(without.status, 401);
+    assert.equal(((await without.json()) as { error: { code: string } }).error.code, 'ACCESS_CODE_REQUIRED');
+    assert.equal((await fetch(`${server.base}/jobs/${job.id}/delete`, manual())).status, 302, 'the page that asks is behind the way in');
+    assert.equal((await fetch(`${server.base}/jobs/${job.id}/delete`, { method: 'POST' })).status, 401);
+    assert.deepEqual(stillStored(server, job.keys), job.keys, 'nothing was deleted for someone without the code');
+    assert.equal((await fetch(`${server.base}/api/jobs/${job.id}`, { headers: { 'x-access-code': ACCESS_CODE } })).status, 200);
+    const refused = await fetch(`${server.base}/api/jobs/${job.id}`, { method: 'DELETE', headers: { 'x-access-code': 'not-the-code-1' } });
+    assert.equal(refused.status, 401);
+    const allowed = await fetch(`${server.base}/api/jobs/${job.id}`, { method: 'DELETE', headers: { 'x-access-code': ACCESS_CODE } });
+    assert.equal(allowed.status, 204);
+    assert.deepEqual(stillStored(server, job.keys), []);
+  } finally { await server.stop(); await dropSchema(schema); }
+});
+
+test('a real upload, once it is done, can be deleted: every file the pipeline stored for it, its transcript, and the transcript kept from its sound are gone', needsFfmpeg, async () => {
+  const schema = schemaName('delete_real'); const raw = new Pool({ connectionString: TEST_DATABASE_URL, options: `-c search_path="${schema}"` });
+  const server = await start({ schema, transcriber: { cacheKey: 'e2e-engine|1', transcribe: (audioPath, workDir, onProgress) => talk.transcribe(audioPath, workDir, onProgress) } });
+  try {
+    const finished = await uploadAndFinish(server); await untilSettled(server);
+    assert.equal(finished.job.status, 'completed', finished.job.errorMessage ?? '');
+    const id = finished.job.id; const memory = server.storage as MemoryStorage;
+    assert.ok([...memory.objects.keys()].some((key) => key.startsWith(`${id}/`)), 'the clips are in storage');
+    assert.equal((await raw.query('SELECT count(*)::int AS n FROM transcript_cache')).rows[0].n, 1, 'the transcript is kept for the next time this sound comes');
+    assert.equal((await raw.query('SELECT audio_sha256 FROM video_jobs WHERE id = $1', [id])).rows[0].audio_sha256?.length, 64, 'and the job noted which sound that was');
+    const other = await makeJobToDelete(server, schema);
+
+    const gone = await fetch(`${server.base}/api/jobs/${id}`, { method: 'DELETE' });
+    assert.equal(gone.status, 204);
+    assert.deepEqual([...memory.objects.keys()].filter((key) => key.includes(id)), [], 'not one object of the job is left in storage, under the job or under sources/');
+    assert.deepEqual((await raw.query('SELECT (SELECT count(*)::int FROM video_jobs WHERE id = $1) AS jobs, (SELECT count(*)::int FROM generated_clips WHERE job_id = $1) AS clips, (SELECT count(*)::int FROM transcript_segments WHERE job_id = $1) AS segments, (SELECT count(*)::int FROM highlight_candidates WHERE job_id = $1) AS candidates, (SELECT count(*)::int FROM transcript_cache) AS cached', [id])).rows[0], { jobs: 0, clips: 0, segments: 0, candidates: 0, cached: 0 });
+    assert.equal((await readdir(server.dirs.OUTPUT_DIR)).includes(id), false);
+    assert.deepEqual(stillStored(server, other.keys), other.keys, 'what belongs to other jobs stays');
+    assert.equal((await fetch(`${server.base}/api/jobs/${id}/clips/${finished.clips[0].id}`, { redirect: 'manual' })).status, 404, 'and a clip that was deleted cannot be fetched');
+  } finally { await raw.end(); await server.stop(); await dropSchema(schema); }
+});

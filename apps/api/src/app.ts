@@ -25,7 +25,8 @@ import { KeepAwake } from './keepawake.js';
 import { FailedAttemptLimiter, createAccessGate } from './access.js';
 import { installAccessGate } from './access-http.js';
 import { parseJobOptions } from './options.js';
-import { escapeHtml, renderJobPage, renderMessagePage, renderUploadPage } from './pages.js';
+import { escapeHtml, keptFor, renderDeleteConfirmPage, renderDeletedPage, renderJobPage, renderMessagePage, renderUploadPage } from './pages.js';
+import { JobEraser, RetentionSweeper, type RetentionOptions } from './retention.js';
 import { PlainFailure, onlyVideos, plainWords } from './failures.js';
 import { decideToneMapping, probeToneMapping, type ToneMappingSupport } from './hdr.js';
 
@@ -76,9 +77,18 @@ export interface AppOverrides {
   machine?: () => Promise<MachineLimits>;
   /** What the trial of converting HDR colours finds (a stand-in for tests; production passes nothing and FFmpeg is asked, see hdr.ts). Not asked at all when CLIP_TONE_MAP_HDR is off, or is `auto` on a machine with little memory. */
   toneMapping?: () => Promise<ToneMappingSupport>;
+  /** When and how the clips that are older than CLIP_RETENTION_DAYS are looked for (default: a minute after the start, then every hour; tests look when they want to). */
+  retention?: Partial<Omit<RetentionOptions, 'days'>>;
 }
 
 const DEFAULT_BOOT_RECOVERY_WAIT_MS = 30_000;
+
+/** What a person is told, and with which status and code, when a job was not deleted (a job that was deleted needs no words). */
+const notDeleted = {
+  missing: { status: 404, code: 'JOB_NOT_FOUND', message: 'No processing job exists for this id.' },
+  'not finished': { status: 409, code: 'JOB_NOT_FINISHED', message: 'This video is still being processed. It can be deleted when it is finished.' },
+  'storage failed': { status: 503, code: 'DELETE_FAILED', message: 'The files of this video could not be deleted right now, and nothing was removed. Please try again in a moment.' },
+} as const;
 
 export async function createApp(config: AppConfig, overrides: AppOverrides = {}) {
   const durableStorage = overrides.storage ?? createStorage(config);
@@ -132,6 +142,14 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
   // Forget the transcripts nobody has asked for lately; with 0 days (nothing is to be kept) that is all of them, so switching the cache off also clears it.
   // Best effort: housekeeping must never stop the server from starting.
   db.pruneTranscriptCache(new Date(Date.now() - config.TRANSCRIPT_CACHE_DAYS * 86_400_000).toISOString()).then((removed) => { if (removed) logger.info({ removed }, 'Forgot transcripts that nobody had needed for a while'); }, (error) => logger.warn({ err: error }, 'Could not forget old transcripts'));
+
+  // Clips stay until a person deletes them (the button on the job page, DELETE /api/jobs/:id) or, when CLIP_RETENTION_DAYS is set, until they are that old.
+  const eraser = new JobEraser({ db, storage: durableStorage, uploadDir: config.UPLOAD_DIR, outputDir: config.OUTPUT_DIR, logger });
+  const retention = new RetentionSweeper({ db, eraser, logger }, { days: config.CLIP_RETENTION_DAYS, ...overrides.retention });
+  if (retention.enabled) {
+    logger.info({ clipRetentionDays: config.CLIP_RETENTION_DAYS }, `Clips are deleted ${config.CLIP_RETENTION_DAYS} days after their job finished (CLIP_RETENTION_DAYS); jobs that are already older than that are deleted shortly after the start`);
+    retention.start();
+  } else logger.info('Clips are kept until a person deletes them (CLIP_RETENTION_DAYS is 0)');
 
   // Prove at startup (and leave a clear line in the logs) whether durable storage really works,
   // instead of finding out when the first customer's upload fails.
@@ -193,6 +211,8 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
     logger,
     retryMs: overrides.toolchainRetryMs,
   });
+  /** The page for a job that does not exist (any more): where clips are deleted after a time, it says so, because that is the likeliest reason. */
+  const notFoundPage = () => renderMessagePage('Not found', `No job exists for this id.${config.CLIP_RETENTION_DAYS ? ` ${keptFor(config.CLIP_RETENTION_DAYS)}` : ''}`, { href: '/test-upload', text: 'Upload a video' });
   const app = express();
   // On Render the first proxy in front of the server is Render's own: believe it about the visitor's address and about https.
   if (config.RENDER_EXTERNAL_URL) app.set('trust proxy', 1);
@@ -219,7 +239,7 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
   app.get('/', (_req, res) => res.redirect(302, '/test-upload'));
 
   app.get('/test-upload', (_req, res) => {
-    res.type('html').send(renderUploadPage({ maxUploadMb, defaultClipCount: config.CLIP_MAX_CANDIDATES, defaultClipSeconds: { min: config.HIGHLIGHT_MIN_DURATION_SECONDS, max: config.HIGHLIGHT_MAX_DURATION_SECONDS }, clipSize: { width: config.CLIP_VERTICAL_WIDTH, height: config.CLIP_VERTICAL_HEIGHT }, faceFraming: framer !== undefined }));
+    res.type('html').send(renderUploadPage({ maxUploadMb, defaultClipCount: config.CLIP_MAX_CANDIDATES, retentionDays: config.CLIP_RETENTION_DAYS || undefined, defaultClipSeconds: { min: config.HIGHLIGHT_MIN_DURATION_SECONDS, max: config.HIGHLIGHT_MAX_DURATION_SECONDS }, clipSize: { width: config.CLIP_VERTICAL_WIDTH, height: config.CLIP_VERTICAL_HEIGHT }, faceFraming: framer !== undefined }));
   });
 
   app.post('/test-upload', (req, res, next) => {
@@ -291,8 +311,26 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
   // no inline <script> here to ever break again the way /test-upload did.
   app.get('/jobs/:id', async (req, res) => {
     const job = await db.getJob(req.params.id);
-    if (!job) return res.status(404).type('html').send(renderMessagePage('Not found', 'No job exists for this id.', { href: '/test-upload', text: 'Upload a video' }));
-    res.type('html').send(renderJobPage(job, await db.listClips(job.id)));
+    if (!job) return res.status(404).type('html').send(notFoundPage());
+    res.type('html').send(renderJobPage(job, await db.listClips(job.id), Date.now(), { retentionDays: config.CLIP_RETENTION_DAYS || undefined }));
+  });
+  // Deleting a job: the API answers JSON, the pages need no JavaScript (a link to a page that asks once more, and a form that does it).
+  app.delete('/api/jobs/:id', async (req, res) => {
+    const outcome = await eraser.erase(req.params.id, 'requested');
+    if (outcome === 'erased') return res.status(204).end();
+    res.status(notDeleted[outcome].status).json({ error: { code: notDeleted[outcome].code, message: notDeleted[outcome].message } });
+  });
+  app.get('/jobs/:id/delete', async (req, res) => {
+    const job = await db.getJob(req.params.id);
+    if (!job) return res.status(404).type('html').send(notFoundPage());
+    if (job.status !== 'completed' && job.status !== 'failed') return res.status(409).type('html').send(renderMessagePage('Not finished yet', notDeleted['not finished'].message, { href: `/jobs/${job.id}`, text: 'Back to the video' }));
+    res.type('html').send(renderDeleteConfirmPage(job));
+  });
+  app.post('/jobs/:id/delete', async (req, res) => {
+    const outcome = await eraser.erase(req.params.id, 'requested');
+    if (outcome === 'erased') return res.type('html').send(renderDeletedPage());
+    if (outcome === 'missing') return res.status(404).type('html').send(notFoundPage());
+    res.status(notDeleted[outcome].status).type('html').send(renderMessagePage('Not deleted', notDeleted[outcome].message, { href: `/jobs/${req.params.id}`, text: 'Back to the video' }));
   });
   app.get('/api/jobs/:id/transcript', async (req, res) => {
     const job = await db.getJob(req.params.id);
@@ -341,6 +379,6 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
     : undefined;
   if (keepAwake) { keepAwake.start(); logger.info({ publicUrl: config.RENDER_EXTERNAL_URL }, 'While a job is processing or an upload is arriving, the instance keeps itself awake'); }
 
-  const close = async (options?: { dropSchema?: boolean }) => { keepAwake?.stop(); toolchain.stop(); pipeline.close(); await db.close(options); };
-  return { app, db, pipeline, storageStatus, toolchain, close };
+  const close = async (options?: { dropSchema?: boolean }) => { keepAwake?.stop(); toolchain.stop(); pipeline.close(); await retention.stop(); await db.close(options); };
+  return { app, db, pipeline, storageStatus, toolchain, retention, close };
 }

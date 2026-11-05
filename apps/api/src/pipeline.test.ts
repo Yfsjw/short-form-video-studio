@@ -1253,6 +1253,54 @@ test('whatever goes wrong with the cache, the job is done: a cache that cannot b
   } finally { await unwritable.cleanup(); }
 });
 
+test('a job notes which sound it listened to, so that deleting it can forget the transcript kept from that sound, and notes nothing when no transcript is kept', async () => {
+  const noted = async (ctx: Context, id: string) => (await ctx.raw.query('SELECT audio_sha256 FROM video_jobs WHERE id = $1', [id])).rows[0]?.audio_sha256 as string | null;
+  const engine = listeningEngine({ key: 'test-engine|1' });
+  const ctx = await setup({ transcriber: engine, media: hearing, runtime: withCache });
+  try {
+    await addJob(ctx, 'j1'); await ctx.pipeline.run('j1');
+    const sound = await noted(ctx, 'j1');
+    assert.match(sound ?? '', /^[0-9a-f]{64}$/, 'the sound is named by its fingerprint');
+    assert.equal((await ctx.raw.query('SELECT audio_sha256 FROM transcript_cache')).rows[0].audio_sha256, sound, 'the one the transcript is kept under');
+    await addJob(ctx, 'j2'); await ctx.pipeline.run('j2');
+    assert.deepEqual(heard(ctx), [false, true]);
+    assert.equal(await noted(ctx, 'j2'), sound, 'a job that reused the transcript noted the same sound');
+    await addJob(ctx, 'other-sound'); await writeFile(join(ctx.uploadDir, 'other-sound.mp4'), 'a different video, so a different sound');
+    await ctx.pipeline.run('other-sound');
+    assert.notEqual(await noted(ctx, 'other-sound'), sound, 'another sound, another fingerprint');
+    assert.equal(ctx.errors.length, 0);
+  } finally { await ctx.cleanup(); }
+
+  for (const [label, key, days] of [['an engine that has no key', undefined, 30], ['keeping nothing (0 days)', 'test-engine|1', 0]] as const) {
+    const plain = await setup({ transcriber: listeningEngine(key ? { key } : {}), media: hearing, runtime: { transcriptCacheDays: days } });
+    try {
+      await addJob(plain, 'a'); await plain.pipeline.run('a');
+      assert.equal((await plain.db.getJob('a'))?.status, 'completed');
+      assert.equal(await noted(plain, 'a'), null, `${label}: no transcript is kept, so there is no sound to note`);
+    } finally { await plain.cleanup(); }
+  }
+});
+
+test('when the sound of a job cannot be noted the job is done all the same, and the log says what will not be forgotten', async () => {
+  const unnoted = (db: StudioDatabase) => new Proxy(db, { get(target, property, receiver) {
+    const value = Reflect.get(target, property, receiver);
+    if (property === 'recordAudioFingerprint') return () => Promise.reject(new Error('the database is out of order'));
+    return typeof value === 'function' ? value.bind(target) : value;
+  } });
+  const engine = listeningEngine({ key: 'test-engine|1' });
+  const ctx = await setup({ transcriber: engine, media: hearing, runtime: withCache, database: unnoted });
+  try {
+    await addJob(ctx, 'j1'); await ctx.pipeline.run('j1');
+    const job = await ctx.db.getJob('j1');
+    assert.equal(job?.status, 'completed', job?.errorMessage ?? '');
+    assert.equal((await ctx.db.listClips('j1')).filter((clip) => clip.status === 'completed').length, 1);
+    assert.ok(ctx.errors.some((message) => /Could not note which sound this job listened to/.test(message)), 'the log says why');
+    assert.equal((await ctx.raw.query('SELECT audio_sha256 FROM video_jobs WHERE id = $1', ['j1'])).rows[0].audio_sha256, null);
+    assert.equal((await ctx.raw.query('SELECT count(*)::int AS n FROM transcript_cache')).rows[0].n, 1, 'the transcript is still kept for reuse');
+    assert.doesNotMatch(String(job?.errorMessage ?? ''), /out of order/, 'nothing of it reaches the person');
+  } finally { await ctx.cleanup(); }
+});
+
 // ---- what a person is told when a job fails ---------------------------------------------------------------------------------------
 
 /** Something that goes wrong the way things go wrong on a server: the words carry a folder, a program, an address. */

@@ -125,6 +125,15 @@ test('upgrades a database created before durable sources existed, keeping its jo
         // The column for the framing note was added by the upgrade, so a new clip can keep its note.
         await db.createClip({ ...makeClip(`after-${boot}`, 'old'), framing: 'Followed a face, seen in 80% of the moments checked.' });
         assert.equal((await db.listClips('old')).find((clip) => clip.id === `after-${boot}`)?.framing, 'Followed a face, seen in 80% of the moments checked.');
+        if (boot === 2) {
+          // The column that says which sound a job listened to was added by the upgrade too, and a job from before it can be deleted whole, old-shaped rows and all.
+          await db.recordAudioFingerprint('old', 'sound-of-the-old-job');
+          await db.storeCachedTranscript('sound-of-the-old-job', 'engine', [{ segmentIndex: 0, startSeconds: 0, endSeconds: 2, text: 'An old transcript.' }]);
+          assert.equal(await db.deleteFinishedJob('old'), true);
+          assert.equal(await db.getJob('old'), undefined);
+          assert.deepEqual([(await db.listClips('old')).length, (await db.listTranscript('old')).length, (await db.listHighlights('old')).length], [0, 0, 0]);
+          assert.equal(await db.findCachedTranscript('sound-of-the-old-job', 'engine'), undefined);
+        }
       } finally { await db.close(); }
     }
   } finally {
@@ -404,4 +413,95 @@ test('a database created before transcripts were kept gets the table, and keeps 
       assert.equal((await second.findCachedTranscript('x', 'y'))?.[0].text, 'Works.', 'and the table is back');
     } finally { await second.close({ dropSchema: true }); }
   } finally { await raw.end(); }
+});
+
+const daysAgo = (days: number) => new Date(Date.now() - days * 86_400_000).toISOString();
+const someWords = [{ segmentIndex: 0, startSeconds: 0, endSeconds: 2, text: 'Some words that were said.' }];
+
+test('the jobs that are over and have not changed since a moment are listed oldest first, the moment itself not included, and a job still being worked on never is', () => withDatabase('older_than', async (db) => {
+  await db.createJob(makeJob('done-10', 'completed', daysAgo(10)));
+  await db.createJob(makeJob('failed-20', 'failed', daysAgo(20)));
+  await db.createJob(makeJob('done-1', 'completed', daysAgo(1)));
+  await db.createJob(makeJob('running-30', 'processing', daysAgo(30)));
+  await db.createJob(makeJob('queued-30', 'queued', daysAgo(30)));
+  assert.deepEqual((await db.listFinishedJobsOlderThan(daysAgo(7))).map((job) => job.id), ['failed-20', 'done-10'], 'done or failed, older than a week, oldest first; nothing that is still queued or running');
+  assert.deepEqual((await db.listFinishedJobsOlderThan(daysAgo(7), 1)).map((job) => job.id), ['failed-20'], 'no more than the limit');
+  assert.deepEqual((await db.listFinishedJobsOlderThan(daysAgo(0.5))).map((job) => job.id), ['failed-20', 'done-10', 'done-1']);
+  assert.deepEqual(await db.listFinishedJobsOlderThan(daysAgo(25)), [], 'nothing that is over is that old');
+  const exact = daysAgo(3);
+  await db.createJob(makeJob('exact', 'completed', exact));
+  assert.ok(!(await db.listFinishedJobsOlderThan(exact)).some((job) => job.id === 'exact'), 'a job that changed at that very moment is not older than it');
+  assert.ok((await db.listFinishedJobsOlderThan(new Date(Date.parse(exact) + 1).toISOString())).some((job) => job.id === 'exact'));
+}));
+
+test('deleting a finished job removes everything the database holds about it and about nothing else, and a job that is not over is left whole', () => withDatabase('delete_job', async (db) => {
+  const fill = async (id: string, status: NewVideoJob['status']) => {
+    await db.createJob(makeJob(id, status));
+    await db.createClip(makeClip(`${id}-clip`, id));
+    await db.replaceTranscript(id, someWords);
+    await db.replaceHighlights(id, [{ startSeconds: 0, endSeconds: 2, score: 60, quality: 'medium', reasons: ['question phrasing'], signals: {}, sourceSegmentIndexes: [0], title: null }]);
+  };
+  const holds = async (id: string) => [(await db.listClips(id)).length, (await db.listTranscript(id)).length, (await db.listHighlights(id)).length];
+  await fill('done', 'completed'); await fill('failed', 'failed'); await fill('other', 'completed'); await fill('running', 'processing'); await fill('waiting', 'queued');
+
+  assert.equal(await db.deleteFinishedJob('done'), true);
+  assert.equal(await db.getJob('done'), undefined);
+  assert.deepEqual(await holds('done'), [0, 0, 0], 'its clips, its transcript and its highlights went with it');
+  assert.equal(await db.deleteFinishedJob('failed'), true, 'a job that failed is over too');
+  assert.deepEqual(await holds('other'), [1, 1, 1], 'another job keeps everything');
+  assert.ok(await db.getJob('other'));
+
+  for (const id of ['running', 'waiting']) {
+    assert.equal(await db.deleteFinishedJob(id), false, `${id}: a job that is not over is never taken away`);
+    assert.ok(await db.getJob(id));
+    assert.deepEqual(await holds(id), [1, 1, 1], `${id}: and nothing of it is removed`);
+  }
+  assert.equal(await db.deleteFinishedJob('done'), false, 'a job that is gone cannot be deleted again');
+  assert.equal(await db.deleteFinishedJob('never-was'), false);
+}));
+
+test('deleting a job also forgets the transcript kept from the sound it listened to, in every engine, and no other', () => withDatabase('delete_job_cache', async (db) => {
+  await db.createJob(makeJob('listened', 'completed')); await db.createJob(makeJob('unrecorded', 'completed')); await db.createJob(makeJob('elsewhere', 'completed'));
+  await db.recordAudioFingerprint('listened', 'sound-a');
+  await db.recordAudioFingerprint('elsewhere', 'sound-b');
+  for (const [sound, engine] of [['sound-a', 'engine-1'], ['sound-a', 'engine-2'], ['sound-b', 'engine-1'], ['sound-c', 'engine-1']]) await db.storeCachedTranscript(sound, engine, someWords);
+
+  assert.equal(await db.deleteFinishedJob('unrecorded'), true);
+  assert.ok(await db.findCachedTranscript('sound-a', 'engine-1') && await db.findCachedTranscript('sound-b', 'engine-1') && await db.findCachedTranscript('sound-c', 'engine-1'), 'a job that never noted its sound forgets nothing');
+  assert.equal(await db.deleteFinishedJob('listened'), true);
+  assert.equal(await db.findCachedTranscript('sound-a', 'engine-1'), undefined, 'the transcript of its sound is forgotten');
+  assert.equal(await db.findCachedTranscript('sound-a', 'engine-2'), undefined, 'whichever engine wrote it');
+  assert.ok(await db.findCachedTranscript('sound-b', 'engine-1'), 'the transcript of another job\'s sound stays');
+  assert.ok(await db.findCachedTranscript('sound-c', 'engine-1'), 'and so does one that no job has noted');
+  assert.equal((await db.getJob('elsewhere'))?.status, 'completed');
+}));
+
+test('the sound a job listened to is noted without touching anything else of the job, and without the public view of it', () => withDatabase('fingerprint', async (db) => {
+  const before = makeJob('j', 'completed', daysAgo(5));
+  await db.createJob(before);
+  await db.recordAudioFingerprint('j', 'sound-a');
+  const after = await db.getJob('j');
+  assert.equal(after?.updatedAt, before.updatedAt, 'noting the sound is not a change of the job: when a job is deleted is counted from when it last changed');
+  assert.equal(after?.status, 'completed');
+  assert.ok(!JSON.stringify(after).includes('sound-a'), 'the job as the rest of the program sees it does not carry the fingerprint');
+}));
+
+test('a job that goes back to work while it is being deleted is not deleted: the deletion waits for whoever holds the job, and then finds that it is not over', async () => {
+  const schema = schemaName('delete_race');
+  const db = await StudioDatabase.connect(TEST_DATABASE_URL, schema);
+  const pool = new Pool({ connectionString: TEST_DATABASE_URL, options: `-c search_path="${schema}"` });
+  const client = await pool.connect();
+  try {
+    await db.createJob(makeJob('busy', 'completed'));
+    await db.createClip(makeClip('busy-clip', 'busy'));
+    await client.query('BEGIN');
+    await client.query(`UPDATE video_jobs SET stage = stage WHERE id = 'busy'`); // this connection now holds the job
+    const deleting = db.deleteFinishedJob('busy');
+    await sleep(400); // the deletion has reached the job and waits for it
+    await client.query(`UPDATE video_jobs SET status = 'processing' WHERE id = 'busy'`);
+    await client.query('COMMIT');
+    assert.equal(await deleting, false, 'by the time the deletion had the job, it was being worked on again');
+    assert.equal((await db.getJob('busy'))?.status, 'processing');
+    assert.equal((await db.listClips('busy')).length, 1, 'and nothing of it was removed');
+  } finally { client.release(); await pool.end(); await db.close({ dropSchema: true }); }
 });

@@ -99,8 +99,10 @@ Job stages you can see on the status page: `preparing_source`, `saving_source`, 
 - **A database that goes silent is not timed out.** node-postgres has no default timeout for connections or queries and none is
   configured here. A connection the database *closes* is handled (see point 7 above); one that is accepted and then never
   answered would stall the request or job that uses it.
-- **Clips are kept until deleted.** Source videos are removed after their job; generated clips stay in R2 and the bucket has no
-  retention rule. Add a lifecycle rule in the Cloudflare dashboard if clips should expire.
+- **Clips are kept until a person deletes them, unless `CLIP_RETENTION_DAYS` is set.** Source videos are removed after their job;
+  generated clips stay in R2 until the job is deleted (the button on its page, or `DELETE /api/jobs/:id`) or, when
+  `CLIP_RETENTION_DAYS` is above 0, until the job is that old. See [Keeping and deleting clips](#keeping-and-deleting-clips). A lifecycle
+  rule on the bucket is not needed and would leave the database pointing at clips that are gone.
 
 ### What the free instance has actually done
 
@@ -208,6 +210,7 @@ All configuration comes from environment variables; see [`.env.example`](.env.ex
 | `TRANSCRIPTION_API_URL`, `TRANSCRIPTION_API_KEY`, `TRANSCRIPTION_API_MODEL` | Only for `openai_compatible`: the service's base address (ending in `/v1`), its key (never logged, never shown in a message) and the model (default `whisper-1`). The address and key are required when that engine is chosen. |
 | `TRANSCRIPTION_CHUNK_SECONDS`, `TRANSCRIPTION_API_CONCURRENCY`, `TRANSCRIPTION_API_TIMEOUT_MS` | Only for `openai_compatible`: about how many seconds of audio go in one request (default 600), how many requests run at once (default 3) and the time limit of one request (default 300000 ms). |
 | `TRANSCRIPT_CACHE_DAYS` | How many days the transcript of a sound is kept after it was last used, so that the same video is not listened to twice (0–365, default 30; `0` keeps nothing and clears what was kept the next time the server starts). See [Not listening twice](#not-listening-twice). |
+| `CLIP_RETENTION_DAYS` | How many days after a job has finished the server deletes it with everything made from it: the clips and captions in storage, the transcript and the record (0–3650, default `0` = never: clips stay until a person deletes them). Above 0, every finished job that is already older than that is deleted too, about a minute after the server starts. See [Keeping and deleting clips](#keeping-and-deleting-clips). |
 | `CLIP_MAX_CANDIDATES` | Highest-ranked candidates rendered per job (default 3). |
 | `CLIP_VERTICAL_WIDTH`, `CLIP_VERTICAL_HEIGHT` | Output size of a vertical clip; must be 9:16 (default 1080×1920). The other shapes are worked out from it (see `aspect` under [Job options](#job-options)). |
 | `CLIP_VIDEO_CODEC`, `CLIP_AUDIO_CODEC`, `CLIP_CRF`, `CLIP_PRESET` | FFmpeg encoding (defaults `libx264`, `aac`, 23, `veryfast`). |
@@ -230,9 +233,10 @@ All configuration comes from environment variables; see [`.env.example`](.env.ex
 - `GET /api/jobs/:id/transcript` — timestamped transcript segments.
 - `GET /api/jobs/:id/highlights` — ranked highlight candidates with their scoring signals.
 - `GET /api/jobs/:jobId/clips/:clipId` — redirects to a short-lived signed R2 link (add `?download=1` to force a download). In local-only mode the file is streamed from disk.
+- `DELETE /api/jobs/:id` — deletes a job that is finished or failed with its clips, captions, transcript and record: `204` when it is done; `404` `JOB_NOT_FOUND` when there is no such job (a second request for the same job gets this too); `409` `JOB_NOT_FINISHED` while the video is still being processed; `503` `DELETE_FAILED` when storage would not delete a file (nothing was removed, ask again). See [Keeping and deleting clips](#keeping-and-deleting-clips).
 - `GET /api/health` — `{ status, service, storage: { backend: "r2" | "local-only", selfTest, checkedAt }, access: { codeRequired }, toolchain: { state, checkedAt, failed } }`. Always open, even when an access code is set. `toolchain` is the result of the [start-up check of the video tools](#start-up-check-of-the-video-tools): `state` is `pending`, `running`, `passed`, `failed`, `skipped` or `disabled`, and `failed` names the checks that failed (never versions or paths).
 - `GET /login`, `POST /login` (form field `code`, optional `next`), `GET /logout` — the way in when `ACCESS_CODE` is set; without it `/login` just sends the person on. With a code set, every other route answers `401` `ACCESS_CODE_REQUIRED` (under `/api/`) or sends the browser to `/login` until the code is given.
-- `GET /test-upload`, `POST /test-upload`, `GET /jobs/:id` — the built-in phone-friendly pages. `GET /` redirects to `/test-upload`.
+- `GET /test-upload`, `POST /test-upload`, `GET /jobs/:id`, `GET /jobs/:id/delete`, `POST /jobs/:id/delete` — the built-in phone-friendly pages (the last two ask once more and then delete, with a plain form). `GET /` redirects to `/test-upload`.
 
 ### Job options
 
@@ -553,6 +557,59 @@ two places, and removing only one of them leaves the other doing the job). That 
 how much time it saves on real recordings (the saving is the whole listening stage, which was 10 minutes for the one 45-second video
 measured, but that is one sample).
 
+### Keeping and deleting clips
+
+Clips are kept until a person deletes them, unless the operator sets `CLIP_RETENTION_DAYS`.
+
+**A person deletes a job.** The page of a job that is finished or failed has a red link, "Delete this video and its clips" ("Delete this
+job" for one that failed). It leads to a page that says what is lost (the clips made from the video, its transcript and the record of
+the job, for good; clips already downloaded stay where they were saved) and asks once more; a plain form button does it. There is no
+JavaScript on any of these pages. Programs use `DELETE /api/jobs/:id` (answers in [API](#api)). A job that is still queued or being worked on
+is never deleted, by anyone or by the clock: its page has no such link and the API answers `409`. With an access code set (see
+[The access code](#the-access-code-optional)) deleting needs the code like everything else. Without one, anybody who has the address of a
+job's page can delete the job, just as anybody who has it can watch the clips.
+
+**The clock deletes a job.** With `CLIP_RETENTION_DAYS` above 0 the server deletes a job that many days after it last changed, which for a
+finished or failed job is when it ended. It looks a minute after the server starts and then once an hour, oldest first, 25 jobs at a
+time and at most 20 rounds (500 jobs) in one look; what is left waits for the next look. **Setting the number for the first time deletes,
+within a minute of the next start, every finished job that is already older than that**, so it is a decision about the clips people have
+already been given, not only about new ones. While it is set, the upload page, and the page of a finished job that has clips, say it ("Clips
+are deleted 14 days after they are made. These are kept until 2026-11-20. Download the clips you want to keep."); with the default they say
+nothing. The server's log says at start-up which of the two it is doing, and each look that deleted something says how many.
+
+**What is deleted** for one job: in durable storage each clip, the caption file of each clip and the video that was uploaded (normally
+gone by then; a job that ended while storage was failing may still hold it); in the database its clips, transcript, highlights and record,
+and the transcript that was kept for reuse from the same sound ([Not listening twice](#not-listening-twice)) when the job noted which sound
+it was (a job from before this version did not; its kept transcript is forgotten after `TRANSCRIPT_CACHE_DAYS` as before); on the server's own
+disk the job's clip folder and uploaded video, if they are still there. Only what the job's own records name is deleted: a name that could
+point outside the server's folders is refused as a path (the job is still deleted).
+
+**When something cannot be deleted** the files in storage go first and the rows last. If storage will not delete a file, every other file
+is still tried, the job's rows are **kept** (with them the job can be found and asked for again, and nothing is left that nothing points
+at), and the person gets `503` / "Not deleted" and the clock tries again an hour later. Deleting what is not there is not an error, so
+asking again finishes what a failure left half done. Two requests to delete the same job at the same moment delete it once, and a job that
+goes back to work while it is being deleted is left whole (the database holds the job's row until the decision is made).
+
+**What it does not reach:** copies that people downloaded; anything the bucket itself keeps if versioning or backups were switched on in
+Cloudflare (this program neither turns them on nor looks); and the server's logs, which can name a job and the file that was uploaded.
+
+Evidence: the deletion of one job (what is in storage, in the database and on the disk afterwards; a job that is not there; one that is still
+being worked on; storage that is down; one file that cannot be deleted; hostile names), the sweeper (the age counted from an injected clock,
+rounds and their limits, storage down, two looks at once, the timer, stopping while a look is under way, the default times), the database
+(what is listed, in which order, the boundary instant; the transaction; the transcript kept for the sound; upgrading a database from before),
+the pages and the whole application over HTTP (the API, the pages, the access code, the sweeper deleting by itself, a real upload deleted
+from end to end in both durable and local-only mode) are covered by 47 new tests, with a real Postgres database, a real
+FFmpeg and a storage in memory that behaves like S3 (the whole suite is now 492 tests). To check that those tests would notice a
+mistake, the code was also broken on purpose in 134 different ways, one at a time (the order of the steps, a failure that is ignored, a path
+that is not checked, a boundary that is off by one, a timer that is never stopped, a status code, a sentence that is not escaped, and so on):
+127 were noticed by the first set of tests, the other 7 showed small gaps (how the sweeper counts, the timer of a sweeper that is off, two
+starts of one timer, the reason written to the log, which folder is which, two sentences of the confirmation page), tests were added for each,
+and then all 134 were noticed. That check was run by hand and is not part of the repository.
+**Not proven yet:** deleting on the live service against the real R2 bucket (the storage here is a stand-in that, like S3, accepts a delete of
+a key that is not there; R2 is expected to do the same, but that has not been seen), the clock on the live service (it is off by default and
+has deleted nothing anywhere but in tests), a look that really has hundreds of jobs to delete, and what happens when a bucket has versioning
+on.
+
 ### The access code (optional)
 
 Without a code, anybody who knows the address can upload videos (each one costs processing time, storage and, with a hosted speech
@@ -695,7 +752,7 @@ Speaker tracking (the optional face following follows the most visible face, not
 out of the box (whisper.cpp needs a multilingual model instead of the English-only `ggml-base.en` that `setup:whisper` downloads and
 `TRANSCRIPTION_LANGUAGE` set to the language code; the hosted engine above can take other languages but has not been tried with one; and the
 caption font only covers Latin, Greek and Cyrillic), user accounts and real authentication (the only protection is the optional shared [access code](#the-access-code-optional); **without it anyone who can reach the service can upload**), per-user quotas,
-malware scanning, a separate worker tier, and retention rules for generated clips. YouTube ingestion depends on a third-party Cobalt
+malware scanning and a separate worker tier. YouTube ingestion depends on a third-party Cobalt
 service whose availability and terms of use are outside this repository. Operators are responsible for having the right to
 process the videos users upload.
 

@@ -18,7 +18,7 @@ import { StageClock, stageProgress, totalMilliseconds } from './progress.js';
 import { sourceKeyFor, StoredObjectMissingError, type DurableStorage } from './storage.js';
 import { PlainFailure, failureMessage, plainWords } from './failures.js';
 
-type PipelineStore = Pick<StudioDatabase, 'getJob' | 'updateJob' | 'replaceTranscript' | 'listTranscript' | 'replaceHighlights' | 'listHighlights' | 'createClip' | 'updateClip' | 'beginAttempt' | 'touchJob' | 'listUnfinishedJobs' | 'listFinishedJobsHoldingSource' | 'claimJobForRecovery' | 'failStaleJob' | 'deleteClipsForJob' | 'findCachedTranscript' | 'storeCachedTranscript' | 'pruneTranscriptCache'>;
+type PipelineStore = Pick<StudioDatabase, 'getJob' | 'updateJob' | 'replaceTranscript' | 'listTranscript' | 'replaceHighlights' | 'listHighlights' | 'createClip' | 'updateClip' | 'beginAttempt' | 'touchJob' | 'listUnfinishedJobs' | 'listFinishedJobsHoldingSource' | 'claimJobForRecovery' | 'failStaleJob' | 'deleteClipsForJob' | 'findCachedTranscript' | 'storeCachedTranscript' | 'pruneTranscriptCache' | 'recordAudioFingerprint'>;
 type MediaProcessor = Pick<FfmpegAdapter, 'probe' | 'extractAudio'>;
 
 export interface PipelineRuntimeOptions {
@@ -426,6 +426,11 @@ export class VideoPipeline {
         cached = await this.db.findCachedTranscript(fingerprint, engineKey);
       } catch (error) {
         this.logger.error({ err: error, jobId }, 'Could not look for an earlier transcript of this video; the speech will be recognised again');
+      }
+      // Deleting the job later forgets the transcript kept for this sound too, which needs to know which sound it was.
+      if (fingerprint) {
+        try { await this.db.recordAudioFingerprint(jobId, fingerprint); }
+        catch (error) { this.logger.error({ err: error, jobId }, 'Could not note which sound this job listened to; deleting the job will not forget the transcript kept for reuse (it is forgotten after a while anyway)'); }
       }
     }
     if (cached) {

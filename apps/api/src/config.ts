@@ -80,6 +80,9 @@ const schema = z.object({
   // How many days the transcript of a sound is kept after it was last used, so the same video uploaded again (to try other choices) or a job
   // started over after a restart does not have its speech recognised twice. 0 keeps nothing.
   TRANSCRIPT_CACHE_DAYS: z.coerce.number().int().min(0).max(365).default(30),
+  // How many days the clips of a job are kept after the job finished; then the job is deleted with its clips, its transcript and everything stored for it.
+  // 0 (the default) keeps them until a person deletes them. Setting it deletes at once every job that is already older than that.
+  CLIP_RETENTION_DAYS: z.coerce.number().int().min(0).max(3650).default(0),
   // Only used when TRANSCRIPTION_ENGINE=openai_compatible (a hosted service that speaks the OpenAI audio/transcriptions protocol).
   TRANSCRIPTION_API_URL: z.string().url().optional(),
   TRANSCRIPTION_API_KEY: z.string().optional(),
