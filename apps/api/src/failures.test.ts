@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { PlainFailure, describeTimeLimit, failureMessage, onlyVideos, plainWords } from './failures.js';
+import { JobStopped, PlainFailure, describeTimeLimit, failureMessage, onlyVideos, plainWords } from './failures.js';
 
 /** What nobody who uploads a video should have to read: the insides of the server. */
 const technical = /\/(opt|tmp|usr|var|home|srv)\b|\.(mp4|wav|json|bin)\b|ffmpeg|ffprobe|whisper|cobalt|postgres|r2\b|s3\b|exit code|signal|stderr|stdout|ENOENT|ECONN|Error:|\bat \w+\.\w+/i;
@@ -64,4 +64,13 @@ test('every sentence a person can be told is plain: it says what is wrong and wh
 test('a time limit is told in the words of a person', () => {
   const cases: Array<[number, string]> = [[0, '1 second'], [300, '1 second'], [1_000, '1 second'], [1_499, '1 second'], [1_500, '2 seconds'], [90_000, '90 seconds'], [119_000, '119 seconds'], [119_499, '119 seconds'], [120_000, '2 minutes'], [149_000, '2 minutes'], [151_000, '3 minutes'], [600_000, '10 minutes'], [3_600_000, '60 minutes'], [5_400_000, '90 minutes']];
   for (const [milliseconds, words] of cases) assert.equal(describeTimeLimit(milliseconds), words, `${milliseconds} ms`);
+});
+
+test('a stop is its own reason: it says who stopped the video, and it is never one of the failures a person is told about', () => {
+  const stop = new JobStopped();
+  assert.equal(stop.name, 'JobStopped');
+  assert.match(stop.message, /stopped it/);
+  assert.ok(!(stop instanceof PlainFailure), 'it is not told in the words of a failure');
+  assert.equal(failureMessage(stop, 'transcribing'), 'The speech in this video could not be turned into text. Please try again, or try another video.', 'if it ever reached the words for failures it would be one more failure, which is why the pipeline decides by the signal and never by the error');
+  assert.match(plainWords.stopped, /^You stopped this video before it was finished\. Nothing from it was kept\.$/);
 });

@@ -21,7 +21,7 @@ upload ─► job row (Postgres) ─► video copied to Cloudflare R2 ─► ffp
 | File storage | Cloudflare R2 (S3 API). The uploaded video is kept there while a job is unfinished; finished clips are served from there through short-lived signed links. |
 | Speech | `whisper.cpp` on the CPU (`ggml-base.en`, English). |
 | Video | `ffprobe` / `ffmpeg`. |
-| Pages | The service serves two small phone-friendly pages itself, with no JavaScript: `/test-upload` (upload form with a few options) and `/jobs/<id>` (a progress bar while the job runs; the clips playable on the page, each with a download button, once it is done). An upload leads straight to its `/jobs/<id>` page. `apps/web` is a separate React client that is **not** part of the current deployment. |
+| Pages | The service serves two small phone-friendly pages itself, with no JavaScript: `/test-upload` (upload form with a few options) and `/jobs/<id>` (a progress bar and a red "Stop this video" link while the job runs; the clips playable on the page, each with a download button, once it is done). An upload leads straight to its `/jobs/<id>` page. `apps/web` is a separate React client that is **not** part of the current deployment. |
 
 ## Durability and recovery
 
@@ -103,6 +103,12 @@ Job stages you can see on the status page: `preparing_source`, `saving_source`, 
   generated clips stay in R2 until the job is deleted (the button on its page, or `DELETE /api/jobs/:id`) or, when
   `CLIP_RETENTION_DAYS` is above 0, until the job is that old. See [Keeping and deleting clips](#keeping-and-deleting-clips). A lifecycle
   rule on the bucket is not needed and would leave the database pointing at clips that are gone.
+- **A stop is quick for what runs, not for a transfer that is under way, and a few moments are not covered.** A video can be
+  stopped while it is worked on: the programs are killed and the job's work is thrown away (see [Stopping a video](#stopping-a-video)).
+  A transfer to or from storage is never broken off halfway, so on a very slow link a stop can take as long as the transfer in
+  progress; a stop that arrives in the last instant lets the job finish; one that arrives while the job is going back to wait for
+  storage, or while the database is down, can be lost. Whether the real whisper.cpp on the free instance ends as quickly as the
+  stand-in programs of the tests has not been seen.
 
 ### What the free instance has actually done
 
@@ -234,9 +240,10 @@ All configuration comes from environment variables; see [`.env.example`](.env.ex
 - `GET /api/jobs/:id/highlights` — ranked highlight candidates with their scoring signals.
 - `GET /api/jobs/:jobId/clips/:clipId` — redirects to a short-lived signed R2 link (add `?download=1` to force a download). In local-only mode the file is streamed from disk.
 - `DELETE /api/jobs/:id` — deletes a job that is finished or failed with its clips, captions, transcript and record: `204` when it is done; `404` `JOB_NOT_FOUND` when there is no such job (a second request for the same job gets this too); `409` `JOB_NOT_FINISHED` while the video is still being processed; `503` `DELETE_FAILED` when storage would not delete a file (nothing was removed, ask again). See [Keeping and deleting clips](#keeping-and-deleting-clips).
+- `POST /api/jobs/:id/stop` — stops a job that is being worked on: `202` `{ "stopping": true }` when it is being stopped (asking again while it is under way gives the same answer); `404` `JOB_NOT_FOUND`; `409` `JOB_ALREADY_OVER` when the job is finished or failed already; `409` `JOB_NOT_RUNNING` when this server is not working on it at this moment (it is waiting to start again after a restart, or another process has it: try again in a minute). The job then ends as `failed` in the stage `stopped`. See [Stopping a video](#stopping-a-video).
 - `GET /api/health` — `{ status, service, storage: { backend: "r2" | "local-only", selfTest, checkedAt }, access: { codeRequired }, toolchain: { state, checkedAt, failed } }`. Always open, even when an access code is set. `toolchain` is the result of the [start-up check of the video tools](#start-up-check-of-the-video-tools): `state` is `pending`, `running`, `passed`, `failed`, `skipped` or `disabled`, and `failed` names the checks that failed (never versions or paths).
 - `GET /login`, `POST /login` (form field `code`, optional `next`), `GET /logout` — the way in when `ACCESS_CODE` is set; without it `/login` just sends the person on. With a code set, every other route answers `401` `ACCESS_CODE_REQUIRED` (under `/api/`) or sends the browser to `/login` until the code is given.
-- `GET /test-upload`, `POST /test-upload`, `GET /jobs/:id`, `GET /jobs/:id/delete`, `POST /jobs/:id/delete` — the built-in phone-friendly pages (the last two ask once more and then delete, with a plain form). `GET /` redirects to `/test-upload`.
+- `GET /test-upload`, `POST /test-upload`, `GET /jobs/:id`, `GET /jobs/:id/delete`, `POST /jobs/:id/delete`, `GET /jobs/:id/stop`, `POST /jobs/:id/stop` — the built-in phone-friendly pages (the last four ask once more and then delete or stop, with a plain form). `GET /` redirects to `/test-upload`.
 
 ### Job options
 
@@ -293,7 +300,7 @@ the short reason code the service gave (only when it is a plain code); everythin
 server. Please try again in a moment." The upload form shows the same words on a page instead of JSON. Jobs that failed before this was
 introduced keep the message they were given then.
 
-What has been tried, and what has not. On the development machine (the whole suite, 422 tests, passes): every message above comes out of a
+What has been tried, and what has not. On the development machine (at that point the whole suite, 422 tests, passed): every message above comes out of a
 test that makes the situation happen with real files and the real FFmpeg and ffprobe (a video without sound, a file that is not a video, a
 file cut in half, a recording with no picture, a file whose sound comes before its picture), or with a stand-in for a program that fails the
 way real ones do (killed from outside, past its time limit, not installed), and the same tests read the page of the job, the answer of the
@@ -565,7 +572,7 @@ Clips are kept until a person deletes them, unless the operator sets `CLIP_RETEN
 job" for one that failed). It leads to a page that says what is lost (the clips made from the video, its transcript and the record of
 the job, for good; clips already downloaded stay where they were saved) and asks once more; a plain form button does it. There is no
 JavaScript on any of these pages. Programs use `DELETE /api/jobs/:id` (answers in [API](#api)). A job that is still queued or being worked on
-is never deleted, by anyone or by the clock: its page has no such link and the API answers `409`. With an access code set (see
+is never deleted, by anyone or by the clock: its page has no such link and the API answers `409` (stop it first, see [Stopping a video](#stopping-a-video)). With an access code set (see
 [The access code](#the-access-code-optional)) deleting needs the code like everything else. Without one, anybody who has the address of a
 job's page can delete the job, just as anybody who has it can watch the clips.
 
@@ -599,7 +606,7 @@ rounds and their limits, storage down, two looks at once, the timer, stopping wh
 (what is listed, in which order, the boundary instant; the transaction; the transcript kept for the sound; upgrading a database from before),
 the pages and the whole application over HTTP (the API, the pages, the access code, the sweeper deleting by itself, a real upload deleted
 from end to end in both durable and local-only mode) are covered by 47 new tests, with a real Postgres database, a real
-FFmpeg and a storage in memory that behaves like S3 (the whole suite is now 492 tests). To check that those tests would notice a
+FFmpeg and a storage in memory that behaves like S3 (the whole suite was 492 tests then). To check that those tests would notice a
 mistake, the code was also broken on purpose in 134 different ways, one at a time (the order of the steps, a failure that is ignored, a path
 that is not checked, a boundary that is off by one, a timer that is never stopped, a status code, a sentence that is not escaped, and so on):
 127 were noticed by the first set of tests, the other 7 showed small gaps (how the sweeper counts, the timer of a sweeper that is off, two
@@ -609,6 +616,50 @@ and then all 134 were noticed. That check was run by hand and is not part of the
 a key that is not there; R2 is expected to do the same, but that has not been seen), the clock on the live service (it is off by default and
 has deleted nothing anywhere but in tests), a look that really has hundreds of jobs to delete, and what happens when a bucket has versioning
 on.
+
+### Stopping a video
+
+A person can stop a video that is queued or being worked on. Its page has a red link, "Stop this video", which leads to a page that says what is
+lost (the work done so far is thrown away and cannot be picked up again; to get clips from the video it has to be uploaded again) and asks once
+more; a plain form button does it. Programs use `POST /api/jobs/:id/stop` (answers in [API](#api)). There is no JavaScript on any of these pages.
+With an access code set (see [The access code](#the-access-code-optional)) stopping needs the code like everything else.
+
+**What a stop does.** It ends what is running *now*: the programs (FFmpeg, whisper.cpp) are killed at once, a request to a hosted speech service
+is called off and its pauses between tries end, and a job that is waiting for its turn gives up its place without disturbing the others. Then
+everything the job made is thrown away: the clips and their captions (in storage, on disk and in the database) and the stored copy of the uploaded
+video. The job ends as `failed` in a new stage, `stopped`, with the words "You stopped this video before it was finished. Nothing from it was kept."
+Its page says "You stopped this video", calls the status "stopped" (not "failed"), is not in the colour of an error, and offers to delete the job
+like that of any video that is over. The server's log tells the stop at `info` level, never as an error. Until the clean-up is over (usually
+a moment) the page says "Stopping your video" and has no link to stop it again. The transcript that is kept for reuse from the same sound is not
+touched, so uploading the same video again does not listen twice ([Not listening twice](#not-listening-twice)).
+
+**What it answers.** `202` when the job is being stopped; `404` when there is no such job; `409` `JOB_ALREADY_OVER` for a job that is finished or
+failed; `409` `JOB_NOT_RUNNING` for a job that this process is not working on (it is waiting to start again after a restart, or another process
+has it). The last one is deliberate: a job that nobody here works on is not touched, because its state belongs to whoever works on it.
+
+**A mistake worth keeping in mind.** The first version asked Node's `execFile` to end a program with its `signal` option. The test with a program that
+*ignores* the polite request showed that `execFile` then ends it with SIGTERM whatever `killSignal` says, so a busy program went on running behind a
+job that was reported as stopped. Programs are now killed by hand with SIGKILL (`stopping.ts`), and there is a test with programs that ignore SIGTERM
+for each place a program is started.
+
+**Limits.** A stop that arrives in the last instant, after the last check and before the job is marked finished, lets the job finish (its page then
+shows its clips). A stop that arrives in the moment when a job that could not read its video back from storage is put back to wait can be lost, and a
+stop is lost if the database is down at that exact moment (the person gets an error and can ask again). A transfer to or from storage is never broken
+off halfway: the clip that is being saved is saved, then the job ends, so on a very slow link a stop can take as long as that transfer. The checks at
+the edge of every step and between clips only make a stop quicker; what ends the work is the kill and the signal.
+
+Evidence: 51 new tests, with real processes (programs that do nothing for a minute, in two kinds, one that ends when it is asked to and one that ignores
+the request: each place a program is started is checked to end it, quickly, for good, with the reason of the stop and nothing of its own), a real Postgres
+database, the real FFmpeg and a storage in memory that behaves like S3 (the whole suite is now 543 tests). They stop a job in each stage (reading the video,
+taking the sound out, listening, a face being looked for, the first clip, a later clip after one was saved), while it waits for its turn (also in the very
+moment it is handed the place), while the video is being saved or read back (a stop wins over a storage that fails at that moment), before it has begun,
+while it reuses a transcript; an engine that ignores the stop; a clean-up that fails; the answers of the API; the pages; the access code; and, over HTTP with the
+real FFmpeg and a stand-in speech program, that the program is really gone after a stop. To check that those tests would notice a mistake, the code was also
+broken on purpose in 134 different ways, one at a time (a kill that is only a polite request, a check that is missing, a listener that is not removed, a place
+in line that is not given up, the order of two branches, a status code, a sentence that is not escaped, and so on): 122 were noticed by the first set of tests; of the other 12, one was my mistake in choosing which tests to run, 7 showed real gaps (nothing stopped a recognition by a hosted service while one of its programs ran, how many clips a stop threw away was not checked, a page that is being stopped could say it had been resumed, and the tests of the pauses of the hosted service hung instead of failing), and tests were added for each of them. The other 4 are not noticed, and cannot be: a check that only makes a stop quicker (looking at pictures that were already on their way), a listener that removes itself from a signal that removes it anyway, a state that cannot exist (a job that is being worked on and has no record), and the order of a write that only changes a number the page never shows for a stopped video. So 130 of the 134 are noticed, and the 4 that are not change nothing a person could see.
+That check was run by hand and is not part of the repository.
+**Not proven yet:** stopping on the live service against the real R2 bucket, the real whisper.cpp on the free instance (the tests kill stand-in programs; that
+whisper.cpp ends as they do is expected, not seen), and how long a stop takes while a very large video is being saved.
 
 ### The access code (optional)
 

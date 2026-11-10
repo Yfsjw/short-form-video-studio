@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { GeneratedClip, VideoJob } from './domain.js';
 import { defaultJobOptions } from './domain.js';
-import { deletedOn, keptFor, renderDeleteConfirmPage, renderDeletedPage, renderJobPage, renderUploadPage } from './pages.js';
+import { deletedOn, keptFor, renderDeleteConfirmPage, renderDeletedPage, renderJobPage, renderStopConfirmPage, renderUploadPage } from './pages.js';
+import { plainWords } from './failures.js';
 
 const job = (overrides: Partial<VideoJob> = {}): VideoJob => ({
   id: 'job-1', originalFilename: 'talk.mp4', storedFilename: 'talk.mp4', mimeType: 'video/mp4', sizeBytes: 1, status: 'completed', stage: 'completed', errorMessage: null,
@@ -163,4 +164,72 @@ test('the page shown after deleting says so and leads on, with nothing about the
   assert.match(page, /were deleted/);
   assert.match(page, /<a href="\/test-upload">Upload another video<\/a>/);
   assert.doesNotMatch(page, /<script|job-1|talk\.mp4/);
+});
+
+// ---- Stopping a video -------------------------------------------------------------------------------------------------------------
+
+const stopLink = /<a class="btn danger" href="\/jobs\/job-1\/stop">Stop this video<\/a>/;
+const stoppedJob = () => job({ status: 'failed', stage: 'stopped', errorMessage: plainWords.stopped, progress: 40 });
+
+test('a video that is being worked on offers to be stopped, and one that is over or already being stopped does not', () => {
+  for (const [status, stage] of [['queued', 'queued'], ['queued', 'waiting_for_capacity'], ['processing', 'transcribing'], ['processing', 'extracting_clips']] as const) {
+    const page = renderJobPage(job({ status, stage, progress: 40 }), []);
+    assert.match(page, stopLink, `a video that is ${status} (${stage}) can be stopped`);
+    assert.doesNotMatch(page, /\/delete|Delete this/, 'and cannot be deleted while it is worked on');
+  }
+  assert.doesNotMatch(renderJobPage(job(), [clip()]), /Stop this video|\/stop/, 'a finished video has nothing to stop');
+  assert.doesNotMatch(renderJobPage(job({ status: 'failed', stage: 'failed', errorMessage: 'No speech was found.' }), []), /Stop this video|\/stop/, 'neither has one that failed');
+  assert.doesNotMatch(renderJobPage(stoppedJob(), []), /Stop this video|\/stop/, 'neither has one that was stopped');
+  assert.doesNotMatch(renderJobPage(job({ status: 'processing', stage: 'transcribing', progress: 40 }), [], Date.now(), { stopping: true }), /Stop this video|\/stop/, 'a video that is being stopped is not offered to be stopped again');
+  const hostile = renderJobPage(job({ id: '"><script>alert(1)</script>', status: 'processing', stage: 'transcribing' }), []);
+  assert.doesNotMatch(hostile, /<script>alert/, 'the address of the job is escaped where it is put into the link');
+  assert.match(hostile, /href="\/jobs\/&quot;&gt;&lt;script&gt;alert\(1\)&lt;\/script&gt;\/stop"/);
+});
+
+test('a video that is being stopped says so, shows no progress and no way to stop it again, and keeps refreshing until the clean-up is over', () => {
+  const page = renderJobPage(job({ status: 'processing', stage: 'transcribing', progress: 40 }), [], Date.now(), { stopping: true });
+  assert.match(page, /<h1>Stopping your video<\/h1>/);
+  assert.match(page, /Status: <strong>stopping<\/strong>/);
+  assert.match(page, /What was made so far is being thrown away\./);
+  assert.match(page, /<meta http-equiv="refresh" content="5">/, 'the page looks again, and then shows that the video was stopped');
+  assert.doesNotMatch(page, /<progress|Still working|Processing your video|transcribing|Transcribing/i, 'it does not go on as if the work went on');
+  assert.doesNotMatch(page, /class="card error"/, 'a stop is not an error');
+  const resumed = job({ status: 'processing', stage: 'transcribing', progress: 40, attempts: 2 });
+  assert.match(renderJobPage(resumed, []), /Resumed automatically after the server restarted \(attempt 2\)\./, 'a video that went on after a restart says so');
+  assert.doesNotMatch(renderJobPage(resumed, [], Date.now(), { stopping: true }), /Resumed automatically/, 'but not while it is being stopped');
+  const notStopping = renderJobPage(job({ status: 'processing', stage: 'transcribing', progress: 40 }), []);
+  assert.match(notStopping, /<h1>Processing your video<\/h1>/);
+  assert.match(notStopping, /<progress/, 'a video that is not being stopped is shown as before');
+  assert.doesNotMatch(notStopping, /Stopping|stopping/);
+});
+
+test('a video that the person stopped says so in words of its own: not "failed", not in the colour of an error, with no way to stop it, and with a way to delete the job', () => {
+  const page = renderJobPage(stoppedJob(), []);
+  assert.match(page, /<h1>You stopped this video<\/h1>/);
+  assert.match(page, /Status: <strong>stopped<\/strong>/);
+  assert.doesNotMatch(page, /failed|could not be processed|\(stopped\)/i, 'the video did not fail');
+  assert.doesNotMatch(page, /class="card error"/, 'it is not an error');
+  assert.match(page, /You stopped this video before it was finished\. Nothing from it was kept\./, 'the words stored with the job are shown');
+  assert.doesNotMatch(page, /<meta http-equiv="refresh"|<progress/, 'there is nothing left to wait for');
+  assert.match(page, /<a class="btn danger" href="\/jobs\/job-1\/delete">Delete this job<\/a>/);
+  assert.match(page, /<a href="\/test-upload">Upload another video<\/a>/);
+  const failed = renderJobPage(job({ status: 'failed', stage: 'failed', errorMessage: 'No speech was found.' }), []);
+  assert.match(failed, /<h1>This video could not be processed<\/h1>/, 'a video that failed is shown as before');
+  assert.match(failed, /class="card error"/);
+  assert.match(failed, /Status: <strong>failed<\/strong>/);
+});
+
+test('the page that asks before stopping says what is lost, posts with a plain form, offers the way back, and escapes what came from the video', () => {
+  const page = renderStopConfirmPage(job({ id: 'job-9', originalFilename: '<b>talk</b>.mp4', status: 'processing', stage: 'transcribing' }));
+  assert.match(page, /<h1>Stop this video\?<\/h1>/);
+  assert.match(page, /<form method="post" action="\/jobs\/job-9\/stop"><button type="submit" class="danger">Yes, stop it<\/button><\/form>/);
+  assert.match(page, /<a href="\/jobs\/job-9">No, let it go on<\/a>/);
+  assert.match(page, /The work on it ends now, and what was made so far is thrown away\./, 'what is lost is said');
+  assert.match(page, /to get clips from this video, upload it again/);
+  assert.doesNotMatch(page, /<b>talk/);
+  assert.match(page, /&lt;b&gt;talk&lt;\/b&gt;\.mp4/);
+  assert.doesNotMatch(page, /<script/, 'the pages have no JavaScript at all');
+  const hostile = renderStopConfirmPage(job({ id: '"><script>alert(1)</script>' }));
+  assert.doesNotMatch(hostile, /<script>alert/, 'the address of the job is escaped where it is put into the form and the link');
+  assert.equal((hostile.match(/&quot;&gt;&lt;script&gt;alert\(1\)&lt;\/script&gt;/g) ?? []).length, 2);
 });

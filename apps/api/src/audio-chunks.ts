@@ -1,8 +1,5 @@
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
+import { execFileUntilStopped } from './stopping.js';
 import { runProgram } from './transcription.js';
-
-const execFileAsync = promisify(execFile);
 
 /** A stretch of silence in the audio, in seconds. */
 export interface Silence { startSeconds: number; endSeconds: number; }
@@ -58,7 +55,7 @@ export function planChunks(durationSeconds: number, silences: Silence[], targetS
 }
 
 /** The silences of an audio file: pauses of at least `minSeconds` that are quieter than `noiseDb`. */
-export async function detectSilences(ffmpegPath: string, audioPath: string, options: { noiseDb?: number; minSeconds?: number; timeoutMs?: number } = {}): Promise<Silence[]> {
+export async function detectSilences(ffmpegPath: string, audioPath: string, options: { noiseDb?: number; minSeconds?: number; timeoutMs?: number; signal?: AbortSignal } = {}): Promise<Silence[]> {
   const noise = options.noiseDb ?? -35; const minimum = options.minSeconds ?? 0.3;
   let carry = ''; const lines: string[] = [];
   // The report is read as it is printed: a long recording has thousands of lines, more than the tail runProgram would keep.
@@ -68,26 +65,27 @@ export async function detectSilences(ffmpegPath: string, audioPath: string, opti
     carry = parts.pop() ?? '';
     for (const line of parts) if (line.includes('silence_')) lines.push(line);
   };
-  await runProgram(ffmpegPath, ['-nostdin', '-hide_banner', '-i', audioPath, '-vn', '-af', `silencedetect=noise=${noise}dB:d=${minimum}`, '-f', 'null', '-'], { cwd: process.cwd(), timeoutMs: options.timeoutMs ?? 5 * 60_000, onStderr });
+  await runProgram(ffmpegPath, ['-nostdin', '-hide_banner', '-i', audioPath, '-vn', '-af', `silencedetect=noise=${noise}dB:d=${minimum}`, '-f', 'null', '-'], { cwd: process.cwd(), timeoutMs: options.timeoutMs ?? 5 * 60_000, onStderr, ...(options.signal ? { signal: options.signal } : {}) });
   if (carry.includes('silence_')) lines.push(carry);
   return parseSilences(lines.join('\n'));
 }
 
 /** Writes one piece of the audio as compressed mono speech (AAC at 48 kbit/s in an .m4a file, about 21 MB per hour). */
-export async function encodeChunk(ffmpegPath: string, audioPath: string, chunk: ChunkPlan, outputPath: string, timeoutMs = 2 * 60_000): Promise<void> {
+export async function encodeChunk(ffmpegPath: string, audioPath: string, chunk: ChunkPlan, outputPath: string, timeoutMs = 2 * 60_000, signal?: AbortSignal): Promise<void> {
   try {
-    await execFileAsync(ffmpegPath, ['-nostdin', '-hide_banner', '-loglevel', 'error', '-y', '-ss', String(chunk.startSeconds), '-t', String(round(chunk.endSeconds - chunk.startSeconds)), '-i', audioPath, '-vn', '-ac', '1', '-ar', '16000', '-c:a', 'aac', '-b:a', '48k', outputPath], { timeout: timeoutMs, maxBuffer: 1024 * 1024 });
+    await execFileUntilStopped(ffmpegPath, ['-nostdin', '-hide_banner', '-loglevel', 'error', '-y', '-ss', String(chunk.startSeconds), '-t', String(round(chunk.endSeconds - chunk.startSeconds)), '-i', audioPath, '-vn', '-ac', '1', '-ar', '16000', '-c:a', 'aac', '-b:a', '48k', outputPath], { timeout: timeoutMs, maxBuffer: 1024 * 1024 }, signal);
   } catch (error) {
+    if (signal?.aborted) throw signal.reason;
     throw new Error(`Could not prepare the audio for the speech recognition service: ${error instanceof Error ? error.message : 'unknown FFmpeg failure'}`);
   }
 }
 
 /** How long an audio file lasts, in seconds. */
-export async function audioDuration(ffprobePath: string, audioPath: string): Promise<number> {
+export async function audioDuration(ffprobePath: string, audioPath: string, signal?: AbortSignal): Promise<number> {
   try {
-    const { stdout } = await execFileAsync(ffprobePath, ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', audioPath], { timeout: 30_000, maxBuffer: 1024 * 1024 });
+    const { stdout } = await execFileUntilStopped(ffprobePath, ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', audioPath], { timeout: 30_000, maxBuffer: 1024 * 1024 }, signal);
     const seconds = Number(stdout.trim());
     if (Number.isFinite(seconds) && seconds > 0) return seconds;
-  } catch { /* reported below */ }
+  } catch { if (signal?.aborted) throw signal.reason; /* anything else is reported below */ }
   throw new Error('Could not read how long the audio is.');
 }

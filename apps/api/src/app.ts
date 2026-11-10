@@ -25,7 +25,7 @@ import { KeepAwake } from './keepawake.js';
 import { FailedAttemptLimiter, createAccessGate } from './access.js';
 import { installAccessGate } from './access-http.js';
 import { parseJobOptions } from './options.js';
-import { escapeHtml, keptFor, renderDeleteConfirmPage, renderDeletedPage, renderJobPage, renderMessagePage, renderUploadPage } from './pages.js';
+import { escapeHtml, keptFor, renderDeleteConfirmPage, renderDeletedPage, renderJobPage, renderMessagePage, renderStopConfirmPage, renderUploadPage } from './pages.js';
 import { JobEraser, RetentionSweeper, type RetentionOptions } from './retention.js';
 import { PlainFailure, onlyVideos, plainWords } from './failures.js';
 import { decideToneMapping, probeToneMapping, type ToneMappingSupport } from './hdr.js';
@@ -86,8 +86,15 @@ const DEFAULT_BOOT_RECOVERY_WAIT_MS = 30_000;
 /** What a person is told, and with which status and code, when a job was not deleted (a job that was deleted needs no words). */
 const notDeleted = {
   missing: { status: 404, code: 'JOB_NOT_FOUND', message: 'No processing job exists for this id.' },
-  'not finished': { status: 409, code: 'JOB_NOT_FINISHED', message: 'This video is still being processed. It can be deleted when it is finished.' },
+  'not finished': { status: 409, code: 'JOB_NOT_FINISHED', message: 'This video is still being processed. It can be deleted once it is finished, or once you have stopped it.' },
   'storage failed': { status: 503, code: 'DELETE_FAILED', message: 'The files of this video could not be deleted right now, and nothing was removed. Please try again in a moment.' },
+} as const;
+
+/** What a person is told, and with which status and code, when asking for a job to be stopped did not stop anything (a job that is stopping needs no words). */
+const notStopped = {
+  missing: { status: 404, code: 'JOB_NOT_FOUND', message: 'No processing job exists for this id.' },
+  'already over': { status: 409, code: 'JOB_ALREADY_OVER', message: 'This video is already finished, so there is nothing to stop.' },
+  'not running here': { status: 409, code: 'JOB_NOT_RUNNING', message: 'This video is not being worked on at this moment (it may be waiting to start again after a restart). Try again in a minute.' },
 } as const;
 
 export async function createApp(config: AppConfig, overrides: AppOverrides = {}) {
@@ -312,7 +319,25 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
   app.get('/jobs/:id', async (req, res) => {
     const job = await db.getJob(req.params.id);
     if (!job) return res.status(404).type('html').send(notFoundPage());
-    res.type('html').send(renderJobPage(job, await db.listClips(job.id), Date.now(), { retentionDays: config.CLIP_RETENTION_DAYS || undefined }));
+    res.type('html').send(renderJobPage(job, await db.listClips(job.id), Date.now(), { retentionDays: config.CLIP_RETENTION_DAYS || undefined, stopping: pipeline.isStopping(job.id) }));
+  });
+  // Stopping a job that is being worked on, shaped like deleting one: JSON for the API; for the pages, a link to a page that asks once more and a form that does it.
+  app.post('/api/jobs/:id/stop', async (req, res) => {
+    const outcome = await pipeline.stop(req.params.id);
+    if (outcome === 'stopping') return res.status(202).json({ stopping: true });
+    res.status(notStopped[outcome].status).json({ error: { code: notStopped[outcome].code, message: notStopped[outcome].message } });
+  });
+  app.get('/jobs/:id/stop', async (req, res) => {
+    const job = await db.getJob(req.params.id);
+    if (!job) return res.status(404).type('html').send(notFoundPage());
+    if (job.status === 'completed' || job.status === 'failed') return res.status(409).type('html').send(renderMessagePage('Already finished', notStopped['already over'].message, { href: `/jobs/${job.id}`, text: 'Back to the video' }));
+    res.type('html').send(renderStopConfirmPage(job));
+  });
+  app.post('/jobs/:id/stop', async (req, res) => {
+    const outcome = await pipeline.stop(req.params.id);
+    if (outcome === 'stopping') return res.redirect(303, `/jobs/${encodeURIComponent(req.params.id)}`);
+    if (outcome === 'missing') return res.status(404).type('html').send(notFoundPage());
+    res.status(notStopped[outcome].status).type('html').send(renderMessagePage(outcome === 'already over' ? 'Already finished' : 'Not being worked on', notStopped[outcome].message, { href: `/jobs/${req.params.id}`, text: 'Back to the video' }));
   });
   // Deleting a job: the API answers JSON, the pages need no JavaScript (a link to a page that asks once more, and a form that does it).
   app.delete('/api/jobs/:id', async (req, res) => {

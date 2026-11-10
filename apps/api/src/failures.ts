@@ -18,6 +18,17 @@ export class PlainFailure extends Error {
   }
 }
 
+/**
+ * The reason the work on a job is called off with when a person stops it (see `VideoPipeline.stop`). It is not a failure of the video or of the
+ * server: the pipeline recognises it by the reason the work was aborted with, and never tells it in the words of a failure.
+ */
+export class JobStopped extends Error {
+  constructor() {
+    super('The person who uploaded this video stopped it.');
+    this.name = 'JobStopped';
+  }
+}
+
 /** The only file types the server takes, in the words told to someone who sends another. */
 export const onlyVideos = 'Only MP4, MOV, MKV, WebM, AVI, and M4V video files are accepted.';
 
@@ -33,6 +44,8 @@ export const plainWords = {
   server: 'Something went wrong on the server. Please try again in a moment.',
   /** For a job that failed in a stage that has no words of its own. */
   jobServer: 'This video could not be processed because of a problem on the server. Please try again in a few minutes.',
+  /** What a job that a person stopped says about itself (it is recorded as failed, with the stage "stopped"). */
+  stopped: 'You stopped this video before it was finished. Nothing from it was kept.',
 } as const;
 
 const receiving = 'The video could not be received properly by the server. Please upload it again.';

@@ -16,7 +16,7 @@ import { paddedRange } from './ranges.js';
 import { aspectRatios, highlightOptionsFor } from './options.js';
 import { StageClock, stageProgress, totalMilliseconds } from './progress.js';
 import { sourceKeyFor, StoredObjectMissingError, type DurableStorage } from './storage.js';
-import { PlainFailure, failureMessage, plainWords } from './failures.js';
+import { JobStopped, PlainFailure, failureMessage, plainWords } from './failures.js';
 
 type PipelineStore = Pick<StudioDatabase, 'getJob' | 'updateJob' | 'replaceTranscript' | 'listTranscript' | 'replaceHighlights' | 'listHighlights' | 'createClip' | 'updateClip' | 'beginAttempt' | 'touchJob' | 'listUnfinishedJobs' | 'listFinishedJobsHoldingSource' | 'claimJobForRecovery' | 'failStaleJob' | 'deleteClipsForJob' | 'findCachedTranscript' | 'storeCachedTranscript' | 'pruneTranscriptCache' | 'recordAudioFingerprint'>;
 type MediaProcessor = Pick<FfmpegAdapter, 'probe' | 'extractAudio'>;
@@ -56,21 +56,31 @@ export interface RecoverySummary {
   waiting: number;
 }
 
+/** What asking for a job to be stopped came to (see `VideoPipeline.stop`). */
+export type StopOutcome = 'stopping' | 'missing' | 'already over' | 'not running here';
+
 const isFile = (path: string) => stat(path).then((info) => info.isFile(), () => false);
 
 /** The uploaded video is (as far as anyone knows) safe in durable storage but cannot be read back at this moment. That says nothing about the job itself. */
 class SourceUnavailableForNow extends Error {}
 
-/** Lets a fixed number of jobs into the heavy stages at once; the rest wait their turn in arrival order. */
-class Semaphore {
+/** Lets a fixed number of jobs into the heavy stages at once; the rest wait their turn in arrival order. (Exported for its tests.) */
+export class Semaphore {
   private held = 0;
   private readonly waiters: Array<() => void> = [];
   constructor(private readonly limit: number) {}
   get isFull() { return this.held >= this.limit; }
-  async acquire() {
+  /** A `signal` that is aborted while the job waits gives up its place in line, and the wait fails with the reason of the signal. */
+  async acquire(signal?: AbortSignal) {
+    signal?.throwIfAborted();
     if (this.held < this.limit) { this.held += 1; return; }
     // The slot is handed over by whoever releases it, so `held` stays the same.
-    await new Promise<void>((resolve) => this.waiters.push(resolve));
+    await new Promise<void>((resolve, reject) => {
+      const handOver = () => { signal?.removeEventListener('abort', giveUp); resolve(); };
+      const giveUp = () => { this.waiters.splice(this.waiters.indexOf(handOver), 1); reject(signal?.reason); };
+      this.waiters.push(handOver);
+      signal?.addEventListener('abort', giveUp, { once: true });
+    });
   }
   release() {
     const next = this.waiters.shift();
@@ -94,6 +104,8 @@ export class VideoPipeline {
   private readonly lastProgress = new Map<string, { percent: number; at: number }>();
   /** The latest progress write of each running job; the next stage change waits for it so an old value can never overwrite a newer one. */
   private readonly progressWrites = new Map<string, Promise<void>>();
+  /** One for each job this process is working on: it is aborted when the person who uploaded the video stops it (see `stop`). */
+  private readonly stoppers = new Map<string, AbortController>();
   private readonly slots: Semaphore;
   private recheckTimer: NodeJS.Timeout | undefined;
   private closed = false;
@@ -128,9 +140,30 @@ export class VideoPipeline {
   }
 
   async run(jobId: string) {
+    const stopper = new AbortController();
+    this.stoppers.set(jobId, stopper);
     this.startHeartbeat(jobId);
-    try { await this.process(jobId); } finally { this.stopHeartbeat(jobId); }
+    try { await this.process(jobId, stopper.signal); } finally { this.stopHeartbeat(jobId); this.stoppers.delete(jobId); }
   }
+
+  /**
+   * Stops the work on a job that this process is working on right now: whatever it is running ends at once, what it made is thrown away, and the job
+   * ends as failed in the stage "stopped" (see `recordStop`). This answers as soon as the stop is under way; the clean-up takes a moment longer.
+   * A job that is over, one that does not exist, and one that this process is not working on (another server has it, or it is waiting to be started
+   * again after a restart) are told apart, so that a person is told what is true of their video.
+   */
+  async stop(jobId: string): Promise<StopOutcome> {
+    const job = await this.db.getJob(jobId);
+    if (!job) return 'missing';
+    if (job.status === 'completed' || job.status === 'failed') return 'already over';
+    const stopper = this.stoppers.get(jobId);
+    if (!stopper) return 'not running here';
+    stopper.abort(new JobStopped());
+    return 'stopping';
+  }
+
+  /** Whether a stop of this job is under way, that is, the job is being cleaned up and its page should say so. */
+  isStopping(jobId: string): boolean { return this.stoppers.get(jobId)?.signal.aborted === true; }
 
   /**
    * Looks for jobs a dead process left unfinished and either resumes them or fails them with an
@@ -215,7 +248,7 @@ export class VideoPipeline {
     this.heartbeats.delete(jobId);
   }
 
-  private async process(jobId: string) {
+  private async process(jobId: string, signal: AbortSignal) {
     const job = await this.db.getJob(jobId); if (!job) return;
     const sourcePath = join(this.uploadDir, job.storedFilename);
     const jobOutputDir = join(this.outputDir, jobId);
@@ -233,16 +266,20 @@ export class VideoPipeline {
       // Everything up to here is plain file transfer and runs for every job at once, so a video is in
       // durable storage as early as possible even while another job occupies the CPU.
       if (this.slots.isFull) await this.enterStage(jobId, 'waiting_for_capacity', { status: 'queued' });
-      await this.slots.acquire();
+      await this.slots.acquire(signal);
       try {
         await this.enterStage(jobId, 'probing_video', { status: 'processing' });
-        await this.renderClips(job, sourcePath, jobOutputDir);
+        await this.renderClips(job, sourcePath, jobOutputDir, signal);
       } finally {
         this.slots.release();
       }
       reachedFinalState = true;
     } catch (error) {
-      if (error instanceof SourceUnavailableForNow && attempt < this.options.maxAttempts) {
+      if (signal.aborted && signal.reason instanceof JobStopped) {
+        // A stop wins over whatever was going wrong at that moment (a program that was killed fails in ways of its own): what ended the job is the person.
+        await this.recordStop(jobId, jobOutputDir, clock);
+        reachedFinalState = true;
+      } else if (error instanceof SourceUnavailableForNow && attempt < this.options.maxAttempts) {
         // Failing the job would end it, delete the only copy of the customer's video and make them upload it all over again, for a
         // problem that is likely to pass (the storage service having a bad minute while the server restarted). So this attempt is
         // simply abandoned, like one whose process died: the job keeps looking unfinished, nothing refreshes it, and the periodic look
@@ -270,6 +307,8 @@ export class VideoPipeline {
 
   /** Moves a job into a stage: closes the timing of the stage before it and records the stage with its place on the progress scale. */
   private async enterStage(jobId: string, stage: string, fields: Partial<Pick<VideoJob, 'status' | 'errorMessage' | 'durationSeconds' | 'width' | 'height'>> = {}) {
+    // A stop is seen at every change of stage, so that work which cannot be called off in the middle (a transfer, an engine that does not listen) is the last thing done.
+    this.stoppers.get(jobId)?.signal.throwIfAborted();
     await this.progressWrites.get(jobId)?.catch(() => undefined);
     const clock = this.clocks.get(jobId);
     clock?.enter(stage);
@@ -371,8 +410,11 @@ export class VideoPipeline {
     this.logger.info({ jobId: job.id, key, sizeBytes: job.sizeBytes }, 'Saved the uploaded video to durable storage');
   }
 
-  /** An interrupted earlier attempt may have left clip rows and files behind; the new attempt starts from a clean slate. */
-  private async discardPreviousClips(jobId: string, jobOutputDir: string) {
+  /**
+   * Throws away the clips made for a job: their rows, their files here and their objects in durable storage. A failure to delete an object is logged
+   * (with `words.couldNotDelete`) and never stops the rest; `words.discarded` is what is logged when there was something to throw away.
+   */
+  private async discardClips(jobId: string, jobOutputDir: string, words: { couldNotDelete: string; discarded: string }) {
     const leftovers = await this.db.deleteClipsForJob(jobId);
     await rm(jobOutputDir, { recursive: true, force: true });
     if (!leftovers.length) return;
@@ -380,11 +422,27 @@ export class VideoPipeline {
       for (const clip of leftovers) {
         for (const key of [clip.outputPath, `${jobId}/${clip.id}.srt`]) {
           try { await this.storage.delete(key); }
-          catch (error) { this.logger.error({ err: error, jobId, key }, 'Could not delete a leftover object from an interrupted attempt'); }
+          catch (error) { this.logger.error({ err: error, jobId, key }, words.couldNotDelete); }
         }
       }
     }
-    this.logger.info({ jobId, discardedClipCount: leftovers.length }, 'Discarded clips left behind by an interrupted attempt');
+    this.logger.info({ jobId, discardedClipCount: leftovers.length }, words.discarded);
+  }
+
+  /**
+   * The end of a job whose person stopped it. What was made for it is thrown away (nobody asked to keep half a video), and the job reads "failed" in the stage
+   * "stopped", with words that say that the person stopped it. A stop is not a failure of the server, so it is logged as information and never as an error;
+   * failing to throw the clips away is (they are found again by the retention sweep or by deleting the job, and the job still ends as stopped).
+   */
+  private async recordStop(jobId: string, jobOutputDir: string, clock: StageClock) {
+    this.logger.info({ jobId, stage: clock.currentStage }, 'Video processing was stopped by the person who uploaded it');
+    try {
+      await this.discardClips(jobId, jobOutputDir, { couldNotDelete: 'Could not delete an object of a clip of a video that was stopped', discarded: 'Discarded the clips of a video that was stopped' });
+    } catch (error) {
+      this.logger.error({ err: error, jobId }, 'Could not discard the clips of a video that was stopped');
+    }
+    await this.progressWrites.get(jobId)?.catch(() => undefined);
+    await this.db.updateJob(jobId, { status: 'failed', stage: 'stopped', errorMessage: plainWords.stopped, stageTimings: clock.finish() });
   }
 
   /** With durable storage the local copies are only scratch space (the disk is wiped on restart anyway), so free them as soon as the job is over. */
@@ -400,11 +458,12 @@ export class VideoPipeline {
    * Plans where the picture of a clip is cut from when the person asked for a face to be followed. Never fails the clip: whatever goes wrong
    * (no face, too little of one, a video that cannot be sampled, a server where this is switched off) the clip is cut from the middle, and says so.
    */
-  private async frameClip(jobId: string, sourcePath: string, range: { startSeconds: number; endSeconds: number }, outputAspect: number): Promise<FramingResult> {
+  private async frameClip(jobId: string, sourcePath: string, range: { startSeconds: number; endSeconds: number }, outputAspect: number, signal: AbortSignal): Promise<FramingResult> {
     if (!this.framer) return { followed: false, note: 'Centred: following a face is switched off on this server.' };
     try {
-      return await this.framer.frame({ sourcePath, startSeconds: range.startSeconds, endSeconds: range.endSeconds, outputAspect });
+      return await this.framer.frame({ sourcePath, startSeconds: range.startSeconds, endSeconds: range.endSeconds, outputAspect, signal });
     } catch (error) {
+      if (signal.aborted) throw error; // the job was stopped: there is no clip to centre
       this.logger.error({ err: error, jobId }, 'Looking for a face to follow failed; the clip is cut from the middle instead');
       return { followed: false, note: 'Centred: the video could not be checked for a face.' };
     }
@@ -416,7 +475,7 @@ export class VideoPipeline {
    * over after a restart does not lose a transcript it had already made). Whatever goes wrong with the cache, the speech is simply recognised:
    * the cache can make a job faster, never make it fail.
    */
-  private async recogniseSpeech(jobId: string, audioPath: string, workDir: string): Promise<{ segments: TranscriptInput; reused: boolean }> {
+  private async recogniseSpeech(jobId: string, audioPath: string, workDir: string, signal: AbortSignal): Promise<{ segments: TranscriptInput; reused: boolean }> {
     const days = this.options.transcriptCacheDays ?? 0;
     const engineKey = days > 0 ? this.transcriber.cacheKey : undefined;
     let fingerprint: string | undefined; let cached: TranscriptInput | undefined;
@@ -439,7 +498,7 @@ export class VideoPipeline {
       return { segments: cached, reused: true };
     }
     await this.enterStage(jobId, 'transcribing');
-    const segments = await this.transcriber.transcribe(audioPath, workDir, (fraction) => this.reportProgress(jobId, stageProgress('transcribing', fraction)));
+    const segments = await this.transcriber.transcribe(audioPath, workDir, (fraction) => this.reportProgress(jobId, stageProgress('transcribing', fraction)), signal);
     if (engineKey && fingerprint && segments.length) {
       try {
         await this.db.storeCachedTranscript(fingerprint, engineKey, segments);
@@ -451,17 +510,17 @@ export class VideoPipeline {
     return { segments, reused: false };
   }
 
-  private async renderClips(job: VideoJob, sourcePath: string, jobOutputDir: string) {
+  private async renderClips(job: VideoJob, sourcePath: string, jobOutputDir: string, signal: AbortSignal) {
     const jobId = job.id;
-    await this.discardPreviousClips(jobId, jobOutputDir);
-    const { hasAudio, hdr, ...metadata } = await this.ffmpeg.probe(sourcePath);
+    await this.discardClips(jobId, jobOutputDir, { couldNotDelete: 'Could not delete a leftover object from an interrupted attempt', discarded: 'Discarded clips left behind by an interrupted attempt' });
+    const { hasAudio, hdr, ...metadata } = await this.ffmpeg.probe(sourcePath, signal);
     await this.enterStage(jobId, 'extracting_audio', { ...metadata });
     if (hasAudio === false) throw new PlainFailure(plainWords.noSound);   // nothing to listen to: say so now, not after a failed extraction
     const workDir = await mkdtemp(join(this.tempDir, `${jobId}-`));
     try {
       const audioPath = join(workDir, 'audio.wav');
-      await this.ffmpeg.extractAudio(sourcePath, audioPath);
-      const { segments, reused: transcriptReused } = await this.recogniseSpeech(jobId, audioPath, workDir);
+      await this.ffmpeg.extractAudio(sourcePath, audioPath, signal);
+      const { segments, reused: transcriptReused } = await this.recogniseSpeech(jobId, audioPath, workDir, signal);
       await this.db.replaceTranscript(jobId, segments);
       await this.enterStage(jobId, 'detecting_highlights');
       const options = job.options;
@@ -484,7 +543,7 @@ export class VideoPipeline {
         const range = paddedRange(candidate.startSeconds, candidate.endSeconds, transcript, metadata.durationSeconds);
         // Only when asked for: a few small pictures per second of the clip are checked for a face (which takes CPU time).
         let framing: FramingResult | undefined;
-        if (options.framing === 'face') { const framingStarted = Date.now(); framing = await this.frameClip(jobId, sourcePath, range, aspectRatios[options.aspect]); framingMs += Date.now() - framingStarted; }
+        if (options.framing === 'face') { const framingStarted = Date.now(); framing = await this.frameClip(jobId, sourcePath, range, aspectRatios[options.aspect], signal); framingMs += Date.now() - framingStarted; }
         const clip: GeneratedClip = { id: clipId, jobId, candidateId: candidate.id, startSeconds: range.startSeconds, endSeconds: range.endSeconds, durationSeconds: range.endSeconds - range.startSeconds, outputPath: join(jobId, outputFilename), outputFilename, status: 'queued', errorMessage: null, captionPath: null, createdAt: now, updatedAt: now, title: candidate.title, score: candidate.score, reasons: candidate.reasons, framing: framing?.note ?? null };
         await this.db.createClip(clip); await this.db.updateClip(clipId, { status: 'processing' });
         try {
@@ -495,7 +554,7 @@ export class VideoPipeline {
             captionCount = await writeSrtCaptions(captionPath, transcript, range.startSeconds, range.endSeconds);
             styledCount = await writeAssCaptions(styledCaptionPath, transcript, range.startSeconds, range.endSeconds, captionStyle, options.aspect, { accent: options.captionAccent, position: options.captionPosition, size: options.captionSize });
           }
-          const rendered = await this.clipRenderer.render({ sourcePath, startSeconds: range.startSeconds, endSeconds: range.endSeconds, outputPath, captionPath: styledCount ? styledCaptionPath : null, quality: options.quality, aspect: options.aspect, framing: framing?.followed ? framing.plan : null, layout: options.framing === 'fit' ? 'fit' : 'fill', ...(hdr ? { hdr } : {}) });
+          const rendered = await this.clipRenderer.render({ sourcePath, startSeconds: range.startSeconds, endSeconds: range.endSeconds, outputPath, captionPath: styledCount ? styledCaptionPath : null, quality: options.quality, aspect: options.aspect, framing: framing?.followed ? framing.plan : null, layout: options.framing === 'fit' ? 'fit' : 'fill', ...(hdr ? { hdr } : {}), signal });
           if (rendered.colours === 'not converted') coloursKept += 1; else if (rendered.colours === 'converted') coloursConverted += 1;
           await rm(styledCaptionPath, { force: true });
           await this.storage.upload(outputPath, clip.outputPath, 'video/mp4');
@@ -503,10 +562,12 @@ export class VideoPipeline {
           await this.db.updateClip(clipId, { status: 'completed', durationSeconds: rendered.durationSeconds, errorMessage: null, captionPath }); completedCount += 1;
         } catch (error) {
           await rm(captionPath, { force: true }); await rm(styledCaptionPath, { force: true });
+          if (signal.aborted) throw error; // the job was stopped: this clip did not fail, and the others are not made
           await this.db.updateClip(clipId, { status: 'failed', errorMessage: plainWords.oneClip }); this.logger.error({ err: error, jobId, clipId, candidateId: candidate.id }, 'Clip extraction failed');
         }
         this.reportProgress(jobId, stageProgress('extracting_clips', (candidateNumber + 1) / candidates.length));
       }
+      signal.throwIfAborted(); // an engine that does not listen for a stop gets here with all its clips made; they are thrown away
       if (coloursKept) this.logger.warn({ jobId, hdr, clipCount: coloursKept }, 'This video is HDR but its colours could not be converted to those of an ordinary picture (this machine does not convert them, or the video does not say what its colours are): the clips play everywhere but look flatter than the original');
       if (!completedCount) throw new PlainFailure(`None of the ${candidates.length} clip${candidates.length === 1 ? '' : 's'} could be made from this video. Please try again, or try another video.`);
       await this.progressWrites.get(jobId)?.catch(() => undefined);

@@ -180,8 +180,14 @@ function whyThisMoment(clip: GeneratedClip): string {
 
 const STAGE_ORDER = ['preparing_source', 'saving_source', 'restoring_source', 'probing_video', 'extracting_audio', 'transcribing', 'reusing_transcript', 'detecting_highlights', 'extracting_clips'];
 
-export function renderJobPage(job: VideoJob, clips: GeneratedClip[], now: number = Date.now(), options: { retentionDays?: number } = {}): string {
+/**
+ * `stopping` says that the person has stopped this video and the work on it is being cleaned up (the job still reads as being worked on until that is done).
+ * A video that was stopped ends as "failed" in the stage "stopped"; the page says that the person stopped it, and shows nothing in the colour of an error.
+ */
+export function renderJobPage(job: VideoJob, clips: GeneratedClip[], now: number = Date.now(), options: { retentionDays?: number; stopping?: boolean } = {}): string {
   const stillWorking = job.status !== 'completed' && job.status !== 'failed';
+  const stopping = stillWorking && options.stopping === true;
+  const stopped = job.status === 'failed' && job.stage === 'stopped';
   const finished = job.status === 'completed';
   const readyClips = clips.filter((clip) => clip.status === 'completed');
   const unmadeClips = clips.filter((clip) => clip.status === 'failed').length;
@@ -190,14 +196,16 @@ export function renderJobPage(job: VideoJob, clips: GeneratedClip[], now: number
   const length = (clip: GeneratedClip) => (clip.durationSeconds ? `${Math.round(clip.durationSeconds)} s` : '');
   const timings = STAGE_ORDER.filter((stage) => job.stageTimings[stage] !== undefined).map((stage) => `<tr><td>${escapeHtml(stageLabel(stage))}</td><td>${formatDuration(job.stageTimings[stage])}</td></tr>`).join('');
 
-  const heading = finished ? 'Your clips' : job.status === 'failed' ? 'This video could not be processed' : 'Processing your video';
+  const heading = finished ? 'Your clips' : stopped ? 'You stopped this video' : job.status === 'failed' ? 'This video could not be processed' : stopping ? 'Stopping your video' : 'Processing your video';
+  const statusWord = stopped ? 'stopped' : stopping ? 'stopping' : job.status;
   const status = `
-<div class="card ${job.status === 'failed' ? 'error' : ''}">
-  <div class="stage">Status: <strong>${job.status}</strong>${finished || job.stage === job.status ? '' : ` (${escapeHtml(job.stage)})`}</div>
-  ${stillWorking ? `<div class="stage">${escapeHtml(stageLabel(job.stage))}</div><progress value="${job.progress}" max="100">${job.progress}%</progress><div class="row"><span>${job.progress}%</span><span class="muted">Running for ${formatDuration(elapsedMs)}</span></div>` : ''}
+<div class="card ${job.status === 'failed' && !stopped ? 'error' : ''}">
+  <div class="stage">Status: <strong>${statusWord}</strong>${finished || stopped || stopping || job.stage === job.status ? '' : ` (${escapeHtml(job.stage)})`}</div>
+  ${stillWorking && !stopping ? `<div class="stage">${escapeHtml(stageLabel(job.stage))}</div><progress value="${job.progress}" max="100">${job.progress}%</progress><div class="row"><span>${job.progress}%</span><span class="muted">Running for ${formatDuration(elapsedMs)}</span></div>` : ''}
   ${job.status === 'failed' && job.errorMessage ? `<div style="margin-top:8px">${escapeHtml(job.errorMessage)}</div>` : ''}
-  ${stillWorking ? '<div class="muted" style="margin-top:8px">Still working -- this page refreshes itself every 5 seconds.</div>' : ''}
-  ${stillWorking && job.attempts > 1 ? `<div class="muted" style="margin-top:8px">Resumed automatically after the server restarted (attempt ${job.attempts}).</div>` : ''}
+  ${stillWorking && !stopping ? '<div class="muted" style="margin-top:8px">Still working -- this page refreshes itself every 5 seconds.</div>' : ''}
+  ${stopping ? '<div style="margin-top:8px">Stopping this video. What was made so far is being thrown away.</div><div class="muted" style="margin-top:8px">This page refreshes itself every 5 seconds.</div>' : ''}
+  ${stillWorking && !stopping && job.attempts > 1 ? `<div class="muted" style="margin-top:8px">Resumed automatically after the server restarted (attempt ${job.attempts}).</div>` : ''}
   ${finished ? `<div class="muted">Done in ${formatDuration(Object.keys(job.stageTimings).length ? totalMilliseconds(job.stageTimings) : Math.max(0, Date.parse(job.updatedAt) - Date.parse(job.createdAt)))}.${unmadeClips ? ` ${unmadeClips} clip${unmadeClips === 1 ? '' : 's'} could not be made.` : ''}</div>` : ''}
 </div>`;
 
@@ -226,8 +234,20 @@ ${clipSection}
 ${timings && finished ? `<details class="card"><summary>Where the time went</summary><table>${timings}</table></details>` : ''}
 ${keeping}
 <p><a href="/test-upload">Upload another video</a></p>${over ? `
-<p><a class="btn danger" href="/jobs/${escapeHtml(job.id)}/delete">${finished ? 'Delete this video and its clips' : 'Delete this job'}</a></p>` : ''}
+<p><a class="btn danger" href="/jobs/${escapeHtml(job.id)}/delete">${finished ? 'Delete this video and its clips' : 'Delete this job'}</a></p>` : ''}${stillWorking && !stopping ? `
+<p><a class="btn danger" href="/jobs/${escapeHtml(job.id)}/stop">Stop this video</a></p>` : ''}
 <p class="id">Job ${escapeHtml(job.id)}</p>`, { refreshSeconds: stillWorking ? 5 : undefined });
+}
+
+/** Asks once more before a video is stopped: the work on it ends and what was made so far is thrown away, which cannot be brought back. */
+export function renderStopConfirmPage(job: VideoJob): string {
+  const id = escapeHtml(job.id);
+  return shell('Stop this video?', `
+<h1>Stop this video?</h1>
+<p class="lead" style="word-break:break-word">${escapeHtml(job.originalFilename)}</p>
+<div class="card">The work on it ends now, and what was made so far is thrown away. It cannot be picked up again: to get clips from this video, upload it again.</div>
+<form method="post" action="/jobs/${id}/stop"><button type="submit" class="danger">Yes, stop it</button></form>
+<p><a href="/jobs/${id}">No, let it go on</a></p>`);
 }
 
 /** Asks once more before a job is deleted: what is deleted for good cannot be brought back. */

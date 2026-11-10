@@ -1,8 +1,6 @@
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import { PlainFailure, plainWords } from './failures.js';
+import { execFileUntilStopped } from './stopping.js';
 import { hdrKindOf, type HdrKind } from './hdr.js';
-const execFileAsync = promisify(execFile);
 
 export interface VideoMetadata { durationSeconds: number; width: number; height: number; }
 /**
@@ -17,13 +15,15 @@ const isMissingProgram = (error: unknown) => typeof error === 'object' && error 
 export class FfmpegAdapter {
   /** Keep both binary locations here so extraction/reframing can be added without changing callers. */
   constructor(private readonly ffprobePath: string, readonly ffmpegPath: string) {}
-  async probe(inputPath: string): Promise<ProbeResult> {
+  /** `signal` (optional) kills the program when it is aborted, and then the failure is its reason (a stopped job is not an unreadable video). */
+  async probe(inputPath: string, signal?: AbortSignal): Promise<ProbeResult> {
     let data: { format?: { duration?: string }; streams?: Array<{ codec_type?: string; width?: number; height?: number; color_transfer?: string }> };
     try {
       // Every stream is listed (not only the first video stream) so that one look also tells whether the file has sound.
-      const { stdout } = await execFileAsync(this.ffprobePath, ['-v', 'error', '-show_entries', 'format=duration:stream=codec_type,width,height,color_transfer', '-of', 'json', inputPath], { timeout: 30_000, maxBuffer: 1024 * 1024 });
+      const { stdout } = await execFileUntilStopped(this.ffprobePath, ['-v', 'error', '-show_entries', 'format=duration:stream=codec_type,width,height,color_transfer', '-of', 'json', inputPath], { timeout: 30_000, maxBuffer: 1024 * 1024 }, signal);
       data = JSON.parse(stdout) as typeof data;
     } catch (error) {
+      if (signal?.aborted) throw signal.reason;
       if (isMissingProgram(error)) throw error;
       throw new PlainFailure(plainWords.unreadableVideo, { cause: error });
     }
@@ -33,10 +33,11 @@ export class FfmpegAdapter {
     const hdr = hdrKindOf(video.color_transfer);
     return { durationSeconds, width: video.width, height: video.height, hasAudio: streams.some((stream) => stream.codec_type === 'audio'), ...(hdr ? { hdr } : {}) };
   }
-  async extractAudio(inputPath: string, outputPath: string): Promise<void> {
+  async extractAudio(inputPath: string, outputPath: string, signal?: AbortSignal): Promise<void> {
     try {
-      await execFileAsync(this.ffmpegPath, ['-nostdin', '-hide_banner', '-v', 'error', '-y', '-i', inputPath, '-map', '0:a:0', '-vn', '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le', outputPath], { timeout: 10 * 60_000, maxBuffer: 1024 * 1024 });
+      await execFileUntilStopped(this.ffmpegPath, ['-nostdin', '-hide_banner', '-v', 'error', '-y', '-i', inputPath, '-map', '0:a:0', '-vn', '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le', outputPath], { timeout: 10 * 60_000, maxBuffer: 1024 * 1024 }, signal);
     } catch (error) {
+      if (signal?.aborted) throw signal.reason;
       if (isMissingProgram(error)) throw error;
       throw new PlainFailure(plainWords.unreadableSound, { cause: error });
     }

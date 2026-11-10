@@ -63,3 +63,9 @@ test('reusing a transcript sits where listening to the speech does, so progress 
   const values = order.map((stage) => stageProgress(stage));
   assert.deepEqual(values, [...values].sort((a, b) => a - b), `not increasing: ${values}`);
 });
+
+test('a video that was stopped is shown as stopped, with no progress to show', () => {
+  assert.equal(stageLabel('stopped'), 'Stopped');
+  assert.equal(stageProgress('stopped'), 0);
+  assert.equal(stageProgress('stopped', 0.5), 0);
+});

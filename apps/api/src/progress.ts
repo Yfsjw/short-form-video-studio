@@ -18,6 +18,7 @@ const stages: Record<string, { label: string; from: number; to: number }> = {
   extracting_clips: { label: 'Rendering the clips', from: 72, to: 99 },
   clip_extraction_complete: { label: 'Done', from: 100, to: 100 },
   failed: { label: 'Failed', from: 0, to: 0 },
+  stopped: { label: 'Stopped', from: 0, to: 0 },
 };
 
 /** A readable name for a stage; an unknown stage (a newer release's, say) is shown as it is. */

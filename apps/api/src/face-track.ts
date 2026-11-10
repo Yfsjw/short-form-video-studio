@@ -8,7 +8,8 @@ import { defaultFramingSettings, planFraming, type FramingObservation, type Fram
  */
 export interface ClipFramer {
   /** `outputAspect` (width over height of the clip) is the shape of this clip when it is not the one the framer was made for. */
-  frame(request: { sourcePath: string; startSeconds: number; endSeconds: number; outputAspect?: number }): Promise<FramingResult>;
+  /** `signal` calls the work off: FFmpeg is killed the moment it is aborted, and the failure is the reason of the signal. */
+  frame(request: { sourcePath: string; startSeconds: number; endSeconds: number; outputAspect?: number; signal?: AbortSignal }): Promise<FramingResult>;
 }
 
 /** A grey picture: one byte per pixel, row after row. */
@@ -83,7 +84,7 @@ export interface FaceFramerOptions {
 export class FaceClipFramer implements ClipFramer {
   constructor(private readonly options: FaceFramerOptions) {}
 
-  async frame(request: { sourcePath: string; startSeconds: number; endSeconds: number; outputAspect?: number }): Promise<FramingResult> {
+  async frame(request: { sourcePath: string; startSeconds: number; endSeconds: number; outputAspect?: number; signal?: AbortSignal }): Promise<FramingResult> {
     const clipSeconds = request.endSeconds - request.startSeconds;
     if (!Number.isFinite(clipSeconds) || clipSeconds <= 0) throw new Error('The stretch to look for faces in must have a positive length.');
     const cascade = await loadFaceCascade();
@@ -93,7 +94,8 @@ export class FaceClipFramer implements ClipFramer {
 
     const observations: FramingObservation[] = [];
     let previous: Uint8Array | undefined; let width = 0; let height = 0;
-    for await (const picture of this.pictures(request.sourcePath, request.startSeconds, clipSeconds, perSecond)) {
+    for await (const picture of this.pictures(request.sourcePath, request.startSeconds, clipSeconds, perSecond, request.signal)) {
+      request.signal?.throwIfAborted(); // pictures that were already on their way are not looked at once the job is stopped
       ({ width, height } = picture);
       const faces = detectFaces(cascade, picture.pixels, width, height, detect).map((face) => ({ x: (face.x + face.width / 2) / width, width: face.width / width, neighbors: face.neighbors }));
       const sceneCut = previous !== undefined && meanAbsoluteDifference(previous, picture.pixels, width, height) > cutDifference && histogramDistance(previous, picture.pixels, width, height) > cutHistogram;
@@ -107,7 +109,8 @@ export class FaceClipFramer implements ClipFramer {
   }
 
   /** FFmpeg's pictures of the stretch, as they arrive. */
-  private async *pictures(sourcePath: string, startSeconds: number, clipSeconds: number, perSecond: number): AsyncGenerator<GrayPicture> {
+  private async *pictures(sourcePath: string, startSeconds: number, clipSeconds: number, perSecond: number, signal?: AbortSignal): AsyncGenerator<GrayPicture> {
+    signal?.throwIfAborted();
     const filter = `fps=${Number(perSecond.toFixed(4))},scale=${this.options.pictureWidth ?? 480}:-2`;
     // Seeking before the input, as the renderer does, so that the pictures are counted from the start of the clip.
     const threads = this.options.threads ? ['-threads', String(this.options.threads)] : [];
@@ -118,14 +121,18 @@ export class FaceClipFramer implements ClipFramer {
     const finished = new Promise<number | null>((resolve, reject) => { child.once('error', reject); child.once('close', resolve); });
     finished.catch(() => undefined); // looked at below; this only keeps a failure from being "unhandled" while the pictures are still being read
     const timer = setTimeout(() => child.kill('SIGKILL'), this.options.timeoutMs ?? 10 * 60_000);
+    const callOff = () => child.kill('SIGKILL');
+    signal?.addEventListener('abort', callOff, { once: true });
     try {
       let streamError: unknown;
       try { yield* readPgmPictures(child.stdout); } catch (error) { streamError = error; child.kill('SIGKILL'); }
       const code = await finished; // a program that could not even be started fails here, and that is the real story
+      if (signal?.aborted) throw signal.reason; // called off: the program was killed, which is neither a broken stream nor a failed exit
       if (streamError) throw streamError;
       if (code !== 0) throw new Error(`FFmpeg could not take pictures from the video (exit code ${code})${stderr.trim() ? `: ${stderr.trim()}` : ''}`);
     } finally {
       clearTimeout(timer);
+      signal?.removeEventListener('abort', callOff);
       if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
     }
   }

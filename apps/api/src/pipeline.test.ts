@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { randomUUID } from 'node:crypto';
+import { getEventListeners } from 'node:events';
 import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -8,7 +9,8 @@ import { basename, join } from 'node:path';
 import { Pool } from 'pg';
 import { StudioDatabase } from './database.js';
 import { defaultJobOptions, type JobOptions, type NewVideoJob } from './domain.js';
-import { VideoPipeline, type PipelineRuntimeOptions } from './pipeline.js';
+import { Semaphore, VideoPipeline, type PipelineRuntimeOptions, type StopOutcome } from './pipeline.js';
+import type { FfmpegAdapter } from './ffmpeg.js';
 import { NullStorage, type DurableStorage } from './storage.js';
 import { MemoryStorage, eventually, sleep } from './test-support.js';
 import type { TranscriptInput, TranscriptionEngine } from './transcription.js';
@@ -16,7 +18,7 @@ import { DeterministicHighlightDetector } from './highlights.js';
 import type { ClipRenderer, ClipRenderRequest } from './clips.js';
 import type { ClipFramer } from './face-track.js';
 import type { FramingPlan } from './framing.js';
-import { PlainFailure, plainWords } from './failures.js';
+import { JobStopped, PlainFailure, plainWords } from './failures.js';
 
 const TEST_DATABASE_URL = process.env.DATABASE_URL ?? 'postgresql://postgres:localtest@localhost:5432/studio_local_test';
 const VIDEO = 'pretend these are the bytes of an uploaded video';
@@ -47,7 +49,7 @@ function unreachableWhile(isDown: () => boolean, db: StudioDatabase): StudioData
   } });
 }
 
-async function setup(options: { highlights?: Partial<typeof highlightOptions>; storage?: DurableStorage; transcriber?: TranscriptionEngine; renderer?: ClipRenderer; framer?: ClipFramer; runtime?: Partial<PipelineRuntimeOptions>; database?: (db: StudioDatabase) => StudioDatabase; media?: typeof fakeMedia } = {}) {
+async function setup(options: { highlights?: Partial<typeof highlightOptions>; storage?: DurableStorage; transcriber?: TranscriptionEngine; renderer?: ClipRenderer; framer?: ClipFramer; runtime?: Partial<PipelineRuntimeOptions>; database?: (db: StudioDatabase) => StudioDatabase; media?: Pick<FfmpegAdapter, 'probe' | 'extractAudio'> } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'studio-pipeline-'));
   const uploadDir = join(root, 'uploads'); const tempDir = join(root, 'tmp'); const outputDir = join(root, 'outputs');
   await Promise.all([mkdir(uploadDir), mkdir(tempDir), mkdir(outputDir)]);
@@ -981,9 +983,9 @@ const faceOptions: JobOptions = { ...defaultJobOptions, clipCount: 2, clipLength
 const recordingRenderer = (requests: ClipRenderRequest[]): ClipRenderer => ({ render: async (request) => { requests.push(request); await writeFile(request.outputPath, 'rendered clip'); return { durationSeconds: request.endSeconds - request.startSeconds, sizeBytes: 13 }; } });
 
 test('following a face: only when asked for, each clip is checked on its own stretch of the video, the plan goes to the renderer, and the clip says what was done', async () => {
-  const requests: ClipRenderRequest[] = []; const asked: Array<{ sourcePath: string; startSeconds: number; endSeconds: number }> = [];
+  const requests: ClipRenderRequest[] = []; const asked: Array<{ sourcePath: string; startSeconds: number; endSeconds: number }> = []; const signals: Array<AbortSignal | undefined> = [];
   const plan: FramingPlan = { keyframes: [{ seconds: 0, position: 0.2 }, { seconds: 2, position: 0.6 }] };
-  const framer: ClipFramer = { frame: async (request) => { asked.push(request); return { followed: true, plan, seenShare: 0.8, tracksFollowed: 1, note: 'Followed a face, seen in 80% of the moments checked.' }; } };
+  const framer: ClipFramer = { frame: async ({ signal, ...request }) => { asked.push(request); signals.push(signal); return { followed: true, plan, seenShare: 0.8, tracksFollowed: 1, note: 'Followed a face, seen in 80% of the moments checked.' }; } };
   const ctx = await setup({ transcriber: { transcribe: async () => threeMinutes }, renderer: recordingRenderer(requests), framer, media: threeMinuteVideo });
   try {
     await addJob(ctx, 'j-face', { options: faceOptions });
@@ -993,6 +995,7 @@ test('following a face: only when asked for, each clip is checked on its own str
     for (const [index, request] of requests.entries()) {
       assert.deepEqual(asked[index], { sourcePath: request.sourcePath, startSeconds: request.startSeconds, endSeconds: request.endSeconds, outputAspect: 9 / 16 }, 'the face is looked for in exactly the stretch that becomes the clip, for a window of the shape of the clip');
       assert.deepEqual(request.framing, plan, 'the renderer is given the plan');
+      assert.ok(signals[index] instanceof AbortSignal && signals[index] === request.signal, 'the look for a face and the rendering are called off by the same signal: the one of the job');
     }
     const clips = await ctx.db.listClips('j-face');
     assert.deepEqual(clips.map((clip) => clip.framing), ['Followed a face, seen in 80% of the moments checked.', 'Followed a face, seen in 80% of the moments checked.']);
@@ -1384,4 +1387,399 @@ test('a video that is no longer on the server, and was not saved anywhere else, 
       noTrace(job?.errorMessage);
     } finally { await ctx.cleanup(); }
   }
+});
+
+// ---------------------------------------------------------------------------------------------------------------------------
+// Stopping a job: whatever a job has got to, `VideoPipeline.stop` ends it as stopped and throws away what it made.
+
+const stopWords = 'Video processing was stopped by the person who uploaded it';
+const savedFirst = ['preparing_source', 'saving_source'];
+const upToTranscribing = [...savedFirst, 'probing_video', 'extracting_audio', 'transcribing'];
+const upToClips = [...upToTranscribing, 'detecting_highlights', 'extracting_clips'];
+const killed = new Error('ffmpeg was ended by the signal SIGKILL');
+const twoClips: JobOptions = { ...defaultJobOptions, clipCount: 2, clipLength: 'short' };
+
+/** Work that listens for a stop like the real engines do: it never ends by itself and fails the moment its job is stopped (with the reason of the stop, or with `failure` when an engine fails in a way of its own). `entered` says that the job has got to it. */
+function untilStopped(signal: AbortSignal | undefined, entered: () => void, failure?: Error): Promise<never> {
+  return new Promise<never>((_resolve, reject) => {
+    const end = () => reject(failure ?? signal?.reason);
+    entered();
+    if (signal?.aborted) end(); else signal?.addEventListener('abort', end, { once: true });
+  });
+}
+
+/** Wraps the database so that `before` runs, and is waited for, ahead of every call of the method `name` (it is given the arguments of the call): a way of making something happen at an exact moment of a job. */
+function beforeCall(name: string, before: (args: unknown[]) => Promise<void> | void) {
+  return (db: StudioDatabase): StudioDatabase => new Proxy(db, { get(target, property, receiver) {
+    const value = Reflect.get(target, property, receiver);
+    if (typeof value !== 'function') return value;
+    if (property !== name) return (...args: unknown[]) => value.apply(target, args);
+    return async (...args: unknown[]) => { await before(args); return value.apply(target, args); };
+  } });
+}
+
+/** What a job that was stopped has come to once everything is over: it ended as stopped, nothing it made is kept (on disk or in storage), its video is released, and the stop was told as information and not as a failure. */
+async function assertEndedAsStopped(ctx: Context, jobId: string, options: { stage: string | undefined; stages: string[]; discarded?: number }) {
+  const job = await ctx.db.getJob(jobId);
+  assert.deepEqual({ status: job?.status, stage: job?.stage, errorMessage: job?.errorMessage, sourceStorageKey: job?.sourceStorageKey }, { status: 'failed', stage: 'stopped', errorMessage: plainWords.stopped, sourceStorageKey: null });
+  assert.deepEqual(Object.keys(job?.stageTimings ?? {}), options.stages, 'the stages the job had entered when it was stopped, and no others');
+  assert.deepEqual(await ctx.db.listClips(jobId), [], 'a stopped job keeps no clips');
+  assert.deepEqual([...(ctx.storage as MemoryStorage).objects.keys()].filter((key) => key.includes(jobId)), [], 'nothing of a stopped job is left in storage, its video included');
+  assert.equal(existsSync(join(ctx.outputDir, jobId)), false, 'no clips are left on disk');
+  assert.equal(existsSync(join(ctx.uploadDir, `${jobId}.mp4`)), false, 'the video is not kept on the server');
+  assert.deepEqual(ctx.errors, [], 'a stop is not an error');
+  assert.deepEqual(ctx.infos.filter((entry) => entry.message === stopWords).map((entry) => ({ jobId: entry.fields.jobId, stage: entry.fields.stage })), [{ jobId, stage: options.stage }], 'the stop is told once, with the stage it came in');
+  assert.deepEqual(ctx.infos.filter((entry) => entry.message === 'Discarded the clips of a video that was stopped').map((entry) => ({ jobId: entry.fields.jobId, discardedClipCount: entry.fields.discardedClipCount })), options.discarded ? [{ jobId, discardedClipCount: options.discarded }] : [], 'what was thrown away is told, with how many clips it was');
+  assert.equal(ctx.pipeline.isStopping(jobId), false, 'nothing keeps stopping once the job is over');
+}
+
+/** What each kind of work does when its job is stopped. */
+type StopScenario = { name: string; stage: string; stages: string[]; options?: JobOptions; rendered: number; madeClips: boolean; discarded: number; engines: (entered: () => void, calls: { rendered: number }) => NonNullable<Parameters<typeof setup>[0]> };
+const stopScenarios: StopScenario[] = [
+  { name: 'FFmpeg is reading the video', stage: 'probing_video', stages: [...savedFirst, 'probing_video'], rendered: 0, madeClips: false, discarded: 0,
+    engines: (entered) => ({ media: { ...fakeMedia, probe: (_input, signal) => untilStopped(signal, entered) } }) },
+  { name: 'the sound is being taken out of the video (the program fails in a way of its own when it is ended)', stage: 'extracting_audio', stages: [...savedFirst, 'probing_video', 'extracting_audio'], rendered: 0, madeClips: false, discarded: 0,
+    engines: (entered) => ({ media: { ...fakeMedia, extractAudio: (_input, _output, signal) => untilStopped(signal, entered, killed) } }) },
+  { name: 'the speech is being recognised', stage: 'transcribing', stages: upToTranscribing, rendered: 0, madeClips: false, discarded: 0,
+    engines: (entered) => ({ transcriber: { transcribe: (_audio, _dir, _progress, signal) => untilStopped(signal, entered) } }) },
+  { name: 'a face is being looked for', stage: 'extracting_clips', stages: upToClips, options: faceOptions, rendered: 0, madeClips: false, discarded: 0,
+    engines: (entered, calls) => ({ transcriber: { transcribe: async () => threeMinutes }, media: threeMinuteVideo, framer: { frame: ({ signal }) => untilStopped(signal, entered) }, renderer: { render: (request) => { calls.rendered += 1; return writingRenderer.render(request); } } }) },
+  { name: 'the first clip is being made (the program fails in a way of its own when it is ended)', stage: 'extracting_clips', stages: upToClips, rendered: 1, madeClips: false, discarded: 1,
+    engines: (entered, calls) => ({ renderer: { render: (request) => { calls.rendered += 1; return untilStopped(request.signal, entered, killed); } } }) },
+  { name: 'a later clip is being made, after one was finished and saved', stage: 'extracting_clips', stages: upToClips, options: twoClips, rendered: 2, madeClips: true, discarded: 2,
+    engines: (entered, calls) => ({ transcriber: { transcribe: async () => threeMinutes }, media: threeMinuteVideo, renderer: { render: (request) => { calls.rendered += 1; return calls.rendered === 1 ? writingRenderer.render(request) : untilStopped(request.signal, entered, killed); } } }) },
+];
+
+for (const scenario of stopScenarios) {
+  test(`a stop while ${scenario.name} ends the job as stopped: what runs is called off, what was made is thrown away, and nothing is told as a failure`, async () => {
+    let entered = false; const calls = { rendered: 0 };
+    const ctx = await setup(scenario.engines(() => { entered = true; }, calls));
+    try {
+      await addJob(ctx, 'j-stop', scenario.options ? { options: scenario.options } : {});
+      const running = ctx.pipeline.run('j-stop');
+      await waitUntil(`the job to be at the point where ${scenario.name}`, () => entered);
+      if (scenario.madeClips) assert.ok([...(ctx.storage as MemoryStorage).uploaded.keys()].some((key) => key.startsWith('j-stop/')), 'a clip was made and saved before the stop');
+      assert.equal(await ctx.pipeline.stop('j-stop'), 'stopping');
+      assert.equal(ctx.pipeline.isStopping('j-stop'), true, 'the job is being stopped, which is what its page says');
+      await within(running, 8000, 'the job did not end after it was stopped');
+      await assertEndedAsStopped(ctx, 'j-stop', { stage: scenario.stage, stages: scenario.stages, discarded: scenario.discarded });
+      assert.equal(calls.rendered, scenario.rendered, 'no clip was started after the stop');
+    } finally { await ctx.cleanup(); }
+  });
+}
+
+test('a stop that arrives before the job has begun any work ends it at once: nothing is saved, nothing is run, and nothing of it is left', async () => {
+  let ctx!: Context; let probed = 0; let outcome: StopOutcome | undefined;
+  ctx = await setup({ media: { ...fakeMedia, probe: async () => { probed += 1; return fakeMedia.probe(); } }, database: beforeCall('beginAttempt', async ([id]) => { outcome = await ctx.pipeline.stop(String(id)); }) });
+  try {
+    await addJob(ctx, 'j-stop');
+    await within(ctx.pipeline.run('j-stop'), 8000, 'the job did not end after it was stopped');
+    assert.equal(outcome, 'stopping');
+    await assertEndedAsStopped(ctx, 'j-stop', { stage: undefined, stages: [] });
+    assert.equal(probed, 0, 'the video was read although the job was stopped');
+    assert.deepEqual((ctx.storage as MemoryStorage).log.filter((entry) => entry.startsWith('upload:')), [], 'the video was saved although the job was stopped');
+  } finally { await ctx.cleanup(); }
+});
+
+test('a stop that arrives while the pipeline itself is at work (not an engine) is seen at the next change of stage: no clip is started', async () => {
+  let ctx!: Context; const calls = { rendered: 0 };
+  ctx = await setup({ renderer: { render: (request) => { calls.rendered += 1; return writingRenderer.render(request); } }, database: beforeCall('replaceHighlights', async ([id]) => { await ctx.pipeline.stop(String(id)); }) });
+  try {
+    await addJob(ctx, 'j-stop');
+    await within(ctx.pipeline.run('j-stop'), 8000, 'the job did not end after it was stopped');
+    await assertEndedAsStopped(ctx, 'j-stop', { stage: 'detecting_highlights', stages: [...upToTranscribing, 'detecting_highlights'] });
+    assert.equal(calls.rendered, 0, 'a clip was started after the stop');
+  } finally { await ctx.cleanup(); }
+});
+
+test('stopping a job that reuses a transcript harms nothing that is kept for reuse: the next job still reuses it', async () => {
+  let ctx!: Context; const engine = listeningEngine({ key: 'test-engine|1' });
+  ctx = await setup({ transcriber: engine, media: hearing, runtime: withCache, database: beforeCall('replaceTranscript', async ([id]) => { if (id === 'jb') await ctx.pipeline.stop('jb'); }) });
+  try {
+    await addJob(ctx, 'ja'); await ctx.pipeline.run('ja');
+    assert.equal(engine.calls, 1);
+    await addJob(ctx, 'jb'); await within(ctx.pipeline.run('jb'), 8000, 'the job did not end after it was stopped');
+    await assertEndedAsStopped(ctx, 'jb', { stage: 'reusing_transcript', stages: [...savedFirst, 'probing_video', 'extracting_audio', 'reusing_transcript'] });
+    await addJob(ctx, 'jc'); await ctx.pipeline.run('jc');
+    assert.equal((await ctx.db.getJob('jc'))?.status, 'completed');
+    assert.equal(engine.calls, 1, 'the speech was listened to again although its transcript was kept');
+  } finally { await ctx.cleanup(); }
+});
+
+/** Storage whose uploads wait for `gate` before they do anything: a transfer of a big video that takes a while. */
+class SlowUploads extends MemoryStorage {
+  gate: Promise<void> = Promise.resolve();
+  override async upload(localPath: string, key: string) { this.log.push(`reached:${key}`); await this.gate; return super.upload(localPath, key); }
+}
+/** Storage that cannot be read for as long as `gate` is closed, and then fails, like a storage service having a bad minute. */
+class BrokenReads extends MemoryStorage {
+  constructor(private readonly gate: Promise<void>) { super(); }
+  override async download(key: string, _localPath: string) { this.log.push(`download:${key}`); await this.gate; throw new Error('simulated storage outage'); }
+}
+
+test('a stop while the uploaded video is being saved does not break the transfer off: it is finished, and the job then ends as stopped without any work', async () => {
+  let release!: () => void; const storage = new SlowUploads(); storage.gate = new Promise<void>((resolve) => { release = resolve; });
+  let probed = 0;
+  const ctx = await setup({ storage, media: { ...fakeMedia, probe: async () => { probed += 1; return fakeMedia.probe(); } } });
+  try {
+    await addJob(ctx, 'j-stop');
+    const running = ctx.pipeline.run('j-stop');
+    await waitUntil('the video to be on its way to storage', () => storage.log.includes('reached:sources/j-stop/source.mp4'));
+    assert.equal(await ctx.pipeline.stop('j-stop'), 'stopping');
+    await sleep(100);
+    assert.equal((await ctx.db.getJob('j-stop'))?.stage, 'saving_source', 'the transfer was broken off');
+    release();
+    await within(running, 8000, 'the job did not end after it was stopped');
+    assert.ok(storage.uploaded.has('sources/j-stop/source.mp4'), 'the transfer was not finished');
+    assert.equal(probed, 0, 'the video was read although the job was stopped');
+    await assertEndedAsStopped(ctx, 'j-stop', { stage: 'saving_source', stages: savedFirst });
+  } finally { await ctx.cleanup(); }
+});
+
+test('a stop wins over a video that could not be read back at that moment: the job ends as stopped and is not left to be tried again, its stored video is released, and nothing is resumed', async () => {
+  let release!: () => void; const storage = new BrokenReads(new Promise<void>((resolve) => { release = resolve; }));
+  const ctx = await setup({ storage });
+  try {
+    await addJob(ctx, 'j-stop', { status: 'processing', local: false, durable: true, attempts: 1 });
+    const running = ctx.pipeline.run('j-stop');
+    await waitUntil('the video to be read back', () => storage.log.includes('download:sources/j-stop/source.mp4'));
+    assert.equal(await ctx.pipeline.stop('j-stop'), 'stopping');
+    release();
+    await within(running, 8000, 'the job did not end after it was stopped');
+    await assertEndedAsStopped(ctx, 'j-stop', { stage: 'restoring_source', stages: ['preparing_source', 'restoring_source'] });
+    assert.deepEqual(await ctx.pipeline.recoverInterruptedJobs(), { resumed: [], failed: [], waiting: 0 }, 'a stopped job is over: nothing is resumed');
+  } finally { await ctx.cleanup(); }
+});
+
+/** An engine that holds the place for the heavy stages (its job is "listening") until `release` is called, and lets every other job through. */
+function holdingTheFirst(release: Promise<void>, listened: string[]): TranscriptionEngine {
+  return { transcribe: async (_audio: string, workDir: string) => {
+    const who = basename(workDir).split('-')[0]!;
+    listened.push(who);
+    if (who === 'ja') await release;
+    return [{ segmentIndex: 0, startSeconds: 0, endSeconds: 2, text: 'words' }];
+  } };
+}
+
+test('a job that is waiting for its turn is stopped at once: it gives up its place without disturbing the job in front of it, and the job behind it still gets its turn', async () => {
+  let release!: () => void; const blocked = new Promise<void>((resolve) => { release = resolve; });
+  const listened: string[] = [];
+  const ctx = await setup({ transcriber: holdingTheFirst(blocked, listened) });
+  try {
+    await addJob(ctx, 'ja'); await addJob(ctx, 'jb'); await addJob(ctx, 'jc');
+    const first = ctx.pipeline.run('ja');
+    await waitUntil('the first job to be listening', () => listened.includes('ja'));
+    const second = ctx.pipeline.run('jb');
+    await eventually('the second job to wait for a place', async () => (await ctx.db.getJob('jb'))?.stage, (stage) => stage === 'waiting_for_capacity');
+    const third = ctx.pipeline.run('jc');
+    await eventually('the third job to wait for a place', async () => (await ctx.db.getJob('jc'))?.stage, (stage) => stage === 'waiting_for_capacity');
+    assert.equal(await ctx.pipeline.stop('jb'), 'stopping');
+    await within(second, 8000, 'the stopped job went on waiting for a place');
+    await assertEndedAsStopped(ctx, 'jb', { stage: 'waiting_for_capacity', stages: [...savedFirst, 'waiting_for_capacity'] });
+    const [front, behind] = await Promise.all([ctx.db.getJob('ja'), ctx.db.getJob('jc')]);
+    assert.equal(front?.stage, 'transcribing', 'the job that had the place was disturbed');
+    assert.deepEqual({ status: behind?.status, stage: behind?.stage }, { status: 'queued', stage: 'waiting_for_capacity' }, 'the job behind was moved');
+    release();
+    await within(Promise.all([first, third]), 8000, 'the jobs that were not stopped did not finish');
+    assert.deepEqual(listened, ['ja', 'jc'], 'the stopped job took a turn, or the job behind it lost its turn');
+    assert.deepEqual([(await ctx.db.getJob('ja'))?.status, (await ctx.db.getJob('jc'))?.status], ['completed', 'completed']);
+  } finally { await ctx.cleanup(); }
+});
+
+test('a stop that arrives while the job is saying that it is waiting for a place is not missed: the job ends at once, although the place is still held', async () => {
+  let ctx!: Context; let release!: () => void; const blocked = new Promise<void>((resolve) => { release = resolve; });
+  const listened: string[] = [];
+  ctx = await setup({ transcriber: holdingTheFirst(blocked, listened), database: beforeCall('updateJob', async ([id, fields]) => { if (id === 'jb' && (fields as { stage?: string }).stage === 'waiting_for_capacity') await ctx.pipeline.stop('jb'); }) });
+  try {
+    await addJob(ctx, 'ja'); await addJob(ctx, 'jb');
+    const first = ctx.pipeline.run('ja');
+    await waitUntil('the first job to be listening', () => listened.includes('ja'));
+    await within(ctx.pipeline.run('jb'), 8000, 'the job stayed in line although it was stopped: it only ended once the place was free');
+    await assertEndedAsStopped(ctx, 'jb', { stage: 'waiting_for_capacity', stages: [...savedFirst, 'waiting_for_capacity'] });
+    assert.equal((await ctx.db.getJob('ja'))?.stage, 'transcribing', 'the job that had the place was disturbed');
+    release();
+    await within(first, 8000, 'the job that was not stopped did not finish');
+    assert.equal((await ctx.db.getJob('ja'))?.status, 'completed');
+    assert.deepEqual(listened, ['ja']);
+  } finally { await ctx.cleanup(); }
+});
+
+test('stopping tells a person what is true of their video: it does not exist, it is over already, or this server is not working on it', async () => {
+  const ctx = await setup();
+  try {
+    await addJob(ctx, 'j-done', { status: 'completed' }); await addJob(ctx, 'j-failed', { status: 'failed' });
+    await addJob(ctx, 'j-waiting');                          // saved, and nobody is working on it
+    await addJob(ctx, 'j-elsewhere', { status: 'processing' }); // being worked on, but not by this process (another server, or it died)
+    assert.deepEqual(await Promise.all(['nothing-like-it', 'j-done', 'j-failed', 'j-waiting', 'j-elsewhere'].map((id) => ctx.pipeline.stop(id))), ['missing', 'already over', 'already over', 'not running here', 'not running here']);
+    assert.deepEqual(await Promise.all(['j-done', 'j-failed', 'j-waiting', 'j-elsewhere'].map(async (id) => (await ctx.db.getJob(id))?.status)), ['completed', 'failed', 'queued', 'processing'], 'asking for a stop changed a job that was not being worked on');
+    assert.deepEqual(['j-done', 'j-waiting', 'nothing-like-it'].map((id) => ctx.pipeline.isStopping(id)), [false, false, false]);
+  } finally { await ctx.cleanup(); }
+});
+
+test('a job that is being stopped says so until its clean-up is over; stopping it again is harmless, and afterwards it is over', async () => {
+  let ctx!: Context; let cleanUp!: () => void; const held = new Promise<void>((resolve) => { cleanUp = resolve; }); let entered = false;
+  ctx = await setup({ transcriber: { transcribe: (_audio, _dir, _progress, signal) => untilStopped(signal, () => { entered = true; }) }, database: beforeCall('deleteClipsForJob', async ([id]) => { if (ctx.pipeline.isStopping(String(id))) await held; }) });
+  try {
+    await addJob(ctx, 'j-stop');
+    assert.equal(ctx.pipeline.isStopping('j-stop'), false, 'a job nobody works on is not being stopped');
+    const running = ctx.pipeline.run('j-stop');
+    await waitUntil('the job to be listening', () => entered);
+    assert.equal(ctx.pipeline.isStopping('j-stop'), false, 'a job that is being worked on is not being stopped');
+    assert.equal(await ctx.pipeline.stop('j-stop'), 'stopping');
+    assert.equal(ctx.pipeline.isStopping('j-stop'), true);
+    await sleep(100);
+    assert.deepEqual({ status: (await ctx.db.getJob('j-stop'))?.status, stopping: ctx.pipeline.isStopping('j-stop') }, { status: 'processing', stopping: true }, 'the job reads as over before its clean-up is');
+    assert.equal(await ctx.pipeline.stop('j-stop'), 'stopping', 'asking again for a stop that is under way');
+    cleanUp();
+    await within(running, 8000, 'the job did not end after it was stopped');
+    assert.equal(await ctx.pipeline.stop('j-stop'), 'already over');
+    await assertEndedAsStopped(ctx, 'j-stop', { stage: 'transcribing', stages: upToTranscribing });
+  } finally { await ctx.cleanup(); }
+});
+
+test('an engine that does not listen for the stop gets the job no further: its transcript arrives and the next stage is never started', async () => {
+  let release!: () => void; const blocked = new Promise<void>((resolve) => { release = resolve; }); let entered = false; const calls = { rendered: 0 };
+  const deaf: TranscriptionEngine = { transcribe: async () => { entered = true; await blocked; return [{ segmentIndex: 0, startSeconds: 0, endSeconds: 2, text: 'words' }]; } };
+  const ctx = await setup({ transcriber: deaf, renderer: { render: (request) => { calls.rendered += 1; return writingRenderer.render(request); } } });
+  try {
+    await addJob(ctx, 'j-stop');
+    const running = ctx.pipeline.run('j-stop');
+    await waitUntil('the job to be listening', () => entered);
+    assert.equal(await ctx.pipeline.stop('j-stop'), 'stopping');
+    release();
+    await within(running, 8000, 'the job did not end after it was stopped');
+    await assertEndedAsStopped(ctx, 'j-stop', { stage: 'transcribing', stages: upToTranscribing });
+    assert.equal(calls.rendered, 0, 'a clip was made after the stop');
+  } finally { await ctx.cleanup(); }
+});
+
+test('a renderer that does not listen for the stop makes its clips, and the job still ends as stopped with none of them kept', async () => {
+  let release!: () => void; const blocked = new Promise<void>((resolve) => { release = resolve; }); let entered = false; const calls = { rendered: 0 };
+  const deaf: ClipRenderer = { render: async (request) => { calls.rendered += 1; if (calls.rendered === 1) { entered = true; await blocked; } return writingRenderer.render(request); } };
+  const ctx = await setup({ transcriber: { transcribe: async () => threeMinutes }, media: threeMinuteVideo, renderer: deaf });
+  try {
+    await addJob(ctx, 'j-stop', { options: twoClips });
+    const running = ctx.pipeline.run('j-stop');
+    await waitUntil('the first clip to be made', () => entered);
+    assert.equal(await ctx.pipeline.stop('j-stop'), 'stopping');
+    release();
+    await within(running, 8000, 'the job did not end after it was stopped');
+    assert.equal(calls.rendered, 2, 'an engine that does not listen does all its work');
+    assert.ok([...(ctx.storage as MemoryStorage).uploaded.keys()].some((key) => key.startsWith('j-stop/')), 'its clips were saved');
+    await assertEndedAsStopped(ctx, 'j-stop', { stage: 'extracting_clips', stages: upToClips, discarded: 2 });
+  } finally { await ctx.cleanup(); }
+});
+
+/** The engines of a job that has finished one clip when the second is being made (the second ends when the job is stopped). */
+const afterOneClip = (entered: () => void, calls: { rendered: number }): NonNullable<Parameters<typeof setup>[0]> => ({ transcriber: { transcribe: async () => threeMinutes }, media: threeMinuteVideo, renderer: { render: (request) => { calls.rendered += 1; return calls.rendered === 1 ? writingRenderer.render(request) : untilStopped(request.signal, entered, killed); } } });
+
+test('when what a stopped job made cannot be thrown away, the job still ends as stopped and the operator is told what went wrong', async () => {
+  let ctx!: Context; let entered = false;
+  ctx = await setup({ ...afterOneClip(() => { entered = true; }, { rendered: 0 }), database: beforeCall('deleteClipsForJob', ([id]) => { if (ctx.pipeline.isStopping(String(id))) throw new Error('the database refused'); }) });
+  try {
+    await addJob(ctx, 'j-stop', { options: twoClips });
+    const running = ctx.pipeline.run('j-stop');
+    await waitUntil('the second clip to be made', () => entered);
+    assert.equal(await ctx.pipeline.stop('j-stop'), 'stopping');
+    await within(running, 8000, 'the job did not end after it was stopped');
+    const job = await ctx.db.getJob('j-stop');
+    assert.deepEqual({ status: job?.status, stage: job?.stage, errorMessage: job?.errorMessage }, { status: 'failed', stage: 'stopped', errorMessage: plainWords.stopped });
+    assert.deepEqual(ctx.errors, ['Could not discard the clips of a video that was stopped']);
+    assert.ok(logged(ctx, 'the database refused'), 'what really went wrong is kept for the operator');
+  } finally { await ctx.cleanup(); }
+});
+
+test('objects of a stopped job that cannot be deleted from storage are told one by one in the words of a stop, and the job still ends as stopped', async () => {
+  let entered = false; const storage = new MemoryStorage();
+  const ctx = await setup({ ...afterOneClip(() => { entered = true; }, { rendered: 0 }), storage });
+  try {
+    await addJob(ctx, 'j-stop', { options: twoClips });
+    const running = ctx.pipeline.run('j-stop');
+    await waitUntil('the second clip to be made', () => entered);
+    storage.failDeletes = true;
+    assert.equal(await ctx.pipeline.stop('j-stop'), 'stopping');
+    await within(running, 8000, 'the job did not end after it was stopped');
+    const job = await ctx.db.getJob('j-stop');
+    assert.deepEqual({ status: job?.status, stage: job?.stage, errorMessage: job?.errorMessage }, { status: 'failed', stage: 'stopped', errorMessage: plainWords.stopped });
+    const ofClips: string[] = ctx.errors.filter((message) => message === 'Could not delete an object of a clip of a video that was stopped');
+    assert.equal(ofClips.length, 4, 'each of the two clips has a video and captions to delete');
+    assert.deepEqual(ctx.errors.filter((message) => !ofClips.includes(message)), ['Could not delete the stored copy of the uploaded video']);
+    assert.deepEqual(await ctx.db.listClips('j-stop'), [], 'the clips are forgotten even when their objects could not be deleted');
+  } finally { await ctx.cleanup(); }
+});
+
+test('everything a job runs is given one and the same signal, a job that is left alone is never told to stop, and every job has a signal of its own', async () => {
+  const seen = new Map<string, Array<AbortSignal | undefined>>();
+  const note = (path: string, signal: AbortSignal | undefined) => { const job = basename(path).split(/[-.]/)[0]!; seen.set(job, [...(seen.get(job) ?? []), signal]); };
+  const plan: FramingPlan = { keyframes: [{ seconds: 0, position: 0.5 }] };
+  const ctx = await setup({
+    media: { probe: async (input, signal) => { note(input, signal); return threeMinuteVideo.probe(); }, extractAudio: async (input, output, signal) => { note(input, signal); await writeFile(output, 'mock wav'); } },
+    transcriber: { transcribe: async (_audio, workDir, _progress, signal) => { note(workDir, signal); return threeMinutes; } },
+    framer: { frame: async ({ sourcePath, signal }) => { note(sourcePath, signal); return { followed: true, plan, seenShare: 1, tracksFollowed: 1, note: 'Followed a face.' }; } },
+    renderer: { render: async (request) => { note(request.sourcePath, request.signal); return writingRenderer.render(request); } },
+  });
+  try {
+    await addJob(ctx, 'ja', { options: faceOptions }); await addJob(ctx, 'jb', { options: faceOptions });
+    await ctx.pipeline.run('ja'); await ctx.pipeline.run('jb');
+    for (const job of ['ja', 'jb']) {
+      const signals = seen.get(job) ?? [];
+      assert.equal(signals.length, 7, 'the video was read, its sound taken out and listened to, and two clips looked at and made');
+      assert.ok(signals[0] instanceof AbortSignal, 'the work was given a signal');
+      assert.ok(signals.every((signal) => signal === signals[0]), 'each piece of work of a job has its own signal, so that a stop does not reach all of them');
+      assert.equal(signals[0]?.aborted, false, 'a job that was left alone was told to stop');
+    }
+    assert.notEqual(seen.get('ja')?.[0], seen.get('jb')?.[0], 'two jobs share one signal: stopping one would stop the other');
+    assert.deepEqual([(await ctx.db.getJob('ja'))?.status, (await ctx.db.getJob('jb'))?.status], ['completed', 'completed']);
+  } finally { await ctx.cleanup(); }
+});
+
+// ---------------------------------------------------------------------------------------------------------------------------
+// The places for the heavy stages, and what a stop does to a job that waits for one.
+
+test('a place is not taken by a job that was stopped already, and a free place is taken at once', async () => {
+  const slots = new Semaphore(1);
+  const stopped = new AbortController(); stopped.abort(new JobStopped());
+  await assert.rejects(slots.acquire(stopped.signal), (error) => error === stopped.signal.reason);
+  assert.equal(slots.isFull, false, 'a job that was stopped took a place');
+  const live = new AbortController();
+  await slots.acquire(live.signal);
+  assert.equal(slots.isFull, true);
+  assert.equal(getEventListeners(live.signal, 'abort').length, 0, 'taking a free place leaves something waiting for a stop');
+  live.abort(new JobStopped());
+  assert.equal(slots.isFull, true, 'a stop after the place was taken gave it back (the job gives it back when it ends)');
+  slots.release();
+  assert.equal(slots.isFull, false);
+});
+
+test('a job that is stopped while it waits gives up its place in line: it fails with the reason of the stop, the place stays with whoever holds it, and the others keep their order', async () => {
+  const slots = new Semaphore(1); await slots.acquire();
+  const stop = new AbortController(); const order: string[] = [];
+  const first = slots.acquire().then(() => { order.push('first'); });
+  const middle = slots.acquire(stop.signal).then(() => { order.push('middle took a place'); }, (reason: unknown) => { order.push(reason instanceof JobStopped ? 'middle gave up' : 'middle failed in another way'); });
+  const last = slots.acquire().then(() => { order.push('last'); });
+  stop.abort(new JobStopped());
+  await within(middle, 1000, 'a job that was stopped went on waiting');
+  assert.deepEqual(order, ['middle gave up']);
+  assert.equal(getEventListeners(stop.signal, 'abort').length, 0, 'a job that gave up leaves something waiting for a stop');
+  assert.equal(slots.isFull, true, 'giving up a place in line freed the place that someone holds');
+  slots.release(); await within(first, 1000, 'the job in front of the one that gave up was not served');
+  slots.release(); await within(last, 1000, 'the job behind the one that gave up was not served');
+  assert.deepEqual(order, ['middle gave up', 'first', 'last']);
+  slots.release();
+  assert.equal(slots.isFull, false);
+});
+
+test('a job that was handed the place in the very moment it is stopped keeps it until it gives it back, and the job behind it is not lost', async () => {
+  const slots = new Semaphore(1); await slots.acquire();
+  const stop = new AbortController();
+  const handedOver = slots.acquire(stop.signal);
+  const behind = slots.acquire(); const served = behind.then(() => 'served');
+  slots.release();                     // the place is handed to the first in line...
+  stop.abort(new JobStopped());        // ...and in the same moment, before its job has even got going, that job is stopped
+  await within(handedOver, 1000, 'the job that was handed the place never got it');
+  assert.equal(slots.isFull, true);
+  slots.release();                     // the stopped job gives the place back, as it does when a job ends
+  assert.equal(await within(served, 1000, 'the job behind a stopped one was lost: it is still waiting although the place is free'), 'served');
+  slots.release();
+  assert.equal(slots.isFull, false);
 });

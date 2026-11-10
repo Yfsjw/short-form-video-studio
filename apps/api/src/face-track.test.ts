@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import { getEventListeners } from 'node:events';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -197,4 +198,13 @@ test('a clip cut along the plan keeps the walking face in the middle of the pict
     const centred = await faceAt(video('centred.mp4'), seconds);
     assert.ok(centred === undefined || centred < 0.2 || centred > 0.8, `centred clip, ${seconds} s: the face is at ${centred}`);
   }
+});
+
+test('a job that is not stopped leaves nothing listening on its signal, whether the face was followed or FFmpeg could not take pictures', async () => {
+  const signal = new AbortController().signal;
+  const result = await framer().frame({ sourcePath: video('walker.mp4'), startSeconds: 0, endSeconds: 4, signal });
+  assert.ok(result.followed, result.note);
+  assert.equal(getEventListeners(signal, 'abort').length, 0, 'after a clip that was framed');
+  await assert.rejects(framer().frame({ sourcePath: video('nothing-here.mp4'), startSeconds: 0, endSeconds: 5, signal }), /could not take pictures from the video/);
+  assert.equal(getEventListeners(signal, 'abort').length, 0, 'after a failure');
 });

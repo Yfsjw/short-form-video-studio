@@ -1,6 +1,7 @@
 import { readFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { audioDuration, detectSilences, encodeChunk, planChunks } from './audio-chunks.js';
+import { waitOrStop } from './stopping.js';
 import type { TranscriptInput, TranscriptionEngine } from './transcription.js';
 import { wordsFromTokens, type RawToken } from './words.js';
 
@@ -128,24 +129,32 @@ export class OpenAiCompatibleTranscriber implements TranscriptionEngine {
     try { return `hosted|${new URL(this.settings.apiUrl).host}|${this.settings.model}|${this.settings.language}|${this.settings.chunkSeconds}`; } catch { return undefined; }
   }
 
-  async transcribe(audioPath: string, workDir: string, onProgress?: (fraction: number) => void): Promise<TranscriptInput> {
+  async transcribe(audioPath: string, workDir: string, onProgress?: (fraction: number) => void, signal?: AbortSignal): Promise<TranscriptInput> {
     const { ffmpegPath, ffprobePath, chunkSeconds, concurrency } = this.settings;
-    const duration = await audioDuration(ffprobePath, audioPath);
-    const silences = duration > chunkSeconds ? await detectSilences(ffmpegPath, audioPath) : [];
-    const plan = planChunks(duration, silences, chunkSeconds);
-    const results: TranscriptInput[] = new Array(plan.length);
+    // `stop` ends everything that is running for this recording: the programs and the requests. It is aborted by the first piece that fails, and by a stop of the job.
     const stop = new AbortController();
-    let finished = 0;
-    await runLimited(plan.length, concurrency, stop, async (index) => {
-      const file = join(workDir, `speech-${index}.m4a`);
-      try {
-        await encodeChunk(ffmpegPath, audioPath, plan[index], file);
-        results[index] = parseVerboseTranscription(await this.send(await readFile(file), `speech-${index}.m4a`, stop.signal), plan[index].startSeconds);
-      } finally { await rm(file, { force: true }); }
-      finished += 1;
-      onProgress?.(finished / plan.length);
-    });
-    return results.flat().map((segment, segmentIndex) => ({ ...segment, segmentIndex }));
+    const callOff = () => stop.abort(signal?.reason);
+    if (signal) { signal.throwIfAborted(); signal.addEventListener('abort', callOff, { once: true }); }
+    try {
+      const duration = await audioDuration(ffprobePath, audioPath, stop.signal);
+      const silences = duration > chunkSeconds ? await detectSilences(ffmpegPath, audioPath, { signal: stop.signal }) : [];
+      const plan = planChunks(duration, silences, chunkSeconds);
+      const results: TranscriptInput[] = new Array(plan.length);
+      let finished = 0;
+      await runLimited(plan.length, concurrency, stop, async (index) => {
+        const file = join(workDir, `speech-${index}.m4a`);
+        try {
+          await encodeChunk(ffmpegPath, audioPath, plan[index], file, undefined, stop.signal);
+          results[index] = parseVerboseTranscription(await this.send(await readFile(file), `speech-${index}.m4a`, stop.signal), plan[index].startSeconds);
+        } finally { await rm(file, { force: true }); }
+        finished += 1;
+        onProgress?.(finished / plan.length);
+      });
+      return results.flat().map((segment, segmentIndex) => ({ ...segment, segmentIndex }));
+    } catch (error) {
+      if (signal?.aborted) throw signal.reason; // whatever it was in the middle of, a stop of the job is what ended it
+      throw error;
+    } finally { signal?.removeEventListener('abort', callOff); }
   }
 
   private endpoint(): string {
@@ -174,7 +183,7 @@ export class OpenAiCompatibleTranscriber implements TranscriptionEngine {
       } catch (error) {
         if (stop.aborted) throw error;
         if (attempt >= maxAttempts) throw new Error(`Could not reach the speech recognition service: ${this.scrub(describeNetworkError(error))}`);
-        await sleep(baseDelay * 2 ** (attempt - 1));
+        await waitOrStop(sleep, baseDelay * 2 ** (attempt - 1), stop);
         continue;
       }
       if (response.ok) {
@@ -182,7 +191,7 @@ export class OpenAiCompatibleTranscriber implements TranscriptionEngine {
       }
       const body = await response.text().catch(() => '');
       if (RETRIED_STATUSES.has(response.status) && attempt < maxAttempts) {
-        await sleep(retryAfterMs(response.headers.get('retry-after')) ?? baseDelay * 2 ** (attempt - 1));
+        await waitOrStop(sleep, retryAfterMs(response.headers.get('retry-after')) ?? baseDelay * 2 ** (attempt - 1), stop);
         continue;
       }
       throw new Error(this.describeFailure(response.status, body));

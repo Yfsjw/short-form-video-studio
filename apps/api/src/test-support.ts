@@ -1,5 +1,5 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { dirname } from 'node:path';
+import { chmod, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
 import { StoredObjectMissingError, type DurableStorage } from './storage.js';
 
 export const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -87,4 +87,47 @@ export function speechSampleJson(options: { text?: string; tokens?: boolean; fro
 export async function writeFakeWhisper(path: string, options: { json?: string; body?: string; argsLog?: string } = {}): Promise<void> {
   const body = options.body ?? `cat > "$base.json" <<'JSON'\n${options.json ?? speechSampleJson()}\nJSON`;
   await writeFile(path, `#!/bin/sh\nif [ "$1" = "--help" ]; then echo "usage: ./whisper-cli [options] file0.wav"; exit 0; fi\nbase=""\nargs="$*"\nwhile [ $# -gt 0 ]; do case "$1" in -of) base="$2"; shift;; esac; shift; done\n${options.argsLog ? `echo "$args" >> '${options.argsLog}'\n` : ''}${body}\n`, { mode: 0o755 });
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------
+// Real programs that take their time, for the tests of calling work off.
+
+/** Whether a process with this number is still there. */
+export const isAlive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+
+/** A program that is started and does nothing for a minute, like a long FFmpeg or whisper.cpp run. */
+export interface WaitingProgram {
+  /** Its path: what a test gives to the code that is to start it. */
+  path: string;
+  /** Whether it has been started (it notes its process number in a file the moment it begins). */
+  started(): Promise<boolean>;
+  /** The number of its process (once it has been started). */
+  pid(): Promise<number>;
+}
+
+/**
+ * Makes programs that wait for a minute and then end by themselves, in `directory`. One that `ignoresTerm` also ignores the polite request to end
+ * (SIGTERM), as a program that is busy may, and only a kill (SIGKILL) ends it. `killAll` ends every one that is still there, for the end of a test file.
+ */
+export function waitingPrograms(directory: string) {
+  let made = 0; const all: WaitingProgram[] = [];
+  return {
+    async make(options: { ignoresTerm?: boolean } = {}): Promise<WaitingProgram> {
+      made += 1;
+      const path = join(directory, `waiting-${made}.sh`); const pidFile = join(directory, `waiting-${made}.pid`);
+      // `exec` makes the waiting the very process that was started, so there is nothing left behind when it is killed.
+      const body = options.ignoresTerm
+        ? `trap '' TERM\necho $$ > '${pidFile}'\ni=0\nwhile [ $i -lt 60 ]; do sleep 1; i=$((i+1)); done\n`
+        : `echo $$ > '${pidFile}'\nexec sleep 60\n`;
+      await writeFile(path, `#!/bin/sh\n${body}`);
+      await chmod(path, 0o755);
+      const read = async () => { try { const text = (await readFile(pidFile, 'utf8')).trim(); return /^\d+$/.test(text) ? Number(text) : undefined; } catch { return undefined; } };
+      const program: WaitingProgram = { path, started: async () => (await read()) !== undefined, pid: async () => (await read())! };
+      all.push(program);
+      return program;
+    },
+    async killAll() {
+      for (const program of all) { try { process.kill(await program.pid(), 'SIGKILL'); } catch { /* it is gone, or never started */ } }
+    },
+  };
 }

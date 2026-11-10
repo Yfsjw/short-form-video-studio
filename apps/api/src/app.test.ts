@@ -16,7 +16,7 @@ import type { ClipFramer } from './face-track.js';
 import { SAYS_HLG, probeToneMapping } from './hdr.js';
 import type { MachineLimits } from './machine.js';
 import { NullStorage, type DurableStorage } from './storage.js';
-import { MemoryStorage, eventually, sleep, speechSampleJson, writeFakeWhisper } from './test-support.js';
+import { MemoryStorage, eventually, isAlive, sleep, speechSampleJson, writeFakeWhisper } from './test-support.js';
 import { onlyVideos, plainWords } from './failures.js';
 import type { ToolchainReport } from './toolchain.js';
 import type { TranscriptionEngine } from './transcription.js';
@@ -1473,7 +1473,7 @@ test('the API deletes a job that is over together with its clips, and says why i
       const running = await makeJobToDelete(server, schema, { status });
       const refused = await fetch(`${server.base}/api/jobs/${running.id}`, { method: 'DELETE' });
       assert.equal(refused.status, 409, status);
-      assert.deepEqual(((await refused.json()) as { error: unknown }).error, { code: 'JOB_NOT_FINISHED', message: 'This video is still being processed. It can be deleted when it is finished.' }, status);
+      assert.deepEqual(((await refused.json()) as { error: unknown }).error, { code: 'JOB_NOT_FINISHED', message: 'This video is still being processed. It can be deleted once it is finished, or once you have stopped it.' }, status);
       assert.equal((await fetch(`${server.base}/api/jobs/${running.id}`)).status, 200, `${status}: still there`);
       assert.deepEqual(stillStored(server, running.keys), running.keys, `${status}: and so are its files`);
     }
@@ -1681,4 +1681,181 @@ test('a real upload, once it is done, can be deleted: every file the pipeline st
     assert.deepEqual(stillStored(server, other.keys), other.keys, 'what belongs to other jobs stays');
     assert.equal((await fetch(`${server.base}/api/jobs/${id}/clips/${finished.clips[0].id}`, { redirect: 'manual' })).status, 404, 'and a clip that was deleted cannot be fetched');
   } finally { await raw.end(); await server.stop(); await dropSchema(schema); }
+});
+
+// ---- Stopping a video ------------------------------------------------------------------------------------------------------------
+
+/** A speech engine that never ends by itself and ends when its job is stopped, like the real program does (it is killed); `gate` makes it take its time over that, like a program that needs a moment to die. */
+function slowToStop(gate: Promise<void> = Promise.resolve()) {
+  const state = { listening: false };
+  const engine: TranscriptionEngine = { transcribe: (_audio, _dir, _progress, signal) => new Promise<never>((_resolve, reject) => {
+    state.listening = true;
+    signal?.addEventListener('abort', () => { void gate.then(() => reject(signal?.reason)); }, { once: true });
+  }) };
+  return { engine, state };
+}
+const uploadSample = async (server: RunningServer, headers: Record<string, string> = {}) => {
+  const form = new FormData();
+  form.append('video', new Blob([new Uint8Array(await readFile(sampleVideo))], { type: 'video/mp4' }), 'match.mp4');
+  const response = await fetch(`${server.base}/api/jobs`, { method: 'POST', body: form, headers });
+  assert.equal(response.status, 202);
+  return ((await response.json()) as { job: { id: string } }).job.id;
+};
+const askToStop = (server: RunningServer, id: string, headers: Record<string, string> = {}) => fetch(`${server.base}/api/jobs/${id}/stop`, { method: 'POST', headers });
+const errorOf = async (response: Response) => ((await response.json()) as { error: unknown }).error;
+const toldAsStopped = 'Video processing was stopped by the person who uploaded it';
+
+test('the API stops a video that is being worked on: it answers at once, the job ends as stopped with nothing kept and nothing logged as an error, and it says why it cannot stop a video that is over, one that is not there, or one that nobody here is working on', needsFfmpeg, async () => {
+  const schema = schemaName('stop_api'); const lines: string[] = []; const { engine, state } = slowToStop();
+  const server = await start({ schema, transcriber: engine, env: patient, extra: capturing(lines) });
+  try {
+    const id = await uploadSample(server);
+    await eventually('the speech to be listened to', () => state.listening, (listening) => listening);
+    const stopping = await askToStop(server, id);
+    assert.equal(stopping.status, 202);
+    assert.deepEqual(await stopping.json(), { stopping: true });
+    const view = await waitForJob(server.base, id); await untilSettled(server);
+    assert.deepEqual({ status: view.job.status, stage: view.job.stage, errorMessage: view.job.errorMessage }, { status: 'failed', stage: 'stopped', errorMessage: plainWords.stopped });
+    assert.deepEqual(view.clips, []);
+    assert.deepEqual([...(server.storage as MemoryStorage).objects.keys()], [], 'nothing of the video is kept in storage');
+    assert.deepEqual(await readdir(server.dirs.UPLOAD_DIR), [], 'the video is not kept on the server');
+    assert.ok(!(await readdir(server.dirs.OUTPUT_DIR)).includes(id), 'no clips are kept on the server');
+    const entries = readLog(lines);
+    assert.deepEqual(entries.filter((entry) => entry.jobId === id && entry.level >= 50).map((entry) => entry.msg), [], 'a stop is not an error');
+    assert.ok(entries.some((entry) => entry.msg === toldAsStopped && entry.jobId === id && entry.level === 30), 'it is told as information');
+
+    const again = await askToStop(server, id);
+    assert.equal(again.status, 409);
+    assert.deepEqual(await errorOf(again), { code: 'JOB_ALREADY_OVER', message: 'This video is already finished, so there is nothing to stop.' });
+    const nobody = await askToStop(server, randomUUID());
+    assert.equal(nobody.status, 404);
+    assert.deepEqual(await errorOf(nobody), { code: 'JOB_NOT_FOUND', message: 'No processing job exists for this id.' });
+    const elsewhere = await makeJobToDelete(server, schema, { status: 'processing' });
+    const notHere = await askToStop(server, elsewhere.id);
+    assert.equal(notHere.status, 409);
+    assert.deepEqual(await errorOf(notHere), { code: 'JOB_NOT_RUNNING', message: 'This video is not being worked on at this moment (it may be waiting to start again after a restart). Try again in a minute.' });
+    assert.equal(((await (await fetch(`${server.base}/api/jobs/${elsewhere.id}`)).json()) as JobView).job.status, 'processing', 'a video that nobody here works on is left as it was');
+    assert.deepEqual(stillStored(server, elsewhere.keys), elsewhere.keys);
+  } finally { await server.stop(); await dropSchema(schema); }
+});
+
+test('the pages let a person stop a video: a link, a page that asks, a plain form, a page that says it is being stopped, and then one that says they stopped it', needsFfmpeg, async () => {
+  const schema = schemaName('stop_pages'); let open!: () => void; const gate = new Promise<void>((resolve) => { open = resolve; });
+  const { engine, state } = slowToStop(gate);
+  const server = await start({ schema, transcriber: engine, env: patient });
+  const page = (path: string) => fetch(`${server.base}${path}`);
+  const form = (path: string) => fetch(`${server.base}${path}`, { method: 'POST', redirect: 'manual' });
+  try {
+    const id = await uploadSample(server);
+    await eventually('the speech to be listened to', () => state.listening, (listening) => listening);
+    const running = await (await page(`/jobs/${id}`)).text();
+    assert.match(running, new RegExp(`<a class="btn danger" href="/jobs/${id}/stop">Stop this video</a>`), 'a video that is being worked on has a way to stop it');
+    assert.doesNotMatch(running, /\/delete/, 'and none to delete it');
+
+    const ask = await page(`/jobs/${id}/stop`);
+    assert.equal(ask.status, 200);
+    const asking = await ask.text();
+    assert.match(asking, /<h1>Stop this video\?<\/h1>/);
+    assert.match(asking, new RegExp(`<form method="post" action="/jobs/${id}/stop"><button type="submit" class="danger">Yes, stop it</button></form>`));
+    assert.match(asking, new RegExp(`<a href="/jobs/${id}">No, let it go on</a>`));
+    assert.doesNotMatch(asking, /<script/i, 'the pages have no JavaScript at all');
+    assert.equal(server.studio.pipeline.isStopping(id), false, 'asking stops nothing');
+
+    const stopped = await form(`/jobs/${id}/stop`);
+    assert.equal(stopped.status, 303);
+    assert.equal(stopped.headers.get('location'), `/jobs/${id}`, 'the person is taken back to the video');
+    const stopping = await (await page(`/jobs/${id}`)).text();
+    assert.match(stopping, /<h1>Stopping your video<\/h1>/, 'until the clean-up is over the page says that the video is being stopped');
+    assert.doesNotMatch(stopping, /Stop this video|\/stop"|<progress/);
+    assert.equal((await form(`/jobs/${id}/stop`)).status, 303, 'pressing it again is harmless');
+
+    open();
+    await waitForJob(server.base, id); await untilSettled(server);
+    const over = await (await page(`/jobs/${id}`)).text();
+    assert.match(over, /<h1>You stopped this video<\/h1>/);
+    assert.match(over, /Status: <strong>stopped<\/strong>/);
+    assert.match(over, /You stopped this video before it was finished\. Nothing from it was kept\./);
+    assert.doesNotMatch(over, /class="card error"|could not be processed|<meta http-equiv="refresh"/, 'it is not shown as an error, and the page stops refreshing');
+    assert.match(over, new RegExp(`href="/jobs/${id}/delete">Delete this job</a>`), 'the job can be deleted now');
+
+    const late = await form(`/jobs/${id}/stop`);
+    assert.equal(late.status, 409);
+    assert.match(await late.text(), /<h1>Already finished<\/h1>[\s\S]*This video is already finished, so there is nothing to stop\.[\s\S]*Back to the video/);
+    const lateAsk = await page(`/jobs/${id}/stop`);
+    assert.equal(lateAsk.status, 409);
+    assert.doesNotMatch(await lateAsk.text(), /<form/, 'a video that is over is not asked about');
+
+    const elsewhere = await makeJobToDelete(server, schema, { status: 'processing' });
+    const notHere = await form(`/jobs/${elsewhere.id}/stop`);
+    assert.equal(notHere.status, 409);
+    const notHereText = await notHere.text();
+    assert.match(notHereText, /<h1>Not being worked on<\/h1>[\s\S]*may be waiting to start again after a restart[\s\S]*Back to the video/);
+    assert.doesNotMatch(notHereText, /<script/i);
+    const nobody = await form(`/jobs/${randomUUID()}/stop`);
+    assert.equal(nobody.status, 404);
+    assert.match(await nobody.text(), /No job exists for this id\./);
+    assert.equal((await page(`/jobs/${randomUUID()}/stop`)).status, 404);
+  } finally { open(); await server.stop(); await dropSchema(schema); }
+});
+
+test('stopping needs the access code like everything else, and with the code it works', needsFfmpeg, async () => {
+  const schema = schemaName('stop_gate'); const { engine, state } = slowToStop();
+  const server = await start({ schema, transcriber: engine, env: { ...gated, ...patient }, extra: noDelay });
+  try {
+    const id = await uploadSample(server, { 'x-access-code': ACCESS_CODE });
+    await eventually('the speech to be listened to', () => state.listening, (listening) => listening);
+    const without = await askToStop(server, id);
+    assert.equal(without.status, 401);
+    assert.equal(((await without.json()) as { error: { code: string } }).error.code, 'ACCESS_CODE_REQUIRED');
+    assert.equal((await fetch(`${server.base}/jobs/${id}/stop`, manual())).status, 302, 'the page that asks is behind the way in');
+    assert.equal((await fetch(`${server.base}/jobs/${id}/stop`, { method: 'POST' })).status, 401);
+    assert.equal((await askToStop(server, id, { 'x-access-code': 'not-the-code-1' })).status, 401);
+    assert.equal(server.studio.pipeline.isStopping(id), false, 'nothing was stopped for someone without the code');
+    const allowed = await askToStop(server, id, { 'x-access-code': ACCESS_CODE });
+    assert.equal(allowed.status, 202);
+    const view = await (async () => { for (;;) { const seen = await (await fetch(`${server.base}/api/jobs/${id}`, { headers: { 'x-access-code': ACCESS_CODE } })).json() as JobView; if (seen.job.status === 'failed') return seen; await sleep(100); } })();
+    assert.equal(view.job.stage, 'stopped');
+  } finally { await server.stop(); await dropSchema(schema); }
+});
+
+test('stopping a video while the speech program runs ends that program for good, and the job ends as stopped', needsFfmpeg, async () => {
+  const schema = schemaName('stop_speech'); const whisperBinary = join(workspace, 'stop-speech-whisper'); const model = join(workspace, 'stop-speech-model.bin'); const pidFile = join(workspace, 'stop-speech.pid');
+  await rm(pidFile, { force: true });
+  await writeFakeWhisper(whisperBinary, { body: `echo $$ > '${pidFile}'\nexec sleep 60` }); await writeFile(model, '');
+  const lines: string[] = [];
+  const server = await start({ schema, realSpeechEngine: true, env: { WHISPER_CPP_PATH: whisperBinary, WHISPER_MODEL_PATH: model, ...patient }, extra: capturing(lines) });
+  let pid = 0;
+  try {
+    const id = await uploadSample(server);
+    pid = await eventually('the speech program to be started', async () => { try { return Number((await readFile(pidFile, 'utf8')).trim()); } catch { return 0; } }, (value) => value > 0);
+    assert.ok(isAlive(pid), 'the speech program is running');
+    assert.equal((await askToStop(server, id)).status, 202);
+    const view = await waitForJob(server.base, id); await untilSettled(server);
+    assert.deepEqual({ status: view.job.status, stage: view.job.stage, errorMessage: view.job.errorMessage }, { status: 'failed', stage: 'stopped', errorMessage: plainWords.stopped });
+    await eventually('the speech program to be gone', () => isAlive(pid), (alive) => !alive, 3000);
+    assert.deepEqual(readLog(lines).filter((entry) => entry.jobId === id && entry.level >= 50).map((entry) => entry.msg), [], 'a stop is not an error');
+  } finally { if (pid && isAlive(pid)) process.kill(pid, 'SIGKILL'); await server.stop(); await dropSchema(schema); }
+});
+
+test('stopping a video while FFmpeg makes a clip ends that program for good, and nothing of the clip is kept', needsFfmpeg, async () => {
+  const schema = schemaName('stop_render'); const ffmpegBinary = join(workspace, 'stop-render-ffmpeg'); const pidFile = join(workspace, 'stop-render.pid');
+  await rm(pidFile, { force: true });
+  // Everything is real FFmpeg except the making of the clip (it writes into the outputs folder), which waits, being the very process that was started.
+  await writeFile(ffmpegBinary, `#!/bin/sh\ncase "$*" in\n  */outputs/*) echo $$ > '${pidFile}'; exec sleep 60;;\nesac\nexec ffmpeg "$@"\n`, { mode: 0o755 });
+  const lines: string[] = [];
+  const server = await start({ schema, env: { FFMPEG_PATH: ffmpegBinary, ...patient }, extra: capturing(lines) });
+  let pid = 0;
+  try {
+    const id = await uploadSample(server);
+    pid = await eventually('FFmpeg to start making the clip', async () => { try { return Number((await readFile(pidFile, 'utf8')).trim()); } catch { return 0; } }, (value) => value > 0, 20_000);
+    assert.ok(isAlive(pid), 'FFmpeg is making the clip');
+    assert.equal((await askToStop(server, id)).status, 202);
+    const view = await waitForJob(server.base, id); await untilSettled(server);
+    assert.deepEqual({ status: view.job.status, stage: view.job.stage, errorMessage: view.job.errorMessage }, { status: 'failed', stage: 'stopped', errorMessage: plainWords.stopped });
+    assert.deepEqual(view.clips, [], 'the clip that was being made is not kept, not even as a failed one');
+    await eventually('FFmpeg to be gone', () => isAlive(pid), (alive) => !alive, 3000);
+    assert.deepEqual([...(server.storage as MemoryStorage).objects.keys()], [], 'nothing of the video is kept in storage');
+    assert.ok(!(await readdir(server.dirs.OUTPUT_DIR)).includes(id), 'no clips are kept on the server');
+    assert.deepEqual(readLog(lines).filter((entry) => entry.jobId === id && entry.level >= 50).map((entry) => entry.msg), [], 'a stop is not an error, and the clip is not told as one that failed');
+  } finally { if (pid && isAlive(pid)) process.kill(pid, 'SIGKILL'); await server.stop(); await dropSchema(schema); }
 });

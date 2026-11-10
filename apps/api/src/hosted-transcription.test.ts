@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
+import { getEventListeners } from 'node:events';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { readdir, mkdtemp, rm } from 'node:fs/promises';
@@ -8,8 +9,9 @@ import { join } from 'node:path';
 import { Readable } from 'node:stream';
 import test from 'node:test';
 import { promisify } from 'node:util';
+import { JobStopped } from './failures.js';
 import { alignWords, OpenAiCompatibleTranscriber, parseVerboseTranscription, retryAfterMs, type HostedTranscriptionSettings } from './hosted-transcription.js';
-import { sleep } from './test-support.js';
+import { eventually, sleep } from './test-support.js';
 
 const run = promisify(execFile);
 const KEY = 'test-key-0123456789abcdef';
@@ -64,6 +66,9 @@ test('an answer without timed segments is an error that says what is wrong; one 
   assert.throws(() => parseVerboseTranscription(null), /verbose_json/);
   assert.deepEqual(parseVerboseTranscription({ segments: [], words: [] }), []);
 });
+
+/** Waits for `promise`, but fails after `ms` instead of holding the test, and through what it left open the whole run, for ever. */
+const within = <T>(promise: Promise<T>, ms: number, what: string): Promise<T> => Promise.race([promise, sleep(ms).then((): never => { throw new Error(what); })]);
 
 // ---- a service to talk to --------------------------------------------------------------------------------------------------------
 
@@ -259,4 +264,100 @@ test('the hosted engine names the service, model, language and piece length its 
   }
   assert.equal(new OpenAiCompatibleTranscriber({ ...settings, apiKey: 'another-key-5678', concurrency: 5, timeoutMs: 1_000_000 }).cacheKey, key, 'the key, how many requests at once and how long to wait change nothing about the transcript');
   assert.equal(new OpenAiCompatibleTranscriber({ ...settings, apiUrl: 'not an address' }).cacheKey, undefined, 'an address that cannot be read is no key');
+});
+
+// ---- a job that a person stops ---------------------------------------------------------------------------------------------------
+
+/** What is left of the work in the folder of a recording: the pieces cut for the service. */
+const piecesIn = async (dir: string) => (await readdir(dir)).filter((name) => name.startsWith('speech-'));
+
+test('a job that is stopped while a request is on its way ends at once with the stop: the request is cut off, nothing is sent again, nothing is left on the disk and nothing is left listening', { timeout: 30_000 }, async () => {
+  const service = await fakeService(() => ({ delayMs: 5000, body: { segments: [{ start: 0, end: 1, text: 'Too late.' }] } }));
+  try {
+    await withAudio(SHORT, async (dir, wav) => {
+      const controller = new AbortController(); const reason = new JobStopped();
+      const running = new OpenAiCompatibleTranscriber(settingsFor(service.url), quick).transcribe(wav, dir, undefined, controller.signal);
+      const settled = assert.rejects(running, (error) => error === reason, 'the failure is the stop, not a service that did not answer');
+      await eventually('the request to arrive', () => service.calls.length, (count) => count >= 1);
+      const stoppedAt = Date.now();
+      controller.abort(reason);
+      await within(settled, 5000, 'the stop did not end the work');
+      assert.ok(Date.now() - stoppedAt < 2000, 'it did not wait for the service (which takes 5 s to answer)');
+      assert.equal(service.calls.length, 1, 'nothing was sent again');
+      assert.deepEqual(await piecesIn(dir), []);
+      assert.equal(getEventListeners(controller.signal, 'abort').length, 0, 'nothing is left listening');
+    });
+  } finally { await service.close(); }
+});
+
+test('a job that is stopped while the service is being waited for, because it was busy or could not be reached, does not wait out the pause and asks no more', { timeout: 30_000 }, async () => {
+  // A pause that never ends by itself: only the stop can end it.
+  const forEver = async () => new Promise<void>(() => undefined);
+  const busy = await fakeService(() => ({ status: 503, text: 'overloaded' }));
+  try {
+    await withAudio(SHORT, async (dir, wav) => {
+      const controller = new AbortController(); const reason = new JobStopped();
+      const running = new OpenAiCompatibleTranscriber(settingsFor(busy.url), { retryDelayMs: 1, sleep: forEver }).transcribe(wav, dir, undefined, controller.signal);
+      const settled = assert.rejects(running, (error) => error === reason);
+      await eventually('the first answer', () => busy.calls.length, (count) => count >= 1);
+      await sleep(100); // the pause has begun
+      controller.abort(reason);
+      await within(settled, 5000, 'the stop did not end the work');
+      assert.equal(busy.calls.length, 1, 'no second request after the stop');
+      assert.deepEqual(await piecesIn(dir), []);
+    });
+  } finally { await busy.close(); }
+
+  // The same for a service that cannot be reached at all (a stand-in for `fetch` that fails as a closed port does).
+  let tries = 0;
+  const unreachable = async () => { tries += 1; throw new TypeError('fetch failed'); };
+  await withAudio(SHORT, async (dir, wav) => {
+    const controller = new AbortController(); const reason = new JobStopped();
+    const running = new OpenAiCompatibleTranscriber(settingsFor('http://127.0.0.1:9/v1'), { retryDelayMs: 1, sleep: forEver, fetch: unreachable as unknown as typeof fetch }).transcribe(wav, dir, undefined, controller.signal);
+    const settled = assert.rejects(running, (error) => error === reason);
+    await eventually('the first try', () => tries, (count) => count >= 1);
+    await sleep(100);
+    controller.abort(reason);
+    await within(settled, 5000, 'the stop did not end the work');
+    assert.equal(tries, 1);
+  });
+});
+
+test('whatever a request fails with because the job was stopped, the failure is the stop; a job that is stopped already does not even begin', { timeout: 30_000 }, async () => {
+  await withAudio(SHORT, async (dir, wav) => {
+    // A network that reports the request it lost in words of its own, as sockets do.
+    const lost = (async (_url: string, init: { signal: AbortSignal }) => new Promise<Response>((_resolve, reject) => { init.signal.addEventListener('abort', () => reject(new Error('socket hang up')), { once: true }); })) as unknown as typeof fetch;
+    const controller = new AbortController(); const reason = new JobStopped();
+    const running = new OpenAiCompatibleTranscriber(settingsFor('http://127.0.0.1:9/v1'), { ...quick, fetch: lost }).transcribe(wav, dir, undefined, controller.signal);
+    const settled = assert.rejects(running, (error) => error === reason, 'not "could not reach the speech recognition service"');
+    await sleep(300); // long enough for the request to be on its way
+    controller.abort(reason);
+    await within(settled, 5000, 'the stop did not end the work');
+
+    const service = await fakeService(() => ({ body: { segments: [{ start: 0, end: 1, text: 'Never asked.' }] } }));
+    try {
+      await assert.rejects(new OpenAiCompatibleTranscriber(settingsFor(service.url), quick).transcribe(wav, dir, undefined, AbortSignal.abort(reason)), (error) => error === reason);
+      assert.equal(service.calls.length, 0, 'nothing was sent for a job that was stopped before it began');
+    } finally { await service.close(); }
+  });
+});
+
+test('a job that is not stopped is told nothing different, and its signal is not left with a listener', { timeout: 30_000 }, async () => {
+  const service = await fakeService(() => ({ body: { segments: [{ start: 0, end: 1, text: 'It worked.' }] } }));
+  try {
+    await withAudio(SHORT, async (dir, wav) => {
+      const signal = new AbortController().signal;
+      const transcript = await new OpenAiCompatibleTranscriber(settingsFor(service.url), quick).transcribe(wav, dir, undefined, signal);
+      assert.equal(transcript[0].text, 'It worked.');
+      assert.equal(getEventListeners(signal, 'abort').length, 0);
+    });
+    const failing = await fakeService(() => ({ status: 400, text: 'bad audio' }));
+    try {
+      await withAudio(SHORT, async (dir, wav) => {
+        const signal = new AbortController().signal;
+        await assert.rejects(new OpenAiCompatibleTranscriber(settingsFor(failing.url), quick).transcribe(wav, dir, undefined, signal), /refused the audio \(HTTP 400\)/);
+        assert.equal(getEventListeners(signal, 'abort').length, 0, 'a failure leaves nothing listening either');
+      });
+    } finally { await failing.close(); }
+  } finally { await service.close(); }
 });

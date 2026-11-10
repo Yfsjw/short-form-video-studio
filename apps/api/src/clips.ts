@@ -1,14 +1,11 @@
-import { execFile } from 'node:child_process';
 import { rm, stat } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { promisify } from 'node:util';
 import type { AspectChoice, QualityChoice } from './domain.js';
 import { cropXExpression, type FramingPlan } from './framing.js';
 import { SDR_COLOUR_TAGS, TONE_MAP_TO_SDR, isColourConversionFailure, type HdrKind } from './hdr.js';
 import { outputSizeFor } from './options.js';
-
-const execFileAsync = promisify(execFile);
+import { execFileUntilStopped } from './stopping.js';
 
 /**
  * The font the captions are drawn with ships with the program (apps/api/assets/fonts, with its licence) instead of being looked up on the
@@ -28,11 +25,13 @@ export interface ClipRenderRequest {
   layout?: 'fill' | 'fit';
   /** The kind of HDR the picture is in, when it is one. The clip is an ordinary picture either way; with this it also gets the colours of one, where the renderer can (see hdr.ts). */
   hdr?: HdrKind;
+  /** Calls the work off: FFmpeg is killed the moment this is aborted, nothing is tried again, and the failure is the reason of the signal (see stopping.ts). */
+  signal?: AbortSignal;
 }
 /** `colours` is there only for an HDR picture: whether its colours were converted to those of an ordinary one, or the clip was only made 8-bit (a build of FFmpeg without the filters, or a video that does not say what its colours are). */
 export interface RenderedClip { durationSeconds: number; sizeBytes: number; colours?: 'converted' | 'not converted'; }
 export interface ClipRenderer { render(request: ClipRenderRequest): Promise<RenderedClip>; }
-export type FfmpegRunner = (binary: string, arguments_: string[], options: { maxBuffer: number; timeout: number; cwd: string }) => Promise<void>;
+export type FfmpegRunner = (binary: string, arguments_: string[], options: { maxBuffer: number; timeout: number; cwd: string; signal?: AbortSignal }) => Promise<void>;
 
 /** FFmpeg renderer for platform-ready MP4 clips (9:16 unless another shape is asked for) with optional burned-in captions. */
 export class FfmpegClipRenderer implements ClipRenderer {
@@ -44,7 +43,7 @@ export class FfmpegClipRenderer implements ClipRenderer {
     private readonly preset: string,
     private readonly verticalWidth: number,
     private readonly verticalHeight: number,
-    private readonly runner: FfmpegRunner = async (binary, arguments_, options) => { await execFileAsync(binary, arguments_, options); },
+    private readonly runner: FfmpegRunner = async (binary, arguments_, { signal, ...options }) => { await execFileUntilStopped(binary, arguments_, options, signal); },
     private readonly fontsDirectory: string = BUNDLED_FONTS_DIRECTORY,
     /**
      * How many threads FFmpeg may use, for decoding, for the filters and for encoding (left out: it chooses for itself, counting the processors
@@ -81,12 +80,13 @@ export class FfmpegClipRenderer implements ClipRenderer {
         '-c:a', this.audioCodec, '-movflags', '+faststart', ...this.threadOptions(), request.outputPath,
       ];
       try {
-        await this.runner(this.ffmpegPath, args, { maxBuffer: 4 * 1024 * 1024, timeout: 30 * 60_000, cwd: dirname(request.outputPath) });
+        await this.runner(this.ffmpegPath, args, { maxBuffer: 4 * 1024 * 1024, timeout: 30 * 60_000, cwd: dirname(request.outputPath), ...(request.signal ? { signal: request.signal } : {}) });
         const info = await stat(request.outputPath);
         if (!info.isFile() || info.size <= 0) throw new Error('FFmpeg completed without producing a non-empty MP4 file.');
         return { durationSeconds, sizeBytes: info.size, ...(request.hdr ? { colours: toneMap ? 'converted' as const : 'not converted' as const } : {}) };
       } catch (error) {
         await rm(request.outputPath, { force: true });
+        if (request.signal?.aborted) throw request.signal.reason; // called off: not a failure of the clip, and not worth another try
         // Only a failure of the conversion itself is tried again without it (see above); anything else would only fail a second time, later.
         if (toneMap && isColourConversionFailure(typeof error === 'object' && error ? (error as { stderr?: unknown }).stderr : undefined)) continue;
         const stderr = typeof error === 'object' && error && 'stderr' in error ? String(error.stderr).trim().slice(-2000) : '';

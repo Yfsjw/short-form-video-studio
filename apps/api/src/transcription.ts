@@ -8,8 +8,11 @@ import { PlainFailure, describeTimeLimit } from './failures.js';
 
 export type TranscriptInput = Array<Omit<TranscriptSegment, 'id' | 'jobId' | 'createdAt'>>;
 export interface TranscriptionEngine {
-  /** `onProgress` (optional) is told how far along the work is, as a fraction from 0 to 1, whenever the engine knows. */
-  transcribe(audioPath: string, workDir: string, onProgress?: (fraction: number) => void): Promise<TranscriptInput>;
+  /**
+   * `onProgress` (optional) is told how far along the work is, as a fraction from 0 to 1, whenever the engine knows. `signal` (optional) calls the work
+   * off (a person stopped the video): the engine ends whatever it is running at once and fails with the reason of the signal, whatever else went wrong with it.
+   */
+  transcribe(audioPath: string, workDir: string, onProgress?: (fraction: number) => void, signal?: AbortSignal): Promise<TranscriptInput>;
   /**
    * Names everything the transcript depends on besides the sound (which engine, which model, which language). The transcript of a sound
    * is kept and reused only for an engine that has one; two engines that are not set up the same way must never share a key. An engine
@@ -60,23 +63,30 @@ const KEPT_OUTPUT_CHARS = 64 * 1024;
  * Runs a program and hands everything it prints on stderr to `onStderr` as it happens (so progress can be followed),
  * keeping only the tail of both outputs. Unlike execFile with a size limit, a program that prints a lot is not killed for it.
  * A failure carries `stdout` and `stderr`, like execFile's, `timedOut` (the time limit is what stopped the program) and, when a signal ended it, `signal`.
+ * `options.signal` calls the work off: the program is killed the moment it is aborted (it is not even started when it already is), and the failure is the
+ * reason of that signal, once the program is really gone.
  */
-export function runProgram(executable: string, args: string[], options: { cwd: string; timeoutMs: number; onStderr?: (text: string) => void }): Promise<{ stdout: string; stderr: string }> {
+export function runProgram(executable: string, args: string[], options: { cwd: string; timeoutMs: number; onStderr?: (text: string) => void; signal?: AbortSignal }): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
+    if (options.signal?.aborted) { reject(options.signal.reason); return; }
     const child = spawn(executable, args, { cwd: options.cwd, stdio: ['ignore', 'pipe', 'pipe'] });
-    let stdout = ''; let stderr = ''; let timedOut = false; let finished = false;
+    let stdout = ''; let stderr = ''; let timedOut = false; let finished = false; let calledOff = false;
     const keepTail = (kept: string, text: string) => { const joined = kept + text; return joined.length > KEPT_OUTPUT_CHARS ? joined.slice(-KEPT_OUTPUT_CHARS) : joined; };
     const timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, options.timeoutMs);
+    const callOff = () => { calledOff = true; child.kill('SIGKILL'); };
+    options.signal?.addEventListener('abort', callOff, { once: true });
+    const done = () => { clearTimeout(timer); options.signal?.removeEventListener('abort', callOff); };
     child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
     child.stdout.on('data', (text: string) => { stdout = keepTail(stdout, text); });
     child.stderr.on('data', (text: string) => { stderr = keepTail(stderr, text); try { options.onStderr?.(text); } catch { /* a listener must never break the run */ } });
-    const fail = (message: string, extra: { signal?: string } = {}) => { if (finished) return; finished = true; clearTimeout(timer); reject(Object.assign(new Error(message), { stdout, stderr, timedOut, ...extra })); };
+    const fail = (message: string, extra: { signal?: string } = {}) => { if (finished) return; finished = true; done(); reject(Object.assign(new Error(message), { stdout, stderr, timedOut, ...extra })); };
     child.on('error', (error) => fail(`Could not start ${executable}: ${error.message}`));
     child.on('close', (code, signal) => {
       if (finished) return;
+      if (calledOff) { finished = true; done(); reject(options.signal?.reason); return; }
       if (timedOut) return fail(`${basename(executable)} was stopped after the ${Math.round(options.timeoutMs / 1000)} s time limit`);
       if (code !== 0) return fail(`Command failed: ${basename(executable)} (${signal ? `signal ${signal}` : `exit code ${code}`})`, signal ? { signal } : {});
-      finished = true; clearTimeout(timer); resolve({ stdout, stderr });
+      finished = true; done(); resolve({ stdout, stderr });
     });
   });
 }
@@ -114,7 +124,7 @@ export class WhisperCppTranscriber implements TranscriptionEngine {
     try { return `whisper.cpp|${basename(this.modelPath)}|${statSync(this.modelPath).size}|${this.language}`; } catch { return undefined; }
   }
 
-  async transcribe(audioPath: string, workDir: string, onProgress?: (fraction: number) => void): Promise<TranscriptInput> {
+  async transcribe(audioPath: string, workDir: string, onProgress?: (fraction: number) => void, signal?: AbortSignal): Promise<TranscriptInput> {
     const outputBase = join(workDir, basename(audioPath, '.wav'));
     let stdout = '';
     let stderr = '';
@@ -123,10 +133,11 @@ export class WhisperCppTranscriber implements TranscriptionEngine {
       // attempting GPU initialization, which makes the process fail before transcription.
       // `-pp` makes whisper.cpp report its percentage on stderr, which is what the progress bar follows.
       // `-ojf` writes the JSON with the pieces of every segment and their own times (that is what makes word-by-word captions possible).
-      const result = await runProgram(this.executablePath, ['-m', this.modelPath, '-f', audioPath, '-l', this.language, ...(this.threads ? ['-t', String(this.threads)] : []), '-ng', '-nfa', '-pp', '-ojf', '-of', outputBase], { timeoutMs: this.timeoutMs, cwd: dirname(audioPath), onStderr: createProgressListener(onProgress) });
+      const result = await runProgram(this.executablePath, ['-m', this.modelPath, '-f', audioPath, '-l', this.language, ...(this.threads ? ['-t', String(this.threads)] : []), '-ng', '-nfa', '-pp', '-ojf', '-of', outputBase], { timeoutMs: this.timeoutMs, cwd: dirname(audioPath), onStderr: createProgressListener(onProgress), ...(signal ? { signal } : {}) });
       stdout = result.stdout;
       stderr = result.stderr;
     } catch (error) {
+      if (signal?.aborted) throw signal.reason; // called off: not a failure of the program, and not the program being killed by the server
       const execError = error as { message?: string; stdout?: string; stderr?: string; timedOut?: boolean; signal?: string };
       stdout = typeof execError.stdout === 'string' ? execError.stdout : '';
       stderr = typeof execError.stderr === 'string' ? execError.stderr : '';
