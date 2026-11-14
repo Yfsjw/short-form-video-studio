@@ -9,6 +9,7 @@ import { promisify } from 'node:util';
 import { BUNDLED_FONTS_DIRECTORY } from './clips.js';
 import { probeToneMapping } from './hdr.js';
 import { MIN_MODEL_BYTES, REQUIRED_FILTERS, SPEECH_SAMPLE_PATH, SPEECH_SAMPLE_TEXT, ToolchainMonitor, checkToolchain, countAtLeast, fontChosenIn, helpShowsEncoder, helpShowsFilter, isBundledFont, judgeSpeechSample, listsEncoder, listsFilter, pixelAt, shareOfWordsHeard, versionOf, type ToolchainCheckOptions, type ToolchainReport } from './toolchain.js';
+import type { MeasuredSpeeds } from './estimate.js';
 import type { TranscriptInput } from './transcription.js';
 import { sleep, speechSampleJson, writeFakeWhisper } from './test-support.js';
 
@@ -792,9 +793,11 @@ test('with real samples on, everything is checked in order, the speech and the r
 
 test('the render sample is only told when the clip it made is the size of a real clip', needsFfmpeg, async () => {
   const wrongSize = await ffmpegThat({ args: String.raw`(args) => { if (String(args[args.length - 1]).endsWith('sample-clip.mp4')) { const at = args.indexOf('-vf'); args[at + 1] = args[at + 1].replace(/crop=\d+:\d+/, 'crop=100:100'); } return args; }` });
-  const report = await checkToolchain(await optionsFor({ ffmpegPath: wrongSize, realSamples: true, clipSize: { width: 144, height: 256 }, machine: unlimited }));
+  const told: MeasuredSpeeds[] = [];
+  const report = await checkToolchain(await optionsFor({ ffmpegPath: wrongSize, realSamples: true, clipSize: { width: 144, height: 256 }, machine: unlimited, onMeasured: (speeds) => told.push(speeds) }));
   assert.deepEqual(failedIn(report), ['render-speed']);
   assert.match(stepOf(report, 'render-speed').detail, /the clip should be 144x256 but is 100x100/);
+  assert.deepEqual(told, [], 'a clip that is not what it was meant to be tells no speed');
 });
 
 test('a recording of speech is given more time than the other steps get, since a small share of a processor makes listening slow', async () => {
@@ -802,4 +805,41 @@ test('a recording of speech is given more time than the other steps get, since a
   const { report } = await listening(slow, { stepTimeoutMs: 150 });
   const sample = stepOf(report, 'speech-sample');
   assert.equal(sample.ok, true, sample.detail);
+});
+
+test('the speech sample is not handed on as a speed: a recording of 11 seconds is one window of 30 for whisper.cpp, so it says what a window costs and not how long a real video takes', async () => {
+  const whisper = await sampleWhisper({ body: `sleep 1.2\ncat > "$base.json" <<'JSON'\n${speechSampleJson()}\nJSON` });
+  const told: MeasuredSpeeds[] = [];
+  const { report } = await listening(whisper, { onMeasured: (speeds) => told.push(speeds) });
+  assert.equal(stepOf(report, 'speech-sample').ok, true, stepOf(report, 'speech-sample').detail);
+  assert.match(stepOf(report, 'speech-sample').detail, /s to listen to 11 s of speech/, 'the time it took is in the report');
+  assert.deepEqual(told, [], 'but it is not told as a speed');
+});
+
+test('nothing is handed on from samples that did not pass or were not made', async () => {
+  const told: MeasuredSpeeds[] = [];
+  const onMeasured = (speeds: MeasuredSpeeds) => { told.push(speeds); };
+  const wrong = await listening(await sampleWhisper({ json: speechSampleJson({ tokens: false }) }), { onMeasured });
+  assert.equal(stepOf(wrong.report, 'speech-sample').ok, false);
+  await listening(await sampleWhisper(), { speechSamplePath: join(workspace, 'missing.wav'), onMeasured });
+  await checkToolchain(await optionsFor({ ffmpegPath: join(workspace, 'no-such-ffmpeg'), whisper: await sampleWhisper(), onMeasured }));
+  assert.deepEqual(told, [], 'a listening that was not understood, a recording that is not there and a check without samples tell nothing');
+});
+
+test('whoever is told the speeds cannot make the check fail, even by failing itself', needsFfmpeg, async () => {
+  const report = await checkToolchain(await optionsFor({ realSamples: true, clipSize: { width: 144, height: 256 }, machine: unlimited, onMeasured: () => { throw new Error('cannot cope'); } }));
+  assert.equal(stepOf(report, 'render-speed').ok, true, stepOf(report, 'render-speed').detail);
+  assert.deepEqual(failedIn(report), []);
+});
+
+test('what the render sample showed is handed on as the speed of making a clip: the seconds it took for each second of clip', needsFfmpeg, async () => {
+  const ffmpeg = await recordingFfmpeg({ endingWith: 'sample-clip.mp4', milliseconds: 1800 });
+  const told: MeasuredSpeeds[] = [];
+  const report = await checkToolchain(await optionsFor({ ffmpegPath: ffmpeg.path, realSamples: true, clipSize: { width: 180, height: 320 }, machine: sharing(0.1), preset: 'veryfast', crf: 31, clipThreads: 1, onMeasured: (speeds) => told.push(speeds) }));
+  assert.deepEqual(failedIn(report), [], JSON.stringify(report.steps.filter((step) => !step.ok)));
+  assert.equal(told.length, 1, 'told once');
+  assert.deepEqual(Object.keys(told[0]!), ['render']);
+  const times = Number(/\((\d+\.\d) times/.exec(stepOf(report, 'render-speed').detail)![1]);
+  assert.ok(Math.abs(told[0]!.render! - times) <= 0.051, `${told[0]!.render} is not the ${times} times the length of the clip that the check says`);
+  assert.ok(told[0]!.render! * 3 >= 1.8, 'it is the time of the render itself');
 });

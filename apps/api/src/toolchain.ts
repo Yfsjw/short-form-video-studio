@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { writeAssCaptions } from './captions.js';
 import { BUNDLED_FONTS_DIRECTORY, FfmpegClipRenderer, type FfmpegRunner } from './clips.js';
+import type { MeasuredSpeeds } from './estimate.js';
 import { FaceClipFramer } from './face-track.js';
 import { FfmpegAdapter } from './ffmpeg.js';
 import { positionAt, type FramingPlan } from './framing.js';
@@ -67,6 +68,12 @@ export interface ToolchainCheckOptions {
   speechSamplePath?: string;
   /** Where to find what limits this machine (default: the control group files of the container). */
   machine?: () => Promise<MachineLimits>;
+  /**
+   * Told what the samples showed, as speeds (see estimate.ts): the render sample says how long a second of clip takes to make. Only a sample that passed is told, and
+   * whatever this does, the check goes on. The speech sample is not told as a speed: it is a recording of 11 seconds, which whisper.cpp listens to as one window of 30
+   * seconds, so it says what one window costs for a little speech and not how long a real video takes (see speeds.ts); the time it took is in the report.
+   */
+  onMeasured?: (speeds: MeasuredSpeeds) => void;
 }
 
 /** The filters the clips are made with (see clips.ts): captions, the cut-out window, and the whole picture over a blurred copy. */
@@ -238,6 +245,8 @@ export async function checkToolchain(options: ToolchainCheckOptions): Promise<To
       catch (error) { return `could not be found out (${describeFailure(error)})`; }
     });
   }
+
+  const tellSpeed = (speeds: MeasuredSpeeds) => { try { options.onMeasured?.(speeds); } catch { /* whoever is told must not be able to fail the check */ } };
 
   /** whisper.cpp listens to the recording that comes with the program, through the very code that listens to customers' videos. */
   const listenToSample = async (whisper: { binaryPath: string; modelPath: string; threads?: number }): Promise<string> => {
@@ -443,6 +452,7 @@ export async function checkToolchain(options: ToolchainCheckOptions): Promise<To
         const seconds = (performance.now() - started) / 1000;
         // A speed is only worth telling for a clip that is what it was meant to be.
         await shape(output, { width, height });
+        tellSpeed({ render: seconds / 3 });
         return `3 s of ${width}x${height} with captions, from a busy 1920x1080 picture, took ${seconds.toFixed(1)} s with preset ${options.preset} and ${describeThreads(options.clipThreads)} (${(seconds / 3).toFixed(1)} times the length of the clip)`;
       });
     }

@@ -59,6 +59,18 @@ export interface RecoverySummary {
 /** What asking for a job to be stopped came to (see `VideoPipeline.stop`). */
 export type StopOutcome = 'stopping' | 'missing' | 'already over' | 'not running here';
 
+/** Who is working and who waits (see `VideoPipeline.queueView`). */
+export interface QueueView {
+  /** How many videos are worked on at once. */
+  places: number;
+  /** The jobs that hold a place for the heavy stages, in no particular order. */
+  running: string[];
+  /** The jobs that wait for a place, the one that will be let in first at the front. */
+  waiting: string[];
+  /** Jobs that are neither: receiving or saving their video, or finishing up. */
+  other: number;
+}
+
 const isFile = (path: string) => stat(path).then((info) => info.isFile(), () => false);
 
 /** The uploaded video is (as far as anyone knows) safe in durable storage but cannot be read back at this moment. That says nothing about the job itself. */
@@ -67,24 +79,32 @@ class SourceUnavailableForNow extends Error {}
 /** Lets a fixed number of jobs into the heavy stages at once; the rest wait their turn in arrival order. (Exported for its tests.) */
 export class Semaphore {
   private held = 0;
-  private readonly waiters: Array<() => void> = [];
+  private readonly waiters: Array<{ handOver: () => void; label: string | undefined }> = [];
   constructor(private readonly limit: number) {}
   get isFull() { return this.held >= this.limit; }
-  /** A `signal` that is aborted while the job waits gives up its place in line, and the wait fails with the reason of the signal. */
-  async acquire(signal?: AbortSignal) {
+  /** How many places there are. */
+  get places() { return this.limit; }
+  /** The labels of those who wait, the one who will be let in first at the front (one who gave no label is left out). */
+  waitingLabels(): string[] { return this.waiters.flatMap((waiter) => (waiter.label === undefined ? [] : [waiter.label])); }
+  /**
+   * A `signal` that is aborted while the job waits gives up its place in line, and the wait fails with the reason of the signal. A `label` says who is
+   * waiting, so that the line can be shown (see `waitingLabels`).
+   */
+  async acquire(signal?: AbortSignal, label?: string) {
     signal?.throwIfAborted();
     if (this.held < this.limit) { this.held += 1; return; }
     // The slot is handed over by whoever releases it, so `held` stays the same.
     await new Promise<void>((resolve, reject) => {
       const handOver = () => { signal?.removeEventListener('abort', giveUp); resolve(); };
-      const giveUp = () => { this.waiters.splice(this.waiters.indexOf(handOver), 1); reject(signal?.reason); };
-      this.waiters.push(handOver);
+      const waiter = { handOver, label };
+      const giveUp = () => { this.waiters.splice(this.waiters.indexOf(waiter), 1); reject(signal?.reason); };
+      this.waiters.push(waiter);
       signal?.addEventListener('abort', giveUp, { once: true });
     });
   }
   release() {
     const next = this.waiters.shift();
-    if (next) next(); else this.held -= 1;
+    if (next) next.handOver(); else this.held -= 1;
   }
 }
 
@@ -106,6 +126,8 @@ export class VideoPipeline {
   private readonly progressWrites = new Map<string, Promise<void>>();
   /** One for each job this process is working on: it is aborted when the person who uploaded the video stops it (see `stop`). */
   private readonly stoppers = new Map<string, AbortController>();
+  /** The jobs that hold a place for the heavy stages right now. */
+  private readonly running = new Set<string>();
   private readonly slots: Semaphore;
   private recheckTimer: NodeJS.Timeout | undefined;
   private closed = false;
@@ -160,6 +182,27 @@ export class VideoPipeline {
     if (!stopper) return 'not running here';
     stopper.abort(new JobStopped());
     return 'stopping';
+  }
+
+  /**
+   * Who is working and who waits, as this process sees it right now: for showing a person where their video is in line, and for deciding whether to
+   * take on another one. `other` counts the jobs that are neither (receiving or saving their video, or finishing up).
+   */
+  queueView(): QueueView {
+    const waiting = this.slots.waitingLabels();
+    const running = [...this.running];
+    return { places: this.slots.places, running, waiting, other: Math.max(0, this.heartbeats.size - running.length - waiting.length) };
+  }
+
+  /** How many jobs this process has that do not yet hold a place for the heavy stages: those that wait for one, and those that are still getting their video ready. */
+  get backlog() { return Math.max(0, this.heartbeats.size - this.running.size); }
+
+  /** Where a job that this process is working on has got to (its stage, how long it has been in it, how far along the whole job reads), or nothing if it is not. */
+  runState(jobId: string): { stage: string; stageSeconds: number; percent: number } | undefined {
+    const clock = this.clocks.get(jobId);
+    const stage = clock?.currentStage; const elapsed = clock?.currentElapsedMs;
+    if (stage === undefined || elapsed === undefined) return undefined;
+    return { stage, stageSeconds: elapsed / 1000, percent: this.lastProgress.get(jobId)?.percent ?? stageProgress(stage) };
   }
 
   /** Whether a stop of this job is under way, that is, the job is being cleaned up and its page should say so. */
@@ -266,11 +309,13 @@ export class VideoPipeline {
       // Everything up to here is plain file transfer and runs for every job at once, so a video is in
       // durable storage as early as possible even while another job occupies the CPU.
       if (this.slots.isFull) await this.enterStage(jobId, 'waiting_for_capacity', { status: 'queued' });
-      await this.slots.acquire(signal);
+      await this.slots.acquire(signal, jobId);
+      this.running.add(jobId);
       try {
         await this.enterStage(jobId, 'probing_video', { status: 'processing' });
         await this.renderClips(job, sourcePath, jobOutputDir, signal);
       } finally {
+        this.running.delete(jobId);
         this.slots.release();
       }
       reachedFinalState = true;

@@ -18,6 +18,7 @@ import type { MachineLimits } from './machine.js';
 import { NullStorage, type DurableStorage } from './storage.js';
 import { MemoryStorage, eventually, isAlive, sleep, speechSampleJson, writeFakeWhisper } from './test-support.js';
 import { onlyVideos, plainWords } from './failures.js';
+import { describeBasis, type KnownSpeeds } from './speeds.js';
 import type { ToolchainReport } from './toolchain.js';
 import type { TranscriptionEngine } from './transcription.js';
 
@@ -1858,4 +1859,321 @@ test('stopping a video while FFmpeg makes a clip ends that program for good, and
     assert.ok(!(await readdir(server.dirs.OUTPUT_DIR)).includes(id), 'no clips are kept on the server');
     assert.deepEqual(readLog(lines).filter((entry) => entry.jobId === id && entry.level >= 50).map((entry) => entry.msg), [], 'a stop is not an error, and the clip is not told as one that failed');
   } finally { if (pid && isAlive(pid)) process.kill(pid, 'SIGKILL'); await server.stop(); await dropSchema(schema); }
+});
+
+
+// ---- How long a video takes, and saying no early ----
+
+/** What a server has learned of its own speed, for these tests: seconds of work for each second of video (or of clip). */
+const knownSpeeds = (speeds: { listen?: number; render?: number }, samples = 7): KnownSpeeds => ({ speeds, sources: { ...(speeds.listen !== undefined ? { listen: { kind: 'learned' as const, samples } } : {}), ...(speeds.render !== undefined ? { render: { kind: 'learned' as const, samples } } : {}) } });
+const noSpeeds: KnownSpeeds = { speeds: {}, sources: {} };
+const schemaPool = (schema: string) => new Pool({ connectionString: TEST_DATABASE_URL, options: `-c search_path="${schema}"` });
+const countJobs = async (pool: Pool) => (await pool.query('SELECT count(*)::int AS n FROM video_jobs')).rows[0].n as number;
+
+/** A genuine video of `seconds` seconds (small, and quick to make), with a tone of its own: two videos with different tones are not taken for the same speech. */
+async function toneVideo(name: string, seconds: number, hertz: number) {
+  const path = join(workspace, `${name}.mp4`);
+  await run('ffmpeg', ['-nostdin', '-y', '-f', 'lavfi', '-i', `testsrc=duration=${seconds}:size=160x120:rate=2`, '-f', 'lavfi', '-i', `sine=frequency=${hertz}:duration=${seconds}`, '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-shortest', '-movflags', '+faststart', path]);
+  return path;
+}
+
+/** A genuine two-minute video, for the tests of what is turned away for its length. */
+let twoMinutes: string | undefined;
+async function twoMinuteVideo() {
+  twoMinutes ??= await toneVideo('two-minutes', 120, 440);
+  return readFile(twoMinutes);
+}
+
+interface Estimate { ahead?: { running: number; waiting: number }; startsInSeconds?: number; finishesInSeconds?: number; basis?: string }
+const jobView = async (base: string, id: string) => (await (await fetch(`${base}/api/jobs/${id}`)).json()) as { job: { id: string }; estimate?: Estimate };
+
+test('a video that cannot be listened to in the time allowed is turned away at once, in words that say why, with nothing kept of it; when no speed is known, nothing is said against a video, and unreadable ones are taken as before', needsFfmpeg, async () => {
+  const schema = schemaName('toolong'); const raw = schemaPool(schema);
+  let known: KnownSpeeds = noSpeeds;
+  const server = await start({ schema, extra: { speeds: async () => known } });
+  try {
+    const long = await twoMinuteVideo();
+    const first = await upload(server.base, '/api/jobs', long);   // the server has not learned how fast it is yet
+    assert.equal(first.status, 202);
+    const accepted = (await first.json() as { job: { id: string; durationSeconds: number | null; width: number | null; height: number | null } }).job;
+    assert.ok(accepted.durationSeconds !== null && Math.abs(accepted.durationSeconds - 120) < 1, `what looking at the video showed is kept with the job from the start (${accepted.durationSeconds})`);
+    assert.deepEqual([accepted.width, accepted.height], [160, 120]);
+    assert.equal((await waitForJob(server.base, accepted.id)).job.status, 'completed'); await untilSettled(server);
+
+    known = knownSpeeds({ listen: 40, render: 3.4 });   // now it knows: listening to two minutes of video (four windows of 30 s) takes 40 times as long, which is more than the hour it is allowed
+    const uploadsBefore = await readdir(server.dirs.UPLOAD_DIR);
+    const turnedAway = await upload(server.base, '/api/jobs', long);
+    assert.equal(turnedAway.status, 422);
+    assert.equal(turnedAway.headers.get('retry-after'), null, 'trying again later does not help a video that is too long');
+    assert.deepEqual(await turnedAway.json(), { error: { code: 'VIDEO_TOO_LONG', message: 'This video is 2 min 00 s long, which is too long for this server: listening to it would take about 1 h 20 min, and the server stops listening after 1 hour. Videos up to about 1 min work right now. Please upload a shorter part of it.' } });
+    const page = await upload(server.base, '/test-upload', long);
+    assert.equal(page.status, 422); assert.match(page.headers.get('content-type') ?? '', /html/);
+    const html = await page.text();
+    assert.match(html, /<h1>This video is too long<\/h1>/); assert.match(html, /listening to it would take about 1 h 20 min/); assert.match(html, /href="\/test-upload"/);
+    assert.deepEqual(await readdir(server.dirs.UPLOAD_DIR), uploadsBefore, 'the videos that were turned away are not kept');
+    assert.equal(await countJobs(raw), 1, 'and no job was made for them');
+
+    const fits = await upload(server.base, '/api/jobs', await readFile(sampleVideo));   // 8 seconds are one window of 30: 1200 seconds of listening at this speed, which is within the hour
+    assert.equal(fits.status, 202);
+    assert.equal((await waitForJob(server.base, (await fits.json() as { job: { id: string } }).job.id)).job.status, 'completed'); await untilSettled(server);
+    const unreadable = await upload(server.base, '/api/jobs', Buffer.from('this is not a video at all'));
+    assert.equal(unreadable.status, 202, 'a file that cannot be looked at is taken as it is');
+    const failed = await waitForJob(server.base, (await unreadable.json() as { job: { id: string } }).job.id);
+    assert.equal(failed.job.status, 'failed'); assert.equal(failed.job.errorMessage, plainWords.unreadableVideo, 'and fails with its own words, as it always did');
+  } finally { await raw.end(); await server.stop(); await dropSchema(schema); }
+});
+
+test('a hosted speech service is not stopped at a time limit, so no video is turned away for its length, and no longest length is told', needsFfmpeg, async () => {
+  const schema = schemaName('hostedlong');
+  const server = await start({ schema, env: { TRANSCRIPTION_ENGINE: 'openai_compatible', TRANSCRIPTION_API_URL: 'https://speech.example.test/v1', TRANSCRIPTION_API_KEY: 'a-key-that-is-never-used' }, extra: { speeds: async () => knownSpeeds({ listen: 40, render: 3.4 }) } });
+  try {
+    const response = await upload(server.base, '/api/jobs', await twoMinuteVideo());
+    assert.equal(response.status, 202);
+    assert.equal((await waitForJob(server.base, (await response.json() as { job: { id: string } }).job.id)).job.status, 'completed'); await untilSettled(server);
+    assert.equal(((await (await fetch(`${server.base}/api/queue`)).json()) as { longestVideoSeconds?: number }).longestVideoSeconds, undefined);
+    assert.doesNotMatch(await (await fetch(`${server.base}/test-upload`)).text(), /work right now|turned away/);
+  } finally { await server.stop(); await dropSchema(schema); }
+});
+
+test('a server that holds as many waiting videos as it takes on turns the next one away at once and says when to try again; it keeps nothing of it and takes videos again once the line has moved', needsFfmpeg, async () => {
+  const schema = schemaName('full'); const raw = schemaPool(schema);
+  let release!: () => void; const gate = new Promise<void>((resolve) => { release = resolve; });
+  const slowTalk: TranscriptionEngine = { transcribe: async (audioPath, workDir) => { await gate; return talk.transcribe(audioPath, workDir); } };
+  let known: KnownSpeeds = noSpeeds;
+  const server = await start({ schema, transcriber: slowTalk, env: { JOB_QUEUE_LIMIT: '2' }, extra: { speeds: async () => known } });
+  const bytes = await readFile(sampleVideo);
+  const send = async () => (await (await upload(server.base, '/api/jobs', bytes)).json() as { job: { id: string } }).job.id;
+  try {
+    const first = await send();
+    await eventually('the first video to be worked on', () => server.studio.pipeline.queueView().running.length, (count) => count === 1);
+    const second = await send(); const third = await send();
+    await eventually('the next two to wait for their turn', () => server.studio.pipeline.queueView().waiting.length, (count) => count === 2);
+
+    assert.deepEqual(await (await fetch(`${server.base}/api/queue`)).json(), { running: 1, waiting: 2, places: 1, queueLimit: 2, full: true }, 'with no speed known there is no time to tell');
+    const uploadsBefore = await readdir(server.dirs.UPLOAD_DIR);
+    const refused = await upload(server.base, '/api/jobs', bytes);
+    assert.equal(refused.status, 503);
+    assert.equal(refused.headers.get('retry-after'), '300', 'five minutes when it cannot be told when a place frees up');
+    assert.deepEqual(await refused.json(), { error: { code: 'SERVER_BUSY', message: 'The server is full right now: 2 videos are already waiting for their turn, and it does not take on more than 2. Please try again in a few minutes.' } });
+    const refusedPage = await upload(server.base, '/test-upload', bytes);
+    assert.equal(refusedPage.status, 503); assert.equal(refusedPage.headers.get('retry-after'), '300');
+    assert.match(await refusedPage.text(), /<h1>The server is full<\/h1>/);
+    assert.deepEqual(await readdir(server.dirs.UPLOAD_DIR), uploadsBefore, 'nothing was kept of the videos that were turned away');
+    assert.equal(await countJobs(raw), 3, 'and no job was made for them');
+    assert.match(await (await fetch(`${server.base}/test-upload`)).text(), /<div class="card error"><div class="stage">Right now<\/div><div>The server is full right now: 2 videos are already waiting for their turn/, 'the upload page says it before anyone picks a video');
+
+    known = knownSpeeds({ listen: 3.4, render: 3.4 });   // once the speeds are known, times are told, as estimates, with what they rest on
+    const basis = describeBasis(known);
+    const queue = await (await fetch(`${server.base}/api/queue`)).json() as Record<string, unknown>;
+    assert.equal(queue.longestVideoSeconds, 930, 'an hour, less a tenth of it, at 3.4 seconds of listening for each second of a window: 31 whole windows of 30 s');
+    assert.equal(queue.basis, basis);
+    // Each video here is 8 s of video, which whisper.cpp works on as one window of 30 s: 102 s of listening and 13.6 s of making the 4 s clip, 115.6 s in all.
+    assert.ok(typeof queue.newVideoStartsInSeconds === 'number' && queue.newVideoStartsInSeconds > 300 && queue.newVideoStartsInSeconds <= 347, `a video uploaded now starts after what is left of the one that works and the whole of the two that wait (${String(queue.newVideoStartsInSeconds)} s of the 346.8, in whole seconds)`);
+    assert.ok(Number.isInteger(queue.newVideoStartsInSeconds), 'the API tells whole seconds');
+    const refusedAgain = await upload(server.base, '/api/jobs', bytes);
+    assert.equal(refusedAgain.status, 503);
+    const wait = Number(refusedAgain.headers.get('retry-after'));
+    assert.ok(wait >= 60 && wait <= 116, `what is left of the video that works, which is at most 115.6 s (${wait})`);
+    assert.match(((await refusedAgain.json()) as { error: { message: string } }).error.message, /Please try again in about [12] min\.$/);
+    const withTimes = await (await fetch(`${server.base}/test-upload`)).text();
+    assert.match(withTimes, /Videos up to about 15 min work right now\. A longer video is turned away at once: listening to it would take more than the 1 hour this server allows\./);
+
+    const working = await jobView(server.base, first);
+    assert.ok(working.estimate?.finishesInSeconds !== undefined && working.estimate.finishesInSeconds > 60 && working.estimate.finishesInSeconds <= 115.7, `the video that works has 115.6 s of work at most (${working.estimate?.finishesInSeconds})`);
+    assert.ok(Number.isInteger(working.estimate?.finishesInSeconds), 'whole seconds');
+    assert.equal(working.estimate?.basis, basis); assert.equal(working.estimate && 'ahead' in working.estimate, false); assert.equal(working.estimate && 'startsInSeconds' in working.estimate, false);
+    const waiting = (await jobView(server.base, third)).estimate;
+    assert.deepEqual(waiting?.ahead, { running: 1, waiting: 1 });
+    assert.ok(waiting?.startsInSeconds !== undefined && waiting.startsInSeconds > 170 && waiting.startsInSeconds <= 231.3, `it starts after what is left of the first and the whole of the second (${waiting?.startsInSeconds})`);
+    assert.ok(waiting?.finishesInSeconds !== undefined && Math.abs(waiting.finishesInSeconds - waiting.startsInSeconds - 115.6) <= 1, 'and ends 115.6 s after it starts (the API tells whole seconds)');
+    assert.ok(Number.isInteger(waiting.startsInSeconds) && Number.isInteger(waiting.finishesInSeconds), 'whole seconds');
+    assert.deepEqual((await jobView(server.base, second)).estimate?.ahead, { running: 1, waiting: 0 });
+    assert.match(await (await fetch(`${server.base}/jobs/${third}`)).text(), /In front of yours: 1 video being worked on and 1 video waiting\.<\/div><div style="margin-top:8px">It should start in (about \d+ min|less than a minute) and be done in about \d+ min\.<\/div><div class="muted" style="margin-top:8px">An estimate based on how long this server took for its last 7 videos\. It can be off by a good margin\./);
+    assert.match(await (await fetch(`${server.base}/jobs/${first}`)).text(), /Time left: (about \d+ min|less than a minute)\./);
+
+    known = knownSpeeds({ listen: 40, render: 3.4 });   // a video that is too long for this server is told so, even while the server is full: waiting would not make it any shorter
+    const tooLongAndFull = await upload(server.base, '/api/jobs', await twoMinuteVideo());
+    assert.equal(tooLongAndFull.status, 422); assert.equal(tooLongAndFull.headers.get('retry-after'), null);
+    assert.equal(((await tooLongAndFull.json()) as { error: { code: string } }).error.code, 'VIDEO_TOO_LONG');
+
+    known = knownSpeeds({ listen: 0.01, render: 0.01 });   // a server so quick that what is left of the video that works is a fraction of a second
+    const soon = await upload(server.base, '/api/jobs', bytes);
+    assert.equal(soon.status, 503); assert.equal(soon.headers.get('retry-after'), '60', 'not sooner than a minute, however little is left of the video that works');
+    assert.match(((await soon.json()) as { error: { message: string } }).error.message, /Please try again in less than a minute\.$/);
+    known = knownSpeeds({ listen: 3.4, render: 3.4 });
+
+    release();
+    for (const id of [first, second, third]) assert.equal((await waitForJob(server.base, id)).job.status, 'completed'); await untilSettled(server);
+    assert.equal('estimate' in await jobView(server.base, first), false, 'a video that is done has nothing to wait for');
+    assert.doesNotMatch(await (await fetch(`${server.base}/jobs/${first}`)).text(), /In front of yours|Time left|should start/);
+    assert.deepEqual(await (await fetch(`${server.base}/api/queue`)).json(), { running: 0, waiting: 0, places: 1, queueLimit: 2, full: false, newVideoStartsInSeconds: 0, basis, longestVideoSeconds: 930 });
+    const again = await upload(server.base, '/api/jobs', bytes);
+    assert.equal(again.status, 202, 'a server whose line has moved takes videos again');
+    assert.equal((await waitForJob(server.base, (await again.json() as { job: { id: string } }).job.id)).job.status, 'completed'); await untilSettled(server);
+  } finally { release(); await raw.end(); await server.stop(); await dropSchema(schema); }
+});
+
+test('with JOB_QUEUE_LIMIT=0 any number of videos may wait, and nothing says that the server is full; the log says which it is', needsFfmpeg, async () => {
+  const lines: string[] = [];
+  const logging = { logLevel: 'info', logDestination: { write: (line: string) => { lines.push(line); } } };
+  const unlimited = schemaName('nolimit'); const limited = schemaName('withlimit');
+  let release!: () => void; const gate = new Promise<void>((resolve) => { release = resolve; });
+  const slowTalk: TranscriptionEngine = { transcribe: async (audioPath, workDir) => { await gate; return talk.transcribe(audioPath, workDir); } };
+  const server = await start({ schema: unlimited, transcriber: slowTalk, env: { JOB_QUEUE_LIMIT: '0' }, extra: logging });
+  const bytes = await readFile(sampleVideo);
+  try {
+    const ids: string[] = [];
+    for (let count = 0; count < 4; count += 1) {
+      const response = await upload(server.base, '/api/jobs', bytes); assert.equal(response.status, 202);
+      ids.push((await response.json() as { job: { id: string } }).job.id);
+      if (count === 0) await eventually('the first video to be worked on', () => server.studio.pipeline.queueView().running.length, (running) => running === 1);
+    }
+    await eventually('the others to wait for their turn', () => server.studio.pipeline.queueView().waiting.length, (waiting) => waiting === 3);
+    assert.deepEqual(await (await fetch(`${server.base}/api/queue`)).json(), { running: 1, waiting: 3, places: 1, queueLimit: null, full: false });
+    assert.doesNotMatch(await (await fetch(`${server.base}/test-upload`)).text(), /server is full/);
+    release();
+    for (const id of ids) assert.equal((await waitForJob(server.base, id)).job.status, 'completed'); await untilSettled(server);
+  } finally { release(); await server.stop(); await dropSchema(unlimited); }
+  assert.ok(logLines(lines).some((entry) => entry.msg === 'Any number of videos may wait for their turn (JOB_QUEUE_LIMIT is 0)'));
+  lines.length = 0;
+  const other = await start({ schema: limited, extra: logging });
+  try { assert.ok(logLines(lines).some((entry) => entry.msg === 'At most 5 videos may wait for their turn; a video that arrives when that many already wait is turned away at once (JOB_QUEUE_LIMIT)'), 'five is what a server takes on when nothing is set'); }
+  finally { await other.stop(); await dropSchema(limited); }
+});
+
+test('what the start-up check measures about making a clip is kept and logged, but the speed of listening is never taken from it: with no finished videos of its own the server tells no times and turns no video away', needsFfmpeg, async () => {
+  const schema = schemaName('measured'); const lines: string[] = [];
+  let release!: () => void; const gate = new Promise<void>((resolve) => { release = resolve; });
+  const slowTalk: TranscriptionEngine = { transcribe: async (audioPath, workDir) => { await gate; return talk.transcribe(audioPath, workDir); } };
+  const server = await start({ schema, transcriber: slowTalk, extra: { logLevel: 'info', logDestination: { write: (line: string) => { lines.push(line); } }, toolchainCheck: async ({ onMeasured }) => { onMeasured({ render: 3.1 }); return passedReport; } } });
+  const bytes = await readFile(sampleVideo);
+  try {
+    assert.equal((await server.studio.toolchain.run()).state, 'passed');
+    const first = (await (await upload(server.base, '/api/jobs', bytes)).json() as { job: { id: string } }).job.id;
+    await eventually('the first video to be worked on', () => server.studio.pipeline.queueView().running.length, (running) => running === 1);
+    const second = (await (await upload(server.base, '/api/jobs', bytes)).json() as { job: { id: string } }).job.id;
+    await eventually('the second to wait', () => server.studio.pipeline.queueView().waiting.length, (waiting) => waiting === 1);
+    const estimate = (await jobView(server.base, second)).estimate;
+    assert.deepEqual(estimate, { ahead: { running: 1, waiting: 0 } }, 'where it is in line is told, and no time, because how long listening takes is not known yet');
+    assert.equal('estimate' in await jobView(server.base, first), false, 'a video that is being worked on has nothing to say about time then, and sends no empty estimate');
+    const queue = await (await fetch(`${server.base}/api/queue`)).json() as Record<string, unknown>;
+    assert.equal('longestVideoSeconds' in queue, false); assert.equal('newVideoStartsInSeconds' in queue, false); assert.equal('basis' in queue, false);
+    const page = await (await fetch(`${server.base}/jobs/${second}`)).text();
+    assert.match(page, /In front of yours: 1 video being worked on\./); assert.doesNotMatch(page, /should start|Time left|An estimate based on/);
+    const long = await upload(server.base, '/api/jobs', await twoMinuteVideo());
+    assert.equal(long.status, 202, 'and a long video is taken, as there is nothing yet to say that it cannot be done');
+    release();
+    for (const id of [first, second, (await long.json() as { job: { id: string } }).job.id]) assert.equal((await waitForJob(server.base, id)).job.status, 'completed'); await untilSettled(server);
+  } finally { release(); await server.stop(); await dropSchema(schema); }
+  const told = logLines(lines).map((entry) => entry.msg);
+  assert.ok(told.includes('The start-up check measured how fast this server makes a clip: 3.1 seconds of work for each second of clip.'), told.join('\n'));
+  assert.equal(told.filter((message) => /how fast this server listens/.test(message ?? '')).length, 0, 'it does not claim to have measured how fast the server listens to a video');
+});
+
+test('a page about a video does not fail when its time cannot be worked out: the video is shown without a forecast, and the log says why', needsFfmpeg, async () => {
+  const schema = schemaName('forecastfails'); const lines: string[] = [];
+  let release!: () => void; const gate = new Promise<void>((resolve) => { release = resolve; });
+  const slowTalk: TranscriptionEngine = { transcribe: async (audioPath, workDir) => { await gate; return talk.transcribe(audioPath, workDir); } };
+  let broken = false;
+  const server = await start({ schema, transcriber: slowTalk, extra: { logLevel: 'info', logDestination: { write: (line: string) => { lines.push(line); } }, speeds: async () => { if (broken) throw new Error('the speeds cannot be read'); return knownSpeeds({ listen: 3.4, render: 3.4 }); } } });
+  try {
+    const id = (await (await upload(server.base, '/api/jobs', await readFile(sampleVideo))).json() as { job: { id: string } }).job.id;
+    await eventually('the video to be worked on', () => server.studio.pipeline.queueView().running.length, (running) => running === 1);
+    assert.ok((await jobView(server.base, id)).estimate?.finishesInSeconds !== undefined, 'with the speeds known there is a forecast');
+    broken = true;
+    const api = await fetch(`${server.base}/api/jobs/${id}`);
+    assert.equal(api.status, 200);
+    const body = await api.json() as { job: { id: string }; estimate?: unknown };
+    assert.equal(body.job.id, id); assert.equal('estimate' in body, false, 'the video is there, and nothing is said about its time');
+    const page = await fetch(`${server.base}/jobs/${id}`);
+    assert.equal(page.status, 200);
+    assert.doesNotMatch(await page.text(), /Time left|An estimate based on/);
+    broken = false;
+    release();
+    assert.equal((await waitForJob(server.base, id)).job.status, 'completed'); await untilSettled(server);
+  } finally { release(); await server.stop(); await dropSchema(schema); }
+  assert.ok(logLines(lines).some((entry) => entry.msg === 'Could not work out how long a video takes'), 'the log says why');
+});
+
+test('once the server has finished videos of its own the estimates and the longest video go by what they took: the pipeline leaves the records the speeds are learned from, and a server that starts again reads them', needsFfmpeg, async () => {
+  const schema = schemaName('learned');
+  const lengths = [60, 90, 120]; const delays = [600, 900, 1200];   // what listening to each takes: 0.6 s for 60 s of video, and so on: a hundredth of a second for each second of the windows
+  let listened = 0;
+  const timedTalk: TranscriptionEngine = { transcribe: async (audioPath, workDir) => { await sleep(delays[listened] ?? 0); listened += 1; return talk.transcribe(audioPath, workDir); } };
+  let first: RunningServer | undefined; let second: RunningServer | undefined; let third: RunningServer | undefined;
+  let release!: () => void; const gate = new Promise<void>((resolve) => { release = resolve; });
+  const heldTalk: TranscriptionEngine = { transcribe: async (audioPath, workDir) => { await gate; return talk.transcribe(audioPath, workDir); } };
+  try {
+    first = await start({ schema, transcriber: timedTalk, framer: null });
+    for (const [index, seconds] of lengths.entries()) {   // a different tone for each, so that none is taken for a video whose speech was already written down
+      const response = await upload(first.base, '/api/jobs', await readFile(await toneVideo(`learned-${seconds}`, seconds, 440 + 110 * index)));
+      assert.equal(response.status, 202);
+      assert.equal((await waitForJob(first.base, (await response.json() as { job: { id: string } }).job.id)).job.status, 'completed'); await untilSettled(first);
+    }
+    assert.equal(listened, 3, 'all three were listened to');
+    await first.stop();   // what the first server finished stays in the database for the next
+
+    second = await start({ schema, transcriber: heldTalk, framer: null });
+    const queue = await (await fetch(`${second.base}/api/queue`)).json() as { basis?: string; longestVideoSeconds?: number };
+    assert.equal(queue.basis, 'how long this server took for its last 3 videos', 'it learned from the three that finished, and says so');
+    assert.ok(typeof queue.longestVideoSeconds === 'number' && queue.longestVideoSeconds % 30 === 0 && queue.longestVideoSeconds > 32_400, `a server that listens this fast turns no ordinary video away (${String(queue.longestVideoSeconds)} s, in whole windows of 30 s)`);
+    const response = await upload(second.base, '/api/jobs', await readFile(await toneVideo('learned-150', 150, 770)));
+    assert.equal(response.status, 202);
+    const id = (await response.json() as { job: { id: string } }).job.id;
+    await eventually('the video to be worked on', () => second!.studio.pipeline.queueView().running.length, (running) => running === 1);
+    const estimate = (await jobView(second.base, id)).estimate;
+    assert.equal(estimate?.basis, 'how long this server took for its last 3 videos');
+    assert.ok(estimate?.finishesInSeconds !== undefined && estimate.finishesInSeconds > 0 && estimate.finishesInSeconds < 60, `a time that fits what the three took (${String(estimate?.finishesInSeconds)} s)`);
+    assert.match(await (await fetch(`${second.base}/jobs/${id}`)).text(), /Time left: (about \d+ min|less than a minute)\.[\s\S]*An estimate based on how long this server took for its last 3 videos\. It can be off by a good margin\./);
+    release();
+    assert.equal((await waitForJob(second.base, id)).job.status, 'completed'); await untilSettled(second);
+    await second.stop();
+
+    // The same finished videos, but with the clips they made gone from the record, so that the speed of making a clip cannot be learned from them: what the start-up check measured stands in for it.
+    const raw = schemaPool(schema);
+    try { await raw.query('DELETE FROM generated_clips'); } finally { await raw.end(); }
+    third = await start({ schema, framer: null, extra: { toolchainCheck: async ({ onMeasured }) => { onMeasured({ render: 2.5 }); return passedReport; } } });
+    assert.equal((await third.studio.toolchain.run()).state, 'passed');
+    const standIn = await (await fetch(`${third.base}/api/queue`)).json() as { basis?: string };
+    assert.equal(standIn.basis, 'how long this server took for its last 4 videos (and, for making the clips, on a test it made when it started)', 'the three, and the one the second server finished');
+  } finally { release(); await first?.stop(); await second?.stop(); await third?.stop(); await dropSchema(schema); }
+});
+
+test('a video from a YouTube address is looked at like an upload: its length is kept, a video that is too long is thrown away after it was downloaded, and a full server says so before it downloads anything', needsFfmpeg, async () => {
+  const sample = await readFile(sampleVideo); const long = await twoMinuteVideo();
+  let served = sample; const hits = { cobalt: 0, media: 0 };
+  const cobalt = createServer((request, response) => {
+    if (request.method === 'POST') { hits.cobalt += 1; response.setHeader('content-type', 'application/json'); return void response.end(JSON.stringify({ status: 'tunnel', url: `http://127.0.0.1:${(cobalt.address() as AddressInfo).port}/media.mp4`, filename: 'talk.mp4' })); }
+    hits.media += 1; response.setHeader('content-type', 'video/mp4'); response.end(served);
+  }).listen(0, '127.0.0.1');
+  await new Promise<void>((resolve) => cobalt.once('listening', resolve));
+  const schema = schemaName('ytlooks');
+  let release!: () => void; const gate = new Promise<void>((resolve) => { release = resolve; });
+  const slowTalk: TranscriptionEngine = { transcribe: async (audioPath, workDir) => { await gate; return talk.transcribe(audioPath, workDir); } };
+  let known: KnownSpeeds = noSpeeds;
+  const server = await start({ schema, transcriber: slowTalk, env: { COBALT_API_URL: `http://127.0.0.1:${(cobalt.address() as AddressInfo).port}`, JOB_QUEUE_LIMIT: '1' }, extra: { speeds: async () => known } });
+  const ask = () => fetch(`${server.base}/api/youtube`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ url: 'https://www.youtube.com/watch?v=abc' }) });
+  try {
+    const accepted = await ask(); assert.equal(accepted.status, 202);
+    const { job, source } = await accepted.json() as { job: { id: string; durationSeconds: number | null; width: number | null }; source: string };
+    assert.equal(source, 'youtube'); assert.ok(job.durationSeconds !== null && Math.abs(job.durationSeconds - 8) < 1, `${job.durationSeconds}`); assert.equal(job.width, 320);
+    await eventually('the video to be worked on', () => server.studio.pipeline.queueView().running.length, (running) => running === 1);
+
+    served = long; known = knownSpeeds({ listen: 40, render: 3.4 });
+    const uploadsBefore = await readdir(server.dirs.UPLOAD_DIR); const downloadsBefore = hits.media;
+    const tooLong = await ask();
+    assert.equal(tooLong.status, 422); assert.equal(((await tooLong.json()) as { error: { code: string } }).error.code, 'VIDEO_TOO_LONG');
+    assert.equal(hits.media, downloadsBefore + 1, 'it has to be downloaded before anyone can tell how long it is');
+    assert.deepEqual(await readdir(server.dirs.UPLOAD_DIR), uploadsBefore, 'and what was downloaded is thrown away');
+
+    served = sample; known = noSpeeds;
+    const queued = await ask(); assert.equal(queued.status, 202);   // one waits now, which is as many as this server takes on
+    const asked = hits.cobalt;
+    const full = await ask();
+    assert.equal(full.status, 503); assert.equal(full.headers.get('retry-after'), '300');
+    assert.equal(((await full.json()) as { error: { code: string } }).error.code, 'SERVER_BUSY');
+    assert.equal(hits.cobalt, asked, 'a server that is full does not even ask for the video');
+    release();
+    await eventually('both videos to be done', () => server.studio.pipeline.activeJobCount, (count) => count === 0);
+  } finally { release(); await server.stop(); await dropSchema(schema); await new Promise<void>((resolve) => cobalt.close(() => resolve())); }
 });

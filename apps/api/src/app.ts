@@ -16,6 +16,10 @@ import { VideoPipeline } from './pipeline.js';
 import { createTranscriptionEngine } from './engines.js';
 import { FaceClipFramer, type ClipFramer } from './face-track.js';
 import { ToolchainMonitor, checkToolchain, type ToolchainReport } from './toolchain.js';
+import { limitWords, refuseIfFull, refuseIfTooLong, type AdmissionRules, type Refusal, type ServerBusy } from './admission.js';
+import { longestListenable, type MeasuredSpeeds } from './estimate.js';
+import { forecastFor, loadOf, placeFreesIn, type Forecast, type ForecastSources } from './forecast.js';
+import { describeBasis, SpeedBook, type KnownSpeeds } from './speeds.js';
 import { automaticThreads, describeThreads, readMachineLimits, type MachineLimits } from './machine.js';
 import type { TranscriptionEngine } from './transcription.js';
 import { DeterministicHighlightDetector, type HighlightOptions } from './highlights.js';
@@ -25,13 +29,17 @@ import { KeepAwake } from './keepawake.js';
 import { FailedAttemptLimiter, createAccessGate } from './access.js';
 import { installAccessGate } from './access-http.js';
 import { parseJobOptions } from './options.js';
-import { escapeHtml, keptFor, renderDeleteConfirmPage, renderDeletedPage, renderJobPage, renderMessagePage, renderStopConfirmPage, renderUploadPage } from './pages.js';
+import { escapeHtml, keptFor, renderDeleteConfirmPage, renderDeletedPage, renderJobPage, renderMessagePage, renderStopConfirmPage, renderUploadPage, type ServerNow } from './pages.js';
 import { JobEraser, RetentionSweeper, type RetentionOptions } from './retention.js';
 import { PlainFailure, onlyVideos, plainWords } from './failures.js';
 import { decideToneMapping, probeToneMapping, type ToneMappingSupport } from './hdr.js';
 
 const acceptedExtensions = new Set(['.mp4', '.mov', '.mkv', '.webm', '.avi', '.m4v']);
 const acceptedMimeTypes = new Set(['video/mp4', 'video/quicktime', 'video/x-matroska', 'video/webm', 'video/x-msvideo', 'video/x-m4v']);
+
+/** The speeds that estimates are worked out from are learned from the latest videos this server finished: this many of them, and none older than this many days (see speeds.ts). */
+const SPEED_SAMPLE_JOBS = 10;
+const SPEED_SAMPLE_DAYS = 30;
 
 /** What a person is told about an upload that the upload library refused. Its own short words are not repeated: they are not written for people. */
 function uploadRefusal(error: multer.MulterError): string {
@@ -70,8 +78,8 @@ export interface AppOverrides {
   accessFailureDelayMs?: number;
   /** The longest start-up waits for the look at interrupted jobs before the server opens anyway (default 30 seconds; tests make it short). */
   bootRecoveryWaitMs?: number;
-  /** What the check of the video tools does (a stand-in for tests; production passes nothing and gets the real check) and how often it looks whether the server is idle yet. */
-  toolchainCheck?: () => Promise<ToolchainReport>;
+  /** What the check of the video tools does (a stand-in for tests; production passes nothing and gets the real check) and how often it looks whether the server is idle yet. It is given what the real check has to tell the server about the speeds it measured. */
+  toolchainCheck?: (hooks: { onMeasured: (speeds: MeasuredSpeeds) => void }) => Promise<ToolchainReport>;
   toolchainRetryMs?: number;
   /** What limits the machine (default: the control group files of the container). It decides how many threads the programs are started with, and is what the start-up check reports. */
   machine?: () => Promise<MachineLimits>;
@@ -79,6 +87,8 @@ export interface AppOverrides {
   toneMapping?: () => Promise<ToneMappingSupport>;
   /** When and how the clips that are older than CLIP_RETENTION_DAYS are looked for (default: a minute after the start, then every hour; tests look when they want to). */
   retention?: Partial<Omit<RetentionOptions, 'days'>>;
+  /** How fast this server works, as the estimates and the early refusals see it (a stand-in for tests; production passes nothing and it is learned from the finished videos and the start-up check, see speeds.ts). */
+  speeds?: () => Promise<KnownSpeeds>;
 }
 
 const DEFAULT_BOOT_RECOVERY_WAIT_MS = 30_000;
@@ -137,7 +147,8 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
     ? (config.FACE_FRAMING_ENABLED ? new FaceClipFramer({ ffmpegPath: config.FFMPEG_PATH, outputAspect: config.CLIP_VERTICAL_WIDTH / config.CLIP_VERTICAL_HEIGHT, threads: clipThreads }) : undefined)
     : overrides.framer ?? undefined;
   const renderer = new FfmpegClipRenderer(config.FFMPEG_PATH, config.CLIP_VIDEO_CODEC, config.CLIP_AUDIO_CODEC, config.CLIP_CRF, config.CLIP_PRESET, config.CLIP_VERTICAL_WIDTH, config.CLIP_VERTICAL_HEIGHT, undefined, undefined, clipThreads, toneMapping);
-  const pipeline = new VideoPipeline(db, new FfmpegAdapter(config.FFPROBE_PATH, config.FFMPEG_PATH), transcriber, new DeterministicHighlightDetector(), highlightOptions, renderer, config.CLIP_MAX_CANDIDATES, config.UPLOAD_DIR, config.TEMP_DIR, config.OUTPUT_DIR, logger, durableStorage, {
+  const ffmpeg = new FfmpegAdapter(config.FFPROBE_PATH, config.FFMPEG_PATH);
+  const pipeline = new VideoPipeline(db, ffmpeg, transcriber, new DeterministicHighlightDetector(), highlightOptions, renderer, config.CLIP_MAX_CANDIDATES, config.UPLOAD_DIR, config.TEMP_DIR, config.OUTPUT_DIR, logger, durableStorage, {
     concurrency: config.JOB_CONCURRENCY,
     maxAttempts: config.JOB_MAX_ATTEMPTS,
     staleAfterMs: config.JOB_STALE_AFTER_SECONDS * 1000,
@@ -202,17 +213,74 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
   // Requests that are being handled right now (a big upload from a phone can take many minutes). Health checks are left
   // out, so neither Render's own nor the keep-awake request below can make the server look busy all by itself.
   let requestsInFlight = 0;
+  // How long a video takes, which is what the estimates and the early refusals are worked out from: learned from the videos this server finished lately, and until it has
+  // finished enough of them, from what the start-up check measured (see speeds.ts). Plain sums over measured times: nothing here is a model, and nothing changes how a video is processed.
+  const speedBook = new SpeedBook(() => db.listRecentRuns(SPEED_SAMPLE_JOBS, new Date(Date.now() - SPEED_SAMPLE_DAYS * 86_400_000).toISOString()), { onError: (error) => logger.warn({ err: error }, 'Could not read the finished videos to learn how fast this server is') });
+  const knownSpeeds = overrides.speeds ?? (() => speedBook.current());
+  // What is turned away at the door. A video is turned away for its length only when the engine that listens to it is stopped at a time limit (whisper.cpp is; a hosted service is not).
+  const admissionRules: AdmissionRules = { queueLimit: config.JOB_QUEUE_LIMIT || undefined, listeningLimitSeconds: config.TRANSCRIPTION_ENGINE === 'whisper_cpp' ? config.TRANSCRIPTION_TIMEOUT_MS / 1000 : undefined };
+  logger.info({ queueLimit: admissionRules.queueLimit ?? null, listeningLimitSeconds: admissionRules.listeningLimitSeconds ?? null }, admissionRules.queueLimit === undefined
+    ? 'Any number of videos may wait for their turn (JOB_QUEUE_LIMIT is 0)'
+    : `At most ${admissionRules.queueLimit} videos may wait for their turn; a video that arrives when that many already wait is turned away at once (JOB_QUEUE_LIMIT)`);
+  const forecastSources: ForecastSources = {
+    queue: () => pipeline.queueView(), runState: (jobId) => pipeline.runState(jobId), jobs: (ids) => db.getJobs(ids), speeds: knownSpeeds,
+    defaults: { clipCount: config.CLIP_MAX_CANDIDATES, clipSeconds: { min: config.HIGHLIGHT_MIN_DURATION_SECONDS, max: config.HIGHLIGHT_MAX_DURATION_SECONDS } },
+  };
+  /** The check of the video tools tells what it measured: how fast this server makes a clip (the speed of listening is learned from finished videos only: see speeds.ts). */
+  const noteMeasuredSpeeds = (speeds: MeasuredSpeeds) => {
+    speedBook.noteMeasured(speeds);
+    if (speeds.render !== undefined) logger.info({ renderSpeed: speeds.render }, `The start-up check measured how fast this server makes a clip: ${speeds.render.toFixed(1)} seconds of work for each second of clip.`);
+  };
+  /** The forecast of a video. Best effort: a page about a video must never fail because an estimate could not be made. */
+  const forecastOf = (job: VideoJob): Promise<Forecast | undefined> => forecastFor(job, forecastSources).catch((error: unknown) => { logger.warn({ err: error }, 'Could not work out how long a video takes'); return undefined; });
+  /** The answer to a video that arrives when as many already wait as the server takes on (nothing when it takes it). */
+  const refuseIfFullNow = async (): Promise<ServerBusy | undefined> => {
+    const waiting = pipeline.backlog;
+    if (admissionRules.queueLimit === undefined || waiting < admissionRules.queueLimit) return undefined;
+    return refuseIfFull(waiting, admissionRules, await placeFreesIn(forecastSources).catch(() => undefined));
+  };
+  /**
+   * Looks at a video that has just arrived and says whether this server takes it: `refusal` is what to tell the person when it does not (it is too long to be listened to in the
+   * time allowed, or the server is full), and `seen` is what looking at it showed (its length and size), to be kept with the job. A video that cannot be looked at is taken as it is: the
+   * job then fails with words of its own when it is worked on, as before.
+   */
+  const lookAtArrival = async (storedFilename: string, log: Pick<typeof logger, 'info'>): Promise<{ refusal?: Refusal; seen: { durationSeconds: number | null; width: number | null; height: number | null } }> => {
+    const seen = { durationSeconds: null as number | null, width: null as number | null, height: null as number | null };
+    try { const { durationSeconds, width, height } = await ffmpeg.probe(join(config.UPLOAD_DIR, storedFilename)); Object.assign(seen, { durationSeconds, width, height }); }
+    catch (error) { log.info({ err: error }, 'A video that has just arrived could not be looked at; it is taken as it is'); return { seen }; }
+    const refusal = refuseIfTooLong(seen.durationSeconds ?? undefined, (await knownSpeeds()).speeds, admissionRules) ?? await refuseIfFullNow();
+    return { ...(refusal ? { refusal } : {}), seen };
+  };
+  /** What a person at a form is shown when a video is turned away, and what a program is sent. */
+  const retryHeader = (res: Response, refusal: Refusal) => { if (refusal.code === 'SERVER_BUSY') res.set('Retry-After', String(refusal.retryAfterSeconds)); };
+  const refusalPage = (res: Response, refusal: Refusal) => { retryHeader(res, refusal); return res.status(refusal.status).type('html').send(renderMessagePage(refusal.code === 'SERVER_BUSY' ? 'The server is full' : 'This video is too long', refusal.message, { href: '/test-upload', text: 'Back to the upload page' })); };
+  const refusalJson = (res: Response, refusal: Refusal) => { retryHeader(res, refusal); return res.status(refusal.status).json({ error: { code: refusal.code, message: refusal.message } }); };
+  /** How busy the server is, and what it turns away, for the upload page and for programs. */
+  const serverNow = async (): Promise<ServerNow & { places: number }> => {
+    const load = await loadOf(forecastSources); const full = await refuseIfFullNow();
+    const limit = admissionRules.listeningLimitSeconds; const known = limit === undefined ? undefined : await knownSpeeds();
+    const longest = limit === undefined || !known ? undefined : longestListenable(known.speeds, limit);
+    // The longest video that works rests on the same learned speeds as the times do, so what they rest on is told whenever either is.
+    const basis = load.basis ?? (longest !== undefined && known ? describeBasis(known) : undefined);
+    return {
+      running: load.running, waiting: load.waiting, places: load.places,
+      ...(load.newVideoStartsInSeconds !== undefined ? { startsInSeconds: load.newVideoStartsInSeconds } : {}), ...(basis ? { basis } : {}),
+      ...(full ? { full: { message: full.message } } : {}), ...(limit !== undefined && longest !== undefined ? { longestVideo: { seconds: longest, limit: limitWords(limit) } } : {}),
+    };
+  };
+  /** What the API says of the time of a video: the forecast, with whole seconds. */
+  const publicEstimate = (forecast: Forecast) => ({ ...forecast, ...(forecast.startsInSeconds !== undefined ? { startsInSeconds: Math.round(forecast.startsInSeconds) } : {}), ...(forecast.finishesInSeconds !== undefined ? { finishesInSeconds: Math.round(forecast.finishesInSeconds) } : {}) });
   // The check of the video tools is started by whoever starts the server (server.ts), once it is listening: it waits for the server to be
   // idle, because a memory spike on top of a running job could kill a small instance. And once it runs it holds a place for the heavy
   // stages, as a job does, so that a video uploaded meanwhile waits instead of being worked on at the same time as the check.
   const toolchain = new ToolchainMonitor({
-    check: () => pipeline.withCapacity(overrides.toolchainCheck ?? (() => checkToolchain({
+    check: () => pipeline.withCapacity(overrides.toolchainCheck ? () => overrides.toolchainCheck!({ onMeasured: noteMeasuredSpeeds }) : (() => checkToolchain({
       ffmpegPath: config.FFMPEG_PATH, ffprobePath: config.FFPROBE_PATH, videoCodec: config.CLIP_VIDEO_CODEC, audioCodec: config.CLIP_AUDIO_CODEC, crf: config.CLIP_CRF, preset: config.CLIP_PRESET,
       workDirectory: config.TEMP_DIR,
       whisper: config.TRANSCRIPTION_ENGINE === 'whisper_cpp' ? { binaryPath: config.WHISPER_CPP_PATH, modelPath: config.WHISPER_MODEL_PATH, ...(whisperThreads ? { threads: whisperThreads } : {}) } : null,
       faceFollowing: framer !== undefined,
       realSamples: config.TOOLCHAIN_REAL_SAMPLES, clipSize: { width: config.CLIP_VERTICAL_WIDTH, height: config.CLIP_VERTICAL_HEIGHT },
-      clipThreads, toneMapping, machine: overrides.machine,
+      clipThreads, toneMapping, machine: overrides.machine, onMeasured: noteMeasuredSpeeds,
     }))),
     isBusy: () => pipeline.activeJobCount > 0 || requestsInFlight > 0,
     logger,
@@ -245,8 +313,10 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
   // The bare address is what people open first and it has no page of its own, so it leads to the upload page instead of an error.
   app.get('/', (_req, res) => res.redirect(302, '/test-upload'));
 
-  app.get('/test-upload', (_req, res) => {
-    res.type('html').send(renderUploadPage({ maxUploadMb, defaultClipCount: config.CLIP_MAX_CANDIDATES, retentionDays: config.CLIP_RETENTION_DAYS || undefined, defaultClipSeconds: { min: config.HIGHLIGHT_MIN_DURATION_SECONDS, max: config.HIGHLIGHT_MAX_DURATION_SECONDS }, clipSize: { width: config.CLIP_VERTICAL_WIDTH, height: config.CLIP_VERTICAL_HEIGHT }, faceFraming: framer !== undefined }));
+  app.get('/test-upload', async (_req, res) => {
+    // How busy the server is (and what it turns away) is told before a person picks a video; best effort, the page is the same without it.
+    const now = await serverNow().catch((error: unknown) => { logger.warn({ err: error }, 'Could not work out how busy the server is'); return undefined; });
+    res.type('html').send(renderUploadPage({ ...(now ? { now } : {}), maxUploadMb, defaultClipCount: config.CLIP_MAX_CANDIDATES, retentionDays: config.CLIP_RETENTION_DAYS || undefined, defaultClipSeconds: { min: config.HIGHLIGHT_MIN_DURATION_SECONDS, max: config.HIGHLIGHT_MAX_DURATION_SECONDS }, clipSize: { width: config.CLIP_VERTICAL_WIDTH, height: config.CLIP_VERTICAL_HEIGHT }, faceFraming: framer !== undefined }));
   });
 
   app.post('/test-upload', (req, res, next) => {
@@ -263,8 +333,10 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
         if (!req.file) return res.status(400).type('html').send(renderMessagePage('Upload failed', 'No video file was received.'));
         const options = parseJobOptions(req.body);
         if (!options.ok) { await discardUpload(req.file.filename); return res.status(400).type('html').send(renderMessagePage('Upload failed', options.message)); }
+        const arrival = await lookAtArrival(req.file.filename, req.log);
+        if (arrival.refusal) { await discardUpload(req.file.filename); req.log.info({ code: arrival.refusal.code, videoSeconds: arrival.seen.durationSeconds }, 'A video was turned away'); return refusalPage(res, arrival.refusal); }
         const now = new Date().toISOString();
-        const job: NewVideoJob = { id: randomUUID(), originalFilename: req.file.originalname, storedFilename: req.file.filename, mimeType: req.file.mimetype, sizeBytes: req.file.size, status: 'queued', stage: 'queued', errorMessage: null, durationSeconds: null, width: null, height: null, createdAt: now, updatedAt: now, options: options.options };
+        const job: NewVideoJob = { id: randomUUID(), originalFilename: req.file.originalname, storedFilename: req.file.filename, mimeType: req.file.mimetype, sizeBytes: req.file.size, status: 'queued', stage: 'queued', errorMessage: null, ...arrival.seen, createdAt: now, updatedAt: now, options: options.options };
         try { await db.createJob(job); } catch (error) { await discardUpload(req.file.filename); throw error; }
         pipeline.enqueue(job.id);
         // Straight to the page that follows the job, instead of a confirmation page with a link to tap.
@@ -285,11 +357,16 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
       if (!youtubeUrl) return res.status(400).json({ error: { code: 'YOUTUBE_URL_REQUIRED', message: 'Provide a YouTube URL in the “url” field.' } });
       const options = parseJobOptions(req.body);
       if (!options.ok) return res.status(400).json({ error: { code: 'INVALID_OPTIONS', message: options.message } });
+      // A server that is full says so before it downloads anything.
+      const full = await refuseIfFullNow();
+      if (full) { req.log.info({ code: full.code }, 'A video was turned away'); return refusalJson(res, full); }
 
       const id = randomUUID();
       const now = new Date().toISOString();
       const downloaded = await downloadYouTubeVideo({ youtubeUrl, cobaltUrl: config.COBALT_API_URL, cobaltApiKey: config.COBALT_API_KEY, outputDir: config.UPLOAD_DIR, jobId: id, timeoutMs: config.YOUTUBE_DOWNLOAD_TIMEOUT_MS });
-      const job: NewVideoJob = { id, originalFilename: downloaded.originalFilename, storedFilename: downloaded.storedFilename, mimeType: downloaded.mimeType, sizeBytes: downloaded.sizeBytes, status: 'queued', stage: 'queued', errorMessage: null, durationSeconds: null, width: null, height: null, createdAt: now, updatedAt: now, options: options.options };
+      const arrival = await lookAtArrival(downloaded.storedFilename, req.log);
+      if (arrival.refusal) { await discardUpload(downloaded.storedFilename); req.log.info({ code: arrival.refusal.code, videoSeconds: arrival.seen.durationSeconds }, 'A video was turned away'); return refusalJson(res, arrival.refusal); }
+      const job: NewVideoJob = { id, originalFilename: downloaded.originalFilename, storedFilename: downloaded.storedFilename, mimeType: downloaded.mimeType, sizeBytes: downloaded.sizeBytes, status: 'queued', stage: 'queued', errorMessage: null, ...arrival.seen, createdAt: now, updatedAt: now, options: options.options };
       try { await db.createJob(job); } catch (error) { await discardUpload(downloaded.storedFilename); throw error; }
       pipeline.enqueue(job.id);
       res.status(202).json({ job, source: 'youtube' });
@@ -301,8 +378,10 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
       if (!req.file) return res.status(400).json({ error: { code: 'VIDEO_REQUIRED', message: 'Attach one video file using the “video” field.' } });
       const options = parseJobOptions(req.body);
       if (!options.ok) { await discardUpload(req.file.filename); return res.status(400).json({ error: { code: 'INVALID_OPTIONS', message: options.message } }); }
+      const arrival = await lookAtArrival(req.file.filename, req.log);
+      if (arrival.refusal) { await discardUpload(req.file.filename); req.log.info({ code: arrival.refusal.code, videoSeconds: arrival.seen.durationSeconds }, 'A video was turned away'); return refusalJson(res, arrival.refusal); }
       const now = new Date().toISOString();
-      const job: NewVideoJob = { id: randomUUID(), originalFilename: req.file.originalname, storedFilename: req.file.filename, mimeType: req.file.mimetype, sizeBytes: req.file.size, status: 'queued', stage: 'queued', errorMessage: null, durationSeconds: null, width: null, height: null, createdAt: now, updatedAt: now, options: options.options };
+      const job: NewVideoJob = { id: randomUUID(), originalFilename: req.file.originalname, storedFilename: req.file.filename, mimeType: req.file.mimetype, sizeBytes: req.file.size, status: 'queued', stage: 'queued', errorMessage: null, ...arrival.seen, createdAt: now, updatedAt: now, options: options.options };
       try { await db.createJob(job); } catch (error) { await discardUpload(req.file.filename); throw error; }
       pipeline.enqueue(job.id);
       res.status(202).json({ job });
@@ -311,7 +390,13 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
   app.get('/api/jobs/:id', async (req, res) => {
     const job = await db.getJob(req.params.id);
     if (!job) return res.status(404).json({ error: { code: 'JOB_NOT_FOUND', message: 'No processing job exists for this id.' } });
-    res.json({ job: toPublicJob(job), clips: await db.listClips(job.id) });
+    const forecast = await forecastOf(job);
+    res.json({ job: toPublicJob(job), clips: await db.listClips(job.id), ...(forecast && Object.keys(forecast).length ? { estimate: publicEstimate(forecast) } : {}) });
+  });
+  // How busy the server is and what it turns away: for programs (the upload page says the same in words). Times are estimates; they are left out when they cannot be told.
+  app.get('/api/queue', async (_req, res) => {
+    const now = await serverNow();
+    res.json({ running: now.running, waiting: now.waiting, places: now.places, queueLimit: admissionRules.queueLimit ?? null, full: now.full !== undefined, ...(now.startsInSeconds !== undefined ? { newVideoStartsInSeconds: Math.round(now.startsInSeconds) } : {}), ...(now.basis ? { basis: now.basis } : {}), ...(now.longestVideo ? { longestVideoSeconds: Math.round(now.longestVideo.seconds) } : {}) });
   });
   // Human-friendly counterpart to the JSON route above: a progress bar while the job runs, and the clips playable on the page
   // (with a big download button each) once it is over. No JavaScript at all -- auto-refresh is a plain <meta> tag, so there is
@@ -319,7 +404,8 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
   app.get('/jobs/:id', async (req, res) => {
     const job = await db.getJob(req.params.id);
     if (!job) return res.status(404).type('html').send(notFoundPage());
-    res.type('html').send(renderJobPage(job, await db.listClips(job.id), Date.now(), { retentionDays: config.CLIP_RETENTION_DAYS || undefined, stopping: pipeline.isStopping(job.id) }));
+    const forecast = await forecastOf(job);
+    res.type('html').send(renderJobPage(job, await db.listClips(job.id), Date.now(), { retentionDays: config.CLIP_RETENTION_DAYS || undefined, stopping: pipeline.isStopping(job.id), ...(forecast ? { forecast } : {}) }));
   });
   // Stopping a job that is being worked on, shaped like deleting one: JSON for the API; for the pages, a link to a page that asks once more and a form that does it.
   app.post('/api/jobs/:id/stop', async (req, res) => {

@@ -1,4 +1,7 @@
+import { longestWords } from './admission.js';
 import type { GeneratedClip, VideoJob } from './domain.js';
+import { roughly } from './estimate.js';
+import type { Forecast } from './forecast.js';
 import { MAX_CLIP_COUNT, clipLengthRanges, outputSizeFor } from './options.js';
 import { formatDuration, stageLabel, totalMilliseconds } from './progress.js';
 
@@ -80,6 +83,57 @@ export interface UploadPageInfo {
   faceFraming: boolean;
   /** CLIP_RETENTION_DAYS: how many days clips are kept (nothing is said when they are kept until a person deletes them). */
   retentionDays?: number;
+  /** How busy the server is right now and what it turns away (nothing is said about it when this is left out). */
+  now?: ServerNow;
+}
+
+/** What the upload page says about the server right now. Every time in it is an estimate. */
+export interface ServerNow {
+  /** Videos being worked on, and videos waiting for their turn (or getting ready for it). */
+  running: number;
+  waiting: number;
+  /** How long, roughly, until a video uploaded now would start (0: at once). Nothing when it cannot be told. */
+  startsInSeconds?: number;
+  /** What that time rests on, in words. */
+  basis?: string;
+  /** Set when the server is full and turns new videos away, with the words it says it in (the same as in the answer to an upload that is turned away). */
+  full?: { message: string };
+  /** The longest video that works right now, and the limit that is behind it, in words ("1 hour"). Nothing when no video is turned away for its length. */
+  longestVideo?: { seconds: number; limit: string };
+}
+
+const videos = (count: number) => `${count} video${count === 1 ? '' : 's'}`;
+const MARGIN_NOTE = 'It can be off by a good margin.';
+
+function serverNowCard(now: ServerNow): string {
+  const lines: string[] = [];
+  const timed = now.startsInSeconds !== undefined && now.startsInSeconds > 0;
+  if (now.full) lines.push(now.full.message);
+  else if (now.running === 0 && now.waiting === 0) lines.push('The server is free: a video uploaded now starts at once.');
+  else {
+    const turn = (count: number) => `${count === 1 ? 'is' : 'are'} waiting for ${count === 1 ? 'its' : 'their'} turn`;
+    const doing = now.running && now.waiting ? `The server is working on ${videos(now.running)}, and ${now.waiting} more ${turn(now.waiting)}.`
+      : now.running ? `The server is working on ${videos(now.running)}.` : `${videos(now.waiting)} ${turn(now.waiting)}.`;
+    lines.push(`${doing}${now.startsInSeconds === undefined ? '' : now.startsInSeconds === 0 ? ' A video uploaded now starts at once.' : ` A video uploaded now should start in ${roughly(now.startsInSeconds)}.`}`);
+  }
+  if (now.longestVideo) lines.push(`${longestWords(now.longestVideo.seconds)} A longer video is turned away at once: listening to it would take more than the ${now.longestVideo.limit} this server allows.`);
+  const note = (timed || now.longestVideo) && now.basis ? `<div class="muted" style="margin-top:8px">An estimate based on ${escapeHtml(now.basis)}. ${MARGIN_NOTE}</div>` : '';
+  return `<div class="card${now.full ? ' error' : ''}"><div class="stage">Right now</div>${lines.map((line, index) => `<div${index ? ' style="margin-top:8px"' : ''}>${escapeHtml(line)}</div>`).join('')}${note}</div>`;
+}
+
+/** What a person is told about the time of a video that is waiting or being worked on: where it stands in line and how long it should take. All of it an estimate. */
+function forecastLines(forecast: Forecast): string {
+  const lines: string[] = [];
+  if (forecast.ahead) {
+    const { running, waiting } = forecast.ahead;
+    const parts = [running ? `${videos(running)} being worked on` : '', waiting ? `${videos(waiting)} waiting` : ''].filter(Boolean);
+    lines.push(parts.length ? `In front of yours: ${parts.join(' and ')}.` : 'Nothing is in front of yours.');
+  }
+  const { startsInSeconds: starts, finishesInSeconds: finishes } = forecast;
+  if (starts !== undefined) lines.push(`${starts > 0 ? `It should start in ${roughly(starts)}` : 'It should start in a moment'}${finishes !== undefined ? ` and be done in ${roughly(finishes)}` : ''}.`);
+  else if (finishes !== undefined) lines.push(`Time left: ${roughly(finishes)}.`);
+  const figure = starts !== undefined || finishes !== undefined;
+  return lines.map((line) => `<div style="margin-top:8px">${escapeHtml(line)}</div>`).join('') + (figure && forecast.basis ? `<div class="muted" style="margin-top:8px">An estimate based on ${escapeHtml(forecast.basis)}. ${MARGIN_NOTE}</div>` : '');
 }
 
 export function renderUploadPage(info: UploadPageInfo): string {
@@ -91,6 +145,7 @@ export function renderUploadPage(info: UploadPageInfo): string {
 <h1>Upload a video</h1>
 <p class="lead">Choose a video (MP4, MOV, MKV, WebM, AVI or M4V) of up to ${info.maxUploadMb} MB.</p>
 <p class="lead">It is turned into short clips with captions (vertical, unless you choose another shape under Options). The next page shows your clips as soon as they are ready.</p>
+${info.now ? serverNowCard(info.now) : ''}
 <form class="card" action="/test-upload" method="post" enctype="multipart/form-data">
   <label class="field"><span class="label">Video</span><input name="video" type="file" accept="video/*" required></label>
   <details>
@@ -184,7 +239,7 @@ const STAGE_ORDER = ['preparing_source', 'saving_source', 'restoring_source', 'p
  * `stopping` says that the person has stopped this video and the work on it is being cleaned up (the job still reads as being worked on until that is done).
  * A video that was stopped ends as "failed" in the stage "stopped"; the page says that the person stopped it, and shows nothing in the colour of an error.
  */
-export function renderJobPage(job: VideoJob, clips: GeneratedClip[], now: number = Date.now(), options: { retentionDays?: number; stopping?: boolean } = {}): string {
+export function renderJobPage(job: VideoJob, clips: GeneratedClip[], now: number = Date.now(), options: { retentionDays?: number; stopping?: boolean; forecast?: Forecast } = {}): string {
   const stillWorking = job.status !== 'completed' && job.status !== 'failed';
   const stopping = stillWorking && options.stopping === true;
   const stopped = job.status === 'failed' && job.stage === 'stopped';
@@ -201,7 +256,7 @@ export function renderJobPage(job: VideoJob, clips: GeneratedClip[], now: number
   const status = `
 <div class="card ${job.status === 'failed' && !stopped ? 'error' : ''}">
   <div class="stage">Status: <strong>${statusWord}</strong>${finished || stopped || stopping || job.stage === job.status ? '' : ` (${escapeHtml(job.stage)})`}</div>
-  ${stillWorking && !stopping ? `<div class="stage">${escapeHtml(stageLabel(job.stage))}</div><progress value="${job.progress}" max="100">${job.progress}%</progress><div class="row"><span>${job.progress}%</span><span class="muted">Running for ${formatDuration(elapsedMs)}</span></div>` : ''}
+  ${stillWorking && !stopping ? `<div class="stage">${escapeHtml(stageLabel(job.stage))}</div><progress value="${job.progress}" max="100">${job.progress}%</progress><div class="row"><span>${job.progress}%</span><span class="muted">Running for ${formatDuration(elapsedMs)}</span></div>${options.forecast ? forecastLines(options.forecast) : ''}` : ''}
   ${job.status === 'failed' && job.errorMessage ? `<div style="margin-top:8px">${escapeHtml(job.errorMessage)}</div>` : ''}
   ${stillWorking && !stopping ? '<div class="muted" style="margin-top:8px">Still working -- this page refreshes itself every 5 seconds.</div>' : ''}
   ${stopping ? '<div style="margin-top:8px">Stopping this video. What was made so far is being thrown away.</div><div class="muted" style="margin-top:8px">This page refreshes itself every 5 seconds.</div>' : ''}

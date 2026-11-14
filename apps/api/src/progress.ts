@@ -32,6 +32,16 @@ export function stageProgress(stage: string, fraction = 0): number {
   return Math.round(range.from + (range.to - range.from) * clamped);
 }
 
+/**
+ * How far through `stage` a job is when its overall progress reads `percent`: the opposite of `stageProgress`, from 0 to 1. Nothing for a stage that has
+ * no width on the scale (a stage that is not a stretch of work) or one that is not known.
+ */
+export function stageFraction(stage: string, percent: number): number | undefined {
+  const range = stages[stage];
+  if (!range || range.to <= range.from || !Number.isFinite(percent)) return undefined;
+  return Math.min(Math.max((percent - range.from) / (range.to - range.from), 0), 1);
+}
+
 /** Adds up how long each stage took, for the one-line summary ("Finished in 4 min 12 s"). */
 export function totalMilliseconds(timings: Record<string, number>): number {
   return Object.values(timings).reduce((sum, value) => sum + (Number.isFinite(value) ? value : 0), 0);
@@ -59,6 +69,8 @@ export class StageClock {
   }
   /** The stage that is running now (none before the first and after `finish`). */
   get currentStage(): string | undefined { return this.current?.stage; }
+  /** How many milliseconds the stage that is running now has been running (none when no stage is). */
+  get currentElapsedMs(): number | undefined { return this.current ? Math.max(0, this.now() - this.current.since) : undefined; }
   /** The stages that have finished so far. */
   snapshot(): Record<string, number> { return { ...this.finished }; }
   /** Closes the stage that is running and returns everything. */

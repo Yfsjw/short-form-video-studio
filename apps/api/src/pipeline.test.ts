@@ -1783,3 +1783,91 @@ test('a job that was handed the place in the very moment it is stopped keeps it 
   slots.release();
   assert.equal(slots.isFull, false);
 });
+
+// ---- Who works and who waits (the line a person is shown) ----
+
+test('the places for the heavy stages say how many there are, and who waits for one, in the order they will be let in', async () => {
+  const slots = new Semaphore(2);
+  assert.equal(slots.places, 2);
+  assert.deepEqual(slots.waitingLabels(), []);
+  await slots.acquire(); await slots.acquire();
+  const stop = new AbortController();
+  const order: string[] = [];
+  const wait = (label: string | undefined, signal?: AbortSignal) => slots.acquire(signal, label).then(() => { order.push(label ?? '(no label)'); }, () => { order.push(`${label} gave up`); });
+  const a = wait('a'); const b = wait('b', stop.signal); const anonymous = wait(undefined); const c = wait('c');
+  assert.deepEqual(slots.waitingLabels(), ['a', 'b', 'c'], 'in arrival order, and one that gave no label is not listed');
+  stop.abort(new JobStopped());
+  await within(b, 1000, 'a job that was stopped went on waiting');
+  assert.deepEqual(slots.waitingLabels(), ['a', 'c'], 'a job that gave up its place in line is no longer in the line');
+  slots.release(); await within(a, 1000, 'the first in line was not served');
+  assert.deepEqual(slots.waitingLabels(), ['c'], 'a job that was let in is no longer waiting');
+  slots.release(); await within(anonymous, 1000, 'the one without a label was not served');
+  slots.release(); await within(c, 1000, 'the last in line was not served');
+  assert.deepEqual(slots.waitingLabels(), []);
+  assert.deepEqual(order, ['b gave up', 'a', '(no label)', 'c']);
+});
+
+test('the pipeline says who has the place, who waits in what order, and where the job that is working has got to', async () => {
+  let release!: () => void; const blocked = new Promise<void>((resolve) => { release = resolve; });
+  const listened: string[] = [];
+  const ctx = await setup({ transcriber: { transcribe: async (_audio: string, workDir: string, onProgress?: (fraction: number) => void) => {
+    const who = basename(workDir).split('-')[0]!; listened.push(who);
+    if (who === 'ja') { onProgress?.(0.5); await blocked; }
+    return [{ segmentIndex: 0, startSeconds: 0, endSeconds: 2, text: 'words' }];
+  } } });
+  try {
+    assert.deepEqual(ctx.pipeline.queueView(), { places: 1, running: [], waiting: [], other: 0 });
+    assert.equal(ctx.pipeline.backlog, 0);
+    assert.equal(ctx.pipeline.runState('ja'), undefined, 'a job that is not being worked on has no state');
+    await addJob(ctx, 'ja'); await addJob(ctx, 'jb'); await addJob(ctx, 'jc');
+    const first = ctx.pipeline.run('ja');
+    await waitUntil('the first job to be listening', () => listened.includes('ja'));
+    const second = ctx.pipeline.run('jb');
+    await eventually('the second job to wait for a place', async () => (await ctx.db.getJob('jb'))?.stage, (stage) => stage === 'waiting_for_capacity');
+    const third = ctx.pipeline.run('jc');
+    await eventually('the third job to wait for a place', async () => (await ctx.db.getJob('jc'))?.stage, (stage) => stage === 'waiting_for_capacity');
+    assert.deepEqual(ctx.pipeline.queueView(), { places: 1, running: ['ja'], waiting: ['jb', 'jc'], other: 0 });
+    assert.equal(ctx.pipeline.backlog, 2, 'the jobs that do not have a place yet');
+
+    await sleep(120);
+    const working = ctx.pipeline.runState('ja');
+    assert.equal(working?.stage, 'transcribing');
+    assert.equal(working?.percent, 40, 'the progress the engine reported: half way through the 10 to 70 of listening');
+    assert.ok(working!.stageSeconds >= 0.1 && working!.stageSeconds < 5, `${working?.stageSeconds} s in the stage`);
+    const waiting = ctx.pipeline.runState('jb');
+    assert.equal(waiting?.stage, 'waiting_for_capacity');
+    assert.equal(waiting?.percent, 4);
+
+    assert.equal(await ctx.pipeline.stop('jb'), 'stopping');
+    await within(second, 8000, 'the stopped job went on waiting');
+    assert.deepEqual(ctx.pipeline.queueView().waiting, ['jc'], 'a job that was stopped while it waited has left the line');
+    release();
+    await within(Promise.all([first, third]), 8000, 'the jobs that were not stopped did not finish');
+    await untilSettled(ctx);
+    assert.deepEqual(ctx.pipeline.queueView(), { places: 1, running: [], waiting: [], other: 0 }, 'nobody works and nobody waits when everything is over');
+    assert.equal(ctx.pipeline.runState('ja'), undefined, 'a job that is over has no state');
+    assert.equal(ctx.pipeline.backlog, 0);
+  } finally { await ctx.cleanup(); }
+});
+
+test('a job that is still getting its video ready is neither working nor waiting for a place, but it is in the backlog', async () => {
+  let release!: () => void; const storage = new SlowUploads(); storage.gate = new Promise<void>((resolve) => { release = resolve; });
+  const ctx = await setup({ storage });
+  try {
+    await addJob(ctx, 'jp', { durable: false });
+    const preparing = ctx.pipeline.run('jp');
+    await waitUntil('the video to be on its way to storage', () => storage.log.some((entry) => entry.startsWith('reached:')));
+    assert.deepEqual(ctx.pipeline.queueView(), { places: 1, running: [], waiting: [], other: 1 });
+    assert.equal(ctx.pipeline.backlog, 1);
+    assert.equal(ctx.pipeline.runState('jp')?.stage, 'saving_source');
+    release();
+    await within(preparing, 8000, 'the job did not finish');
+    await untilSettled(ctx);
+    assert.equal(ctx.pipeline.backlog, 0);
+  } finally { await ctx.cleanup(); }
+});
+
+test('the number of places the pipeline says it has is the number of videos it works on at once', async () => {
+  const ctx = await setup({ runtime: { ...fastRuntime, concurrency: 3 } });
+  try { assert.equal(ctx.pipeline.queueView().places, 3); } finally { await ctx.cleanup(); }
+});

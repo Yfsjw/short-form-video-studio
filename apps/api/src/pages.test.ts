@@ -233,3 +233,116 @@ test('the page that asks before stopping says what is lost, posts with a plain f
   assert.doesNotMatch(hostile, /<script>alert/, 'the address of the job is escaped where it is put into the form and the link');
   assert.equal((hostile.match(/&quot;&gt;&lt;script&gt;alert\(1\)&lt;\/script&gt;/g) ?? []).length, 2);
 });
+
+const BASIS = 'how long this server took for its last 7 videos';
+
+test('the upload page says nothing about how busy the server is unless it is given something to say', () => {
+  const html = renderUploadPage(uploadInfo);
+  assert.doesNotMatch(html, /Right now/);
+  assert.doesNotMatch(html, /estimate/i);
+});
+
+test('the upload page says that a free server starts a video at once, and does not dress that up as an estimate', () => {
+  const html = renderUploadPage({ ...uploadInfo, now: { running: 0, waiting: 0, startsInSeconds: 0, basis: BASIS } });
+  assert.match(html, /<div class="stage">Right now<\/div><div>The server is free: a video uploaded now starts at once\.<\/div>/);
+  assert.doesNotMatch(html, /An estimate based on/);
+});
+
+test('the upload page says what the server is doing and when a video uploaded now would start, as an estimate with what it rests on', () => {
+  const one = renderUploadPage({ ...uploadInfo, now: { running: 1, waiting: 0, startsInSeconds: 900, basis: BASIS } });
+  assert.match(one, /The server is working on 1 video\. A video uploaded now should start in about 15 min\./);
+  assert.match(one, /An estimate based on how long this server took for its last 7 videos\. It can be off by a good margin\./);
+  const several = renderUploadPage({ ...uploadInfo, now: { running: 2, waiting: 3, startsInSeconds: 5400, basis: BASIS } });
+  assert.match(several, /The server is working on 2 videos, and 3 more are waiting for their turn\. A video uploaded now should start in about 1 h 30 min\./);
+  assert.match(renderUploadPage({ ...uploadInfo, now: { running: 1, waiting: 1, startsInSeconds: 600, basis: BASIS } }), /and 1 more is waiting for its turn/);
+  assert.match(renderUploadPage({ ...uploadInfo, now: { running: 0, waiting: 2, startsInSeconds: 600, basis: BASIS } }), /<div>2 videos are waiting for their turn\. A video uploaded now should start in about 10 min\.<\/div>/);
+  assert.match(renderUploadPage({ ...uploadInfo, now: { running: 1, waiting: 0, startsInSeconds: 30, basis: BASIS } }), /should start in less than a minute\./);
+});
+
+test('when no time can be told the upload page gives none, and no source for one either; a place that is free says at once and needs no source', () => {
+  const unknown = renderUploadPage({ ...uploadInfo, now: { running: 1, waiting: 2, basis: BASIS } });
+  assert.match(unknown, /The server is working on 1 video, and 2 more are waiting for their turn\.<\/div>/);
+  assert.doesNotMatch(unknown, /should start|An estimate/);
+  const free = renderUploadPage({ ...uploadInfo, now: { running: 1, waiting: 0, startsInSeconds: 0, basis: BASIS } });
+  assert.match(free, /The server is working on 1 video\. A video uploaded now starts at once\./);
+  assert.doesNotMatch(free, /An estimate/);
+});
+
+test('a server that is full says so in the words of its refusal, in the colour of a warning, and does not tell a time that a video would start', () => {
+  const message = 'The server is full right now: 5 videos are already waiting for their turn, and it does not take on more than 5. Please try again in about 25 min.';
+  const html = renderUploadPage({ ...uploadInfo, now: { running: 1, waiting: 5, startsInSeconds: 9000, basis: BASIS, full: { message } } });
+  assert.match(html, new RegExp(`<div class="card error"><div class="stage">Right now</div><div>${message.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}</div>`));
+  assert.doesNotMatch(html, /should start in/);
+});
+
+test('the upload page says how long a video can be, and why a longer one is turned away', () => {
+  const html = renderUploadPage({ ...uploadInfo, now: { running: 0, waiting: 0, startsInSeconds: 0, longestVideo: { seconds: 930, limit: '1 hour' } } });
+  assert.match(html, /Videos up to about 15 min work right now\. A longer video is turned away at once: listening to it would take more than the 1 hour this server allows\./);
+  assert.match(renderUploadPage({ ...uploadInfo, now: { running: 0, waiting: 0, startsInSeconds: 0, longestVideo: { seconds: 40, limit: '1 hour' } } }), /Right now only a very short video can be done\./);
+});
+
+test('the longest video that works is an estimate too: the page says what it rests on whether or not a time is told, and says nothing of it when there is no figure', () => {
+  const note = `An estimate based on ${BASIS}. It can be off by a good margin.`;
+  const free = renderUploadPage({ ...uploadInfo, now: { running: 0, waiting: 0, startsInSeconds: 0, basis: BASIS, longestVideo: { seconds: 930, limit: '1 hour' } } });
+  assert.ok(free.includes(note), 'a free server, with a longest video');
+  assert.ok(renderUploadPage({ ...uploadInfo, now: { running: 0, waiting: 0, basis: BASIS, longestVideo: { seconds: 930, limit: '1 hour' } } }).includes(note), 'no time is told at all');
+  assert.equal(renderUploadPage({ ...uploadInfo, now: { running: 0, waiting: 0, startsInSeconds: 0, basis: BASIS } }).includes('An estimate based on'), false, 'a free server with no longest video has no figure to rest on anything');
+});
+
+test('what the upload page says about the server is escaped, and needs no script', () => {
+  const html = renderUploadPage({ ...uploadInfo, now: { running: 1, waiting: 0, startsInSeconds: 600, basis: '<b>x</b>', full: { message: '<i>full</i>' }, longestVideo: { seconds: 900, limit: '<u>1 hour</u>' } } });
+  assert.doesNotMatch(html, /<b>x<\/b>|<i>full<\/i>|<u>1 hour<\/u>/);
+  assert.match(html, /&lt;i&gt;full&lt;\/i&gt;/);
+  assert.doesNotMatch(html, /<script/i);
+});
+
+const waitingJob = () => job({ status: 'queued', stage: 'waiting_for_capacity', progress: 4 });
+
+test('the page of a video that waits says who is in front of it and when it should start and be done, as an estimate', () => {
+  const html = renderJobPage(waitingJob(), [], Date.parse('2026-10-01T10:02:00.000Z'), { forecast: { ahead: { running: 1, waiting: 2 }, startsInSeconds: 3000, finishesInSeconds: 4700, basis: BASIS } });
+  assert.match(html, /In front of yours: 1 video being worked on and 2 videos waiting\./);
+  assert.match(html, /It should start in about 50 min and be done in about 1 h 20 min\./);
+  assert.match(html, /An estimate based on how long this server took for its last 7 videos\. It can be off by a good margin\./);
+  assert.match(html, /Still working -- this page refreshes itself every 5 seconds\./);
+  assert.doesNotMatch(html, /<script/i);
+  assert.match(renderJobPage(waitingJob(), [], Date.now(), { forecast: { ahead: { running: 1, waiting: 0 }, startsInSeconds: 120, finishesInSeconds: 900, basis: BASIS } }), /In front of yours: 1 video being worked on\./);
+  assert.match(renderJobPage(waitingJob(), [], Date.now(), { forecast: { ahead: { running: 0, waiting: 1 }, startsInSeconds: 120, basis: BASIS } }), /In front of yours: 1 video waiting\./);
+});
+
+test('a video that waits with nothing in front of it is told so, and that it starts in a moment', () => {
+  const html = renderJobPage(waitingJob(), [], Date.now(), { forecast: { ahead: { running: 0, waiting: 0 }, startsInSeconds: 0, finishesInSeconds: 1500, basis: BASIS } });
+  assert.match(html, /Nothing is in front of yours\./);
+  assert.match(html, /It should start in a moment and be done in about 25 min\./);
+});
+
+test('a video that is being worked on is told how long is left, and one that waits and has no length known is told when it starts and not when it ends', () => {
+  const working = job({ status: 'processing', stage: 'transcribing', progress: 40 });
+  const html = renderJobPage(working, [], Date.now(), { forecast: { finishesInSeconds: 420, basis: BASIS } });
+  assert.match(html, /Time left: about 7 min\./);
+  assert.doesNotMatch(html, /In front of yours/);
+  assert.match(renderJobPage(working, [], Date.now(), { forecast: { finishesInSeconds: 20, basis: BASIS } }), /Time left: less than a minute\./);
+  const startOnly = renderJobPage(waitingJob(), [], Date.now(), { forecast: { ahead: { running: 1, waiting: 0 }, startsInSeconds: 600, basis: BASIS } });
+  assert.match(startOnly, /It should start in about 10 min\./);
+  assert.doesNotMatch(startOnly, /be done in/);
+});
+
+test('when the forecast has no time in it the page says who is in front and nothing about time or about what a time would rest on', () => {
+  const html = renderJobPage(waitingJob(), [], Date.now(), { forecast: { ahead: { running: 1, waiting: 3 }, basis: BASIS } });
+  assert.match(html, /In front of yours: 1 video being worked on and 3 videos waiting\./);
+  assert.doesNotMatch(html, /should start|Time left|An estimate/);
+  assert.doesNotMatch(renderJobPage(waitingJob(), [], Date.now(), { forecast: {} }), /In front|should start|Time left|An estimate/);
+});
+
+test('a video that is over, or being stopped, shows no forecast, and a page that is given none shows none', () => {
+  const forecast = { ahead: { running: 1, waiting: 2 }, startsInSeconds: 3000, finishesInSeconds: 4700, basis: BASIS };
+  assert.doesNotMatch(renderJobPage(job(), [clip()], Date.now(), { forecast }), /In front of yours|should start|An estimate/);
+  assert.doesNotMatch(renderJobPage(job({ status: 'failed', stage: 'failed', errorMessage: 'x' }), [], Date.now(), { forecast }), /In front of yours|should start|An estimate/);
+  assert.doesNotMatch(renderJobPage(waitingJob(), [], Date.now(), { forecast, stopping: true }), /In front of yours|should start|An estimate/);
+  assert.doesNotMatch(renderJobPage(waitingJob(), []), /In front of yours|should start|Time left|An estimate/);
+});
+
+test('what the forecast says of its source is escaped', () => {
+  const html = renderJobPage(waitingJob(), [], Date.now(), { forecast: { ahead: { running: 1, waiting: 0 }, startsInSeconds: 600, basis: '<script>alert(1)</script>' } });
+  assert.doesNotMatch(html, /<script>alert/);
+  assert.match(html, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
+});

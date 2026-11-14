@@ -505,3 +505,43 @@ test('a job that goes back to work while it is being deleted is not deleted: the
     assert.equal((await db.listClips('busy')).length, 1, 'and nothing of it was removed');
   } finally { client.release(); await pool.end(); await db.close({ dropSchema: true }); }
 });
+
+test('the jobs that finished most recently are listed with what they show about speed: the length of the video, the time of each stage, the clips that were made, and how they were cut', () => withDatabase('recent_runs', async (db) => {
+  const timings = { extracting_audio: 12_000, transcribing: 2_040_000, extracting_clips: 459_000 };
+  const complete = async (id: string, extra: { options?: object; durationSeconds?: number | null; status?: 'completed' | 'failed' | 'processing'; timings?: typeof timings | null } = {}) => {
+    await db.createJob({ ...makeJob(id, 'queued'), durationSeconds: extra.durationSeconds === undefined ? 600 : extra.durationSeconds, ...(extra.options ? { options: extra.options as never } : {}) });
+    if (extra.timings !== null) await db.updateJob(id, { status: extra.status ?? 'completed', stage: 'clip_extraction_complete', stageTimings: extra.timings ?? timings });
+    else await db.updateJob(id, { status: extra.status ?? 'completed', stage: 'clip_extraction_complete' });
+  };
+  await complete('before');
+  await sleep(25);
+  const since = new Date().toISOString();
+  await sleep(25);
+  await complete('first');
+  for (const [id, seconds, status] of [['c1', 45, 'completed'], ['c2', 45, 'completed'], ['c3', 45, 'failed'], ['c4', 30, 'queued']] as const) await db.createClip({ ...makeClip(id, 'first'), durationSeconds: seconds, status });
+  await sleep(10);
+  await complete('second', { durationSeconds: 300, options: { ...defaultJobOptions, framing: 'face' } });
+  await complete('failed', { status: 'failed' });
+  await complete('running', { status: 'processing' });
+  await complete('no-length', { durationSeconds: null });
+  await complete('no-timings', { timings: null });
+
+  const runs = await db.listRecentRuns(10, since);
+  assert.deepEqual(runs, [
+    { videoSeconds: 300, clipSeconds: 0, framing: 'face', timings },
+    { videoSeconds: 600, clipSeconds: 90, framing: 'center', timings },
+  ], 'only completed jobs with a length and timings, since the moment, the latest first; only clips that were made count, and the way the pictures were cut is read from the options');
+  assert.deepEqual((await db.listRecentRuns(1, since)).map((run) => run.videoSeconds), [300], 'no more than the limit');
+  assert.equal((await db.listRecentRuns(10, since)).length, 2);
+  assert.ok((await db.listRecentRuns(10, new Date(0).toISOString())).length === 3, 'the job from before the moment is there when the moment is earlier');
+  assert.deepEqual(await db.listRecentRuns(10, new Date(Date.now() + 60_000).toISOString()), [], 'nothing that finished since a moment in the future');
+}));
+
+test('several jobs can be read at once: the ones that exist, whatever the order, and nothing at all when no id is given', () => withDatabase('get_jobs', async (db) => {
+  for (const id of ['a', 'b', 'c']) await db.createJob({ ...makeJob(id, 'queued'), durationSeconds: 600 });
+  assert.deepEqual((await db.getJobs(['c', 'a', 'missing'])).map((job) => job.id).sort(), ['a', 'c'], 'an id that no job has is left out');
+  assert.deepEqual((await db.getJobs(['b'])).map((job) => job.id), ['b']);
+  assert.deepEqual(await db.getJobs([]), []);
+  assert.deepEqual(await db.getJobs(['b']), [await db.getJob('b')], 'a job is read the same way as when it is read alone');
+  assert.deepEqual((await db.getJobs(['a', 'a'])).map((job) => job.id), ['a'], 'a job that is asked for twice is there once');
+}));

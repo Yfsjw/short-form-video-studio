@@ -87,7 +87,10 @@ Job stages you can see on the status page: `preparing_source`, `saving_source`, 
   proportional to the file size. If the server dies in that window the video exists only on the dying disk, so the job is
   failed with a clear "please upload again" message instead of being resumed.
 - **Single instance.** Jobs run inside the API process. `JOB_CONCURRENCY` (default 1) limits how many are in the heavy
-  stages at once; a 512 MB instance cannot afford more.
+  stages at once; a 512 MB instance cannot afford more. `JOB_QUEUE_LIMIT` (default 5) limits how many may wait, so that a small disk does not fill with
+  uploads (see [How long a video takes, and saying no early](#how-long-a-video-takes-and-saying-no-early)).
+- **Times are estimates, and some are not told at all.** What a video should take is worked out from what this server's own finished videos took, so nothing is told for
+  listening (and no video is turned away for its length) until three videos of 30 seconds or more have been finished; and it can be off by a good margin.
 - **A stalled heartbeat is treated as death.** If a live process stopped refreshing its jobs for longer than
   `JOB_STALE_AFTER_SECONDS` (say, a long database outage) another process may take the job over while the first still works on
   it. There is no fencing between them.
@@ -202,6 +205,7 @@ All configuration comes from environment variables; see [`.env.example`](.env.ex
 | `R2_ACCOUNT_ID`, `R2_BUCKET_NAME`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` | Cloudflare R2 (durable storage). All four must be set to enable it. |
 | `REQUIRE_DURABLE_STORAGE` | `true` makes startup fail when any R2 setting is missing. Anything other than a clear yes/no is rejected. Default `false`. |
 | `JOB_CONCURRENCY` | Jobs allowed in the CPU/memory-heavy stages at once (1–8, default 1). |
+| `JOB_QUEUE_LIMIT` | How many videos may wait for their turn (or be getting ready for it) behind those being worked on; a video that arrives when that many already wait is turned away at once with `503` `SERVER_BUSY` and a `Retry-After`. `0` means no limit (default 5). See [How long a video takes, and saying no early](#how-long-a-video-takes-and-saying-no-early). |
 | `JOB_MAX_ATTEMPTS` | Times a job may be started in total, the first run included (1–10, default 3). |
 | `JOB_STALE_AFTER_SECONDS`, `JOB_HEARTBEAT_SECONDS` | A job untouched for the first value is considered abandoned (default 60); live jobs refresh every second value (default 15, must be at most half of the first). |
 | `KEEP_AWAKE_WHILE_PROCESSING` | `false` stops the server from requesting its own `/api/health` while work is in progress (default `true`; only active when `RENDER_EXTERNAL_URL` is set). Anything other than a clear yes/no is rejected. |
@@ -235,7 +239,9 @@ All configuration comes from environment variables; see [`.env.example`](.env.ex
 
 - `POST /api/jobs` — multipart request with one `video` field and, optionally, the job options below. Returns `202` with the job. An option that is not allowed is refused with `400` (`INVALID_OPTIONS`) before anything is stored.
 - `POST /api/youtube` — JSON `{ "url": "<YouTube URL>" }` (the job options below can be added); only available when `COBALT_API_URL` is configured.
-- `GET /api/jobs/:id` — the job (`status`, `stage`, `progress`, `stageTimings`, `options`, `attempts`, `errorMessage`, …) and its clips. The internal storage location is never exposed.
+  Both can be turned away at once, as `{ "error": { "code", "message" } }`: `422` `VIDEO_TOO_LONG` (this server could not listen to it in the time allowed; trying later does not help) and `503` `SERVER_BUSY` (as many videos already wait as `JOB_QUEUE_LIMIT` allows; `Retry-After` says when to try again). See [How long a video takes, and saying no early](#how-long-a-video-takes-and-saying-no-early).
+- `GET /api/queue` — how busy the server is: `{ running, waiting, places, queueLimit, full }` and, when they can be told, `newVideoStartsInSeconds`, `longestVideoSeconds` and `basis` (what the figures rest on). Estimates.
+- `GET /api/jobs/:id` — the job (`status`, `stage`, `progress`, `stageTimings`, `options`, `attempts`, `errorMessage`, …) and its clips; for a video that waits or is being worked on also an `estimate` (`ahead`, `startsInSeconds`, `finishesInSeconds`, `basis`: only what can be told). The internal storage location is never exposed.
 - `GET /api/jobs/:id/transcript` — timestamped transcript segments.
 - `GET /api/jobs/:id/highlights` — ranked highlight candidates with their scoring signals.
 - `GET /api/jobs/:jobId/clips/:clipId` — redirects to a short-lived signed R2 link (add `?download=1` to force a download). In local-only mode the file is streamed from disk.
@@ -267,7 +273,7 @@ is resumed after a restart is finished the way it was started.
 `progress` (0–100) follows the real work: whisper.cpp's own percentage (`-pp`) fills the long transcription stage, the clips fill
 the last stage one by one. `stageTimings` records how long each stage of the latest attempt took in milliseconds (a stage appears
 once it has finished), and the totals are written to the log line that ends every job. On a small server this is how to see
-where the time goes before deciding what to speed up.
+where the time goes before deciding what to speed up. How long a video *should* take, from these timings of the videos that were finished before it, is told on the pages and in the API (see [How long a video takes, and saying no early](#how-long-a-video-takes-and-saying-no-early)).
 
 Accepted extensions: MP4, MOV, MKV, WebM, AVI, M4V. Extension and declared MIME type are checked before a job is created and
 `ffprobe` then checks that the file really contains a readable video stream. An upload that is abandoned halfway, or whose job
@@ -661,6 +667,80 @@ That check was run by hand and is not part of the repository.
 **Not proven yet:** stopping on the live service against the real R2 bucket, the real whisper.cpp on the free instance (the tests kill stand-in programs; that
 whisper.cpp ends as they do is expected, not seen), and how long a stop takes while a very large video is being saved.
 
+### How long a video takes, and saying no early
+
+A person who uploads a video is told, before they have waited for it, roughly how long it should take and where it stands in line, and a video this
+server cannot do is turned away in the first seconds, in words that say why, instead of being accepted, made to wait and failed an hour later.
+Everything here is plain arithmetic over times that were measured; nothing is a model, nothing is "AI", and nothing changes how a video is processed.
+
+**What people see.** The upload page has a card, "Right now": the server is free, or is working on N videos with M more waiting, and a video uploaded
+now should start in about so much; and, when it is known, "Videos up to about 15 min work right now. A longer video is turned away at once: listening
+to it would take more than the 1 hour this server allows." (the upload page also says it before anyone picks a video, because a refusal can only come
+after the upload has arrived: the length of a video is known only then). The page of a video that waits says "In front of yours: 1 video being worked on
+and 2 videos waiting. It should start in about 4 min and be done in about 6 min."; the page of one that is being worked on says "Time left: about 2 min.";
+and every figure carries a small print, "An estimate based on how long this server took for its last 7 videos. It can be off by a good margin." Programs
+get the same from `GET /api/queue` (`running`, `waiting`, `places`, `queueLimit`, `full`, and, when they can be told, `newVideoStartsInSeconds`,
+`longestVideoSeconds` and `basis`) and from the `estimate` of `GET /api/jobs/:id` (`ahead`, `startsInSeconds`, `finishesInSeconds`, `basis`). No
+JavaScript is involved: the pages refresh as before.
+
+**Where the figures come from.** For one video: the time to listen to it plus the time to make its clips (plus taking the sound out, which is learned
+too and otherwise taken as nothing). *Listening* is counted in the windows whisper.cpp works in: it always looks at 30 seconds at a time, so a video of
+8 seconds is one window, one of 45 seconds is two, and a tail shorter than a second is not listened to. The speed of listening is the seconds spent for each
+second of window. *Making clips* is the speed of making a clip times the length of the clips to be made: the middle of the length range
+(`HIGHLIGHT_MIN_DURATION_SECONDS`/`HIGHLIGHT_MAX_DURATION_SECONDS`) for each of `CLIP_MAX_CANDIDATES` clips, fewer when the video is too short for that many. A
+video that is being worked on is told stage by stage (what is left of the stage it is in, and the stages after it); once a stage is 2% done and has run for
+30 seconds, its own pace is used instead of the average. A video that waits starts when a place for the heavy stages frees up, in line, each place going to the
+next video in turn, so its time is what is left of the videos being worked on plus the whole time of each video in front of it (their lengths are those seen when
+they were accepted).
+
+**The speeds are this server's own.** A speed is the *median* of what the last (up to) 10 videos that finished in the last 30 days took, for the work it did,
+and it is used only when at least 3 videos of 30 seconds or more show it. A job whose transcript was reused did not listen and says nothing about listening; a job
+that followed a face says nothing about making clips (following a face takes longer). **The speed of listening is learned from finished videos and from nothing
+else.** The start-up check does measure listening, on an 11-second recording, but that is one window of 30 seconds to whisper.cpp, so it says what one window
+costs for a little speech and not what a long video costs; the two can be far apart (per second of the recording it looks about three times what it is per second of
+a long video if every window costs the same, and about the same if the cost grows with how much is said; which holds on the free instance is not known). So until
+three videos of 30 seconds or more have been finished by this server (and again after 30 days without any), **no time that depends on listening is told and no video
+is turned away for its length**: the pages say where a video is in line, and nothing else. The speed of making a clip has a stand-in until it is learned: what the
+start-up check measured on its three-second test clip (FFmpeg's time grows with the length of the clip, so a few seconds do say something); the log says it once,
+"The start-up check measured how fast this server makes a clip: …". `basis` says which it is: "how long this server took for its last 7 videos", plus "(and, for making
+the clips, on a test it made when it started)" when the second is the stand-in.
+
+**What is turned away.**
+
+- *A video that is too long to be listened to.* Only where this server's own whisper.cpp does the listening, which is stopped after `TRANSCRIPTION_TIMEOUT_MS`
+  (an hour by default): a video is turned away when its expected listening takes more than nine tenths of that time (a video of one window, about 30 seconds, is never turned away for its length, however slow the server looks: a server that turned every video away could never finish one, and so could never find out that it had become quicker). The answer is `422` `VIDEO_TOO_LONG`, with no
+  `Retry-After` (trying later does not help), as a page for the upload form and as `{ "error": { "code", "message" } }` for programs, and says why, how long listening would
+  take, the limit, the longest video that works (in whole windows, said in whole minutes that are never too many: "Videos up to about 15 min work right now.") and
+  what to do ("Please upload a shorter part of it."). What was uploaded is thrown away and no job is made. A video whose length cannot be read is not turned away: it is
+  taken as it always was and fails with its own words when it is worked on. A hosted speech service ([Faster speech recognition](#faster-speech-recognition-with-a-hosted-service-optional))
+  is not stopped by this server at a time limit, so nothing is turned away for length there.
+- *A server that is full.* `JOB_QUEUE_LIMIT` (default 5; `0` means no limit) is how many videos may wait for their turn, or be getting ready for it, behind those being
+  worked on. A video that arrives when that many already wait is turned away with `503` `SERVER_BUSY` and a `Retry-After` of the time until a place frees up, between one
+  minute and one hour (five minutes when that cannot be told), and nothing of it is kept. This keeps a small disk from filling with videos that would wait for hours. The
+  YouTube route is checked the same way: a full server says so before it downloads anything, and a video that turns out to be too long is thrown away after it was downloaded
+  (nobody can tell how long it is before).
+
+**A mistake worth keeping in mind.** The first version of this took the speed of listening from the start-up check's recording (about 3.4 seconds for each second of it) and
+turned that into "a video longer than about 16 minutes will time out". That was not supported: 11 seconds are one window to whisper.cpp, so the figure said what a window costs,
+not what a long video does. It was found by reading the sentence above about windows against the code, and fixed by learning listening from finished videos only and counting it
+in windows; a test now checks that a speed told by the start-up check is never taken for the speed of listening.
+
+**What has been shown.** On a development machine, not on the live service: 635 tests pass in all (543 before this), among them the arithmetic of the estimates, the learning of speeds, the
+view of the line, the forecast, the refusals, the pages, and end-to-end tests that start the server with real FFmpeg and a database: a video turned away for its length (nothing kept, no job
+made), a hosted speech service that is not length-guarded, a full server (the refusal with its `Retry-After`, nothing kept, taking videos again once the line has moved), `JOB_QUEUE_LIMIT=0`,
+what the start-up check measures and what it does not, speeds learned from videos the server really finished (and read again by a server that starts afterwards), a page that does not fail when a
+time cannot be worked out, and the YouTube route. 124 deliberate small breakages of this code (a wrong boundary, a swapped order, a missing escape, a speed taken from the wrong place, a refusal that
+keeps the upload, and so on) were tried one by one, and the tests caught 120. Eight were not caught at first and got tests of their own; the last four change nothing anyone could see (two layers that
+each keep a measurement out of the speed of listening, which the tests do catch when both are removed; a guard that the next line makes again; the escaping of lines that hold only numbers and fixed
+words).
+
+**Limits.** All of it is an estimate, and a rough one. Nothing is told or refused for listening until three videos have been finished (so, on a new server, not before then), and
+the first minutes after a start are taken by the start-up check, which holds a place. The speed of making a clip ignores the `quality` chosen, and the clips' length is the middle of the
+range, not what the highlights will turn out to be. A video that is still getting ready for its turn (being copied to storage) counts for the limit but is not in the line yet, so while one
+is, no start time is told. The limit on waiting videos is checked when a video arrives and the job is made a moment later, so videos that arrive at the very same moment can pass it by a
+few. The estimate of a waiting video uses the length seen when it was accepted. Nothing has been seen on the live service yet: how good the figures are there, and how fast whisper.cpp
+really goes on a long video there, will show once it has finished a few.
+
 ### The access code (optional)
 
 Without a code, anybody who knows the address can upload videos (each one costs processing time, storage and, with a hosted speech
@@ -738,7 +818,7 @@ running job could use up the memory of the 512 MB instance, so it looks again ev
     `apps/api/test-assets`), through the same code that listens to customers' videos, and judges what it wrote: at least three
     quarters of the words said, in order; a time for every word, in order and spread from the start of the recording to nearly its
     end. A run that fails any of these fails the check. It is the only thing that shows on the host that whisper.cpp's real output is
-    read correctly and that the captions can follow each spoken word. It also says how many seconds the listening took for the 11 seconds of speech.
+    read correctly and that the captions can follow each spoken word. It also says how many seconds the listening took for the 11 seconds of speech (that figure is not used to estimate how long a video takes: see [How long a video takes, and saying no early](#how-long-a-video-takes-and-saying-no-early)).
   - makes one clip of the real size (1080x1920 unless configured otherwise, captions with the spoken word lit, the preset and
     quality the clips use) from three seconds of a busy full-HD test picture, and says how long that took.
 

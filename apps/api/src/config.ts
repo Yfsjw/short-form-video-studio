@@ -31,6 +31,9 @@ const schema = z.object({
   // How many jobs may be in their CPU/memory-heavy stages (transcription, rendering) at once.
   // The 512 MB free instance can only afford one.
   JOB_CONCURRENCY: z.coerce.number().int().min(1).max(8).default(1),
+  // How many videos may wait for their turn (or be getting ready for it) behind the ones being worked on. A video that arrives when that many already wait is
+  // turned away at once, with a time to try again, instead of piling up on a small disk. 0 = no limit.
+  JOB_QUEUE_LIMIT: z.coerce.number().int().min(0).default(5),
   // A job is started at most this many times in total (the first run included); after that it is
   // failed for good, so a video that crashes the server cannot cause an endless crash loop.
   JOB_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(10).default(3),

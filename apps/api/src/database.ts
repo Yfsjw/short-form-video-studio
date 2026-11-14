@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { Pool, type PoolClient } from 'pg';
 import { defaultJobOptions, type GeneratedClip, type HighlightCandidate, type JobStatus, type NewVideoJob, type TranscriptSegment, type VideoJob } from './domain.js';
 import { readStoredOptions } from './options.js';
+import type { FinishedRun } from './speeds.js';
 import type { TranscriptInput } from './transcription.js';
 import { parseCachedSegments, serializeSegments } from './transcript-cache.js';
 import { parseStoredWords } from './words.js';
@@ -159,6 +160,13 @@ export class StudioDatabase {
     return this.mapJob(result.rows[0]);
   }
 
+  /** Several jobs at once, in no particular order; an id that no job has is left out. */
+  async getJobs(ids: readonly string[]): Promise<VideoJob[]> {
+    if (!ids.length) return [];
+    const result = await this.pool.query('SELECT * FROM video_jobs WHERE id = ANY($1::text[])', [[...ids]]);
+    return result.rows.map((row) => this.mapJob(row)).filter((job): job is VideoJob => Boolean(job));
+  }
+
   async listClips(jobId: string): Promise<GeneratedClip[]> {
     const result = await this.pool.query('SELECT * FROM generated_clips WHERE job_id = $1 ORDER BY created_at', [jobId]);
     return result.rows.map((row) => this.mapClip(row)).filter((clip): clip is GeneratedClip => Boolean(clip));
@@ -264,6 +272,22 @@ export class StudioDatabase {
   }
 
   /** Every job that has not reached a final state yet, oldest first. */
+  /**
+   * What the jobs that finished most recently show about how fast this server works (see speeds.ts): how long the video was, how long each stage took, the
+   * length of the clips that were made and how their pictures were cut. Only jobs that were completed since `since` (an ISO time), the latest first.
+   */
+  async listRecentRuns(limit: number, since: string): Promise<FinishedRun[]> {
+    const result = await this.pool.query(
+      `SELECT j.duration_seconds, j.stage_timings_json, j.options_json,
+              COALESCE((SELECT SUM(c.duration_seconds) FROM generated_clips c WHERE c.job_id = j.id AND c.status = 'completed'), 0) AS clip_seconds
+         FROM video_jobs j
+        WHERE j.status = 'completed' AND j.updated_at >= $1 AND j.duration_seconds IS NOT NULL AND j.stage_timings_json IS NOT NULL
+        ORDER BY j.updated_at DESC LIMIT $2`,
+      [since, limit]
+    );
+    return result.rows.map((row) => ({ videoSeconds: Number(row.duration_seconds), clipSeconds: Number(row.clip_seconds), framing: readStoredOptions(row.options_json).framing, timings: parseTimings(row.stage_timings_json) }));
+  }
+
   async listUnfinishedJobs(): Promise<VideoJob[]> {
     const result = await this.pool.query(`SELECT * FROM video_jobs WHERE status IN ('queued', 'processing') ORDER BY created_at`);
     return result.rows.map((row) => this.mapJob(row)).filter((job): job is VideoJob => Boolean(job));
